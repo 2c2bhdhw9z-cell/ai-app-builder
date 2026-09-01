@@ -67,6 +67,10 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 - **Memory_Cap**: The configured maximum size of a memory store, beyond which Memory_Mode governs behavior.
 - **Project_Export**: A downloadable, self-contained copy of a Project's full file state suitable for continuing development outside the AI_App_Builder (e.g., a standard Git repository or archive).
 - **Standard_Toolchain**: Publicly available, documented development tools (compilers, package managers, build tools) that contain no AI_App_Builder-proprietary or AI_App_Builder-account-gated component.
+- **Service_Level_Objective (SLO)**: A target that must hold for a stated percentage of operations under normal load (e.g., "95% of operations within N seconds"), rather than a hard guarantee for every single operation.
+- **Rate_Limit**: A configured ceiling on the number of resource-creating operations a User_Account may perform within a time window (e.g., Project creations, builds, deployments, or generation turns per minute).
+- **Resource_Quota**: A configured ceiling on the resources a User_Account or Project may consume concurrently or in total (e.g., maximum concurrent Sandboxes, maximum total Projects, and the per-Sandbox CPU/memory/execution-time limits).
+- **Encryption_At_Rest**: The property that a stored value is persisted in encrypted form on disk so that the raw value is not recoverable from the stored bytes without the decryption key.
 
 ## Requirements
 
@@ -76,13 +80,14 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 
 #### Acceptance Criteria
 
-1. WHEN a user submits a natural-language description (1–5,000 characters after trimming whitespace), selects a Target_Category that is one of `web`, `full-stack-web`, `mobile`, or `multi-target`, and selects a Project_Origin that is one of `blank`, `template`, `github-import`, or `fork`, THE AI_App_Builder SHALL begin Project creation within 10 seconds by recording the Project and allocating its Sandbox so the Project becomes available for streaming, while origin population completes within the origin-specific bounds defined in the Project Scaffolding and Templates requirement (Template population within 30 seconds) and the Project Origins requirement (`github-import` clone within 120 seconds).
+1. WHEN a user submits a natural-language description (1–5,000 characters after trimming whitespace), selects a Target_Category that is one of `web`, `full-stack-web`, `mobile`, or `multi-target`, and selects a Project_Origin that is one of `blank`, `template`, `github-import`, or `fork`, THE AI_App_Builder SHALL begin Project creation — recording the Project and allocating its Sandbox so the Project becomes available for streaming — within 10 seconds for at least 95% of such requests under normal load as a Service_Level_Objective, acknowledging that cold Sandbox or container provisioning may occasionally exceed this bound; this criterion covers the start of creation and not a finished Project, while origin population completes within the origin-specific bounds defined in the Project Scaffolding and Templates requirement (Template population) and the Project Origins requirement (`github-import` clone).
 2. WHEN a Project is created from a description, THE Builder_Agent SHALL generate the Project source files by invoking the Plumby_Engine.
 3. WHEN Project generation completes and a Verify_Result reports verdict PASS, THE AI_App_Builder SHALL start the Dev_Server and make a Preview available within 60 seconds of Dev_Server start.
 4. IF a user submits a description that is empty or shorter than 1 character after trimming whitespace, THEN THE AI_App_Builder SHALL reject the request, SHALL NOT create a Project, and SHALL return a message requesting a description.
 5. IF a user selects a Target_Category that is not one of `web`, `full-stack-web`, `mobile`, or `multi-target`, THEN THE AI_App_Builder SHALL reject the request, SHALL NOT create a Project, and SHALL return an error indicating the Target_Category is unsupported.
 6. IF a user selects a Project_Origin that is not one of `blank`, `template`, `github-import`, or `fork`, THEN THE AI_App_Builder SHALL reject the request, SHALL NOT create a Project, and SHALL return an error indicating the Project_Origin is unsupported.
 7. IF Project generation produces a Verify_Result reporting verdict FAIL, THEN THE AI_App_Builder SHALL report the failure with the captured error output, SHALL NOT start the Dev_Server, and SHALL retain the Project files in an editable state.
+8. THE AI_App_Builder SHALL treat the numeric timing bounds stated throughout these requirements as targets under normal load, and WHERE a bound is stated as a Service_Level_Objective THE AI_App_Builder SHALL evaluate that bound against the stated percentage of operations rather than as a hard guarantee for every individual operation.
 
 ### Requirement 2: Iterative Refinement via Chat
 
@@ -132,7 +137,7 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 #### Acceptance Criteria
 
 1. THE AI_App_Builder SHALL provide at least one Template for each Target_Category: `web`, `full-stack-web`, `mobile`, and `multi-target`.
-2. WHEN a Project is created from a Template, THE AI_App_Builder SHALL populate the Project with all of the Template's files and its dependency manifest within 30 seconds.
+2. WHEN a Project is created from a Template, THE AI_App_Builder SHALL populate the Project with all of the Template's files and its dependency manifest within 30 seconds for at least 95% of Templates under normal load as a Service_Level_Objective, where population time scales with Template size so that larger Templates may take proportionally longer.
 3. IF a Project is created from a Template and one or more Template files or the dependency manifest fail to be written, THEN THE AI_App_Builder SHALL abort creation, remove any partially written Project files, and return an error indicating which artifact failed to populate.
 4. WHEN a Template is instantiated, THE AI_App_Builder SHALL produce a Project whose baseline build completes with a zero (success) exit status and no build errors before any user refinement.
 5. IF a Template's baseline build does not complete with a success exit status within 300 seconds of build start, THEN THE AI_App_Builder SHALL mark the instantiation as failed and return an error indicating the build failure.
@@ -148,11 +153,12 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 1. THE AI_App_Builder SHALL support four Project_Origins: `blank`, `template`, `github-import`, and `fork`.
 2. WHEN a user creates a Project with Project_Origin `blank`, THE AI_App_Builder SHALL create a Project containing only the minimal files required for the Sandbox and Dev_Server to start, with no Template applied.
 3. WHEN a user creates a Project with Project_Origin `template`, THE AI_App_Builder SHALL initialize the Project from the Template matching the selected Target_Category.
-4. WHEN a user creates a Project with Project_Origin `github-import` and provides a repository reference the user is authorized to access, THE AI_App_Builder SHALL clone the repository into the Project's Sandbox within 120 seconds and use its contents as the Project's starting file state.
-5. IF a `github-import` repository reference is invalid, inaccessible, or the clone exceeds 120 seconds, THEN THE AI_App_Builder SHALL report the import failure with its cause, SHALL NOT create a partially imported Project, and SHALL leave no orphaned Sandbox running.
-6. WHEN a user creates a Project with Project_Origin `fork` referencing an existing Project the user is authorized to access, THE AI_App_Builder SHALL create a new Project whose starting file state is a copy of the referenced Project's most recent Snapshot, independent of the original.
-7. IF a `fork` references a Project that does not exist or that the user is not authorized to access, THEN THE AI_App_Builder SHALL reject the request and SHALL NOT create a Project.
-8. WHEN a Project is created from any Project_Origin, THE AI_App_Builder SHALL proceed to the same iterative refinement, Preview, persistence, and verify/self-healing behavior as any other Project.
+4. WHEN a user creates a Project with Project_Origin `github-import` referencing a small repository (up to 100 MB) the user is authorized to access, THE AI_App_Builder SHALL clone the repository into the Project's Sandbox within 120 seconds as a Service_Level_Objective under normal load and use its contents as the Project's starting file state.
+5. WHERE a `github-import` references a repository larger than 100 MB, THE AI_App_Builder SHALL report ongoing clone progress to the user and SHALL apply a configurable maximum clone time (default 600 seconds), and IF the clone exceeds the configured maximum clone time, THEN THE AI_App_Builder SHALL abort the import with its cause, SHALL NOT create a partially imported Project, and SHALL leave no orphaned Sandbox running.
+6. IF a `github-import` repository reference is invalid, inaccessible, or the clone exceeds the applicable maximum clone time, THEN THE AI_App_Builder SHALL report the import failure with its cause, SHALL NOT create a partially imported Project, and SHALL leave no orphaned Sandbox running.
+7. WHEN a user creates a Project with Project_Origin `fork` referencing an existing Project the user is authorized to access, THE AI_App_Builder SHALL create a new Project whose starting file state is a copy of the referenced Project's most recent Snapshot, independent of the original.
+8. IF a `fork` references a Project that does not exist or that the user is not authorized to access, THEN THE AI_App_Builder SHALL reject the request and SHALL NOT create a Project.
+9. WHEN a Project is created from any Project_Origin, THE AI_App_Builder SHALL proceed to the same iterative refinement, Preview, persistence, and verify/self-healing behavior as any other Project.
 
 ### Requirement 7: Authentication and Authorization
 
@@ -222,14 +228,16 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 1. THE AI_App_Builder SHALL generate Projects that contain no AI_App_Builder telemetry, beacon, or phone-home code, defined as no source code, dependency, build-tool plugin, or configuration that transmits data to any AI_App_Builder-controlled host at build time or run time.
 2. THE AI_App_Builder SHALL generate Projects that contain no injected AI_App_Builder branding, badge, or watermark rendered in, or embedded in, the Project's shipped output.
 3. THE AI_App_Builder SHALL NOT add any lint rule, convention rule, or hash-protected file to a generated Project whose effect is to fail the Project's build, test run, or startup when AI_App_Builder-specific code is removed.
-4. WHEN a Connector injects credentials, THE AI_App_Builder SHALL reference those credentials only through injected Secrets (environment configuration), such that no hardcoded platform host or literal credential value is written into the Project's source files.
-5. IF, during Project generation, the AI_App_Builder would write a literal credential value or a hardcoded AI_App_Builder platform host into a Project source file, THEN THE AI_App_Builder SHALL replace it with an environment-variable reference and SHALL record the substitution in a report available to the user.
-6. WHEN a user requests a Project_Export, THE AI_App_Builder SHALL produce, within 300 seconds for a Project of up to 10,000 files, a self-contained copy of the Project's full file state that builds and runs outside the AI_App_Builder using a Standard_Toolchain, without requiring an AI_App_Builder account or any network access to an AI_App_Builder-controlled host.
+4. WHEN a Connector injects credentials, THE AI_App_Builder SHALL reference those credentials only through injected Secrets (environment configuration), such that no hardcoded platform host or literal credential value is written into the Project's source files; this criterion is the PRIMARY mechanism for keeping credentials and platform hosts out of Project source files.
+5. IF, during Project generation, the AI_App_Builder would write a literal credential value or a hardcoded AI_App_Builder platform host into a Project source file, THEN THE AI_App_Builder SHALL replace it with an environment-variable reference and SHALL record the substitution in a report available to the user; this criterion is a SECONDARY safety net behind criterion 4 that should rarely trigger when criterion 4 is operating correctly.
+6. WHEN a user requests a Project_Export, THE AI_App_Builder SHALL produce a self-contained copy of the Project's full file state that builds and runs outside the AI_App_Builder using a Standard_Toolchain, without requiring an AI_App_Builder account or any network access to an AI_App_Builder-controlled host, completing within 300 seconds for a Project within the configured file-count limit as a Service_Level_Objective under normal load.
 7. IF a Project_Export fails to complete or cannot produce a self-contained copy, THEN THE AI_App_Builder SHALL abort the export, retain the Project's stored state unchanged, and return an error indication identifying the reason for the failure.
 8. WHEN a Project_Export is produced, THE AI_App_Builder SHALL exclude every Secret and Connector credential value from the exported files and SHALL instead include a template that lists every required environment variable name with no accompanying value.
-9. WHEN a user runs a Lockin_Audit on a Project, THE AI_App_Builder SHALL complete the audit within 120 seconds for a Project of up to 10,000 files and SHALL report each detected lock-in signal (telemetry/beacons, injected UI, hardcoded platform hosts, enforcement rules, hash-protected files, undeclared outbound hosts) with file path and line number evidence, or SHALL report that no lock-in signals were found.
-10. IF a Lockin_Audit encounters a file it cannot scan, THEN THE AI_App_Builder SHALL report that file as an unverified surface in the audit results rather than omitting it silently.
-11. WHERE a Lockin_Audit reports a lock-in signal in AI_App_Builder-generated code, THE AI_App_Builder SHALL treat it as a defect to be corrected rather than a required feature.
+9. THE AI_App_Builder SHALL apply a configurable maximum file-count (default 10,000 files) to a single Project_Export or Lockin_Audit operation, and IF a Project exceeds the configured maximum file-count for the requested operation, THEN THE AI_App_Builder SHALL report the excess to the user rather than silently truncating the operation.
+10. WHEN a user runs a Lockin_Audit on a Project within the configured file-count limit, THE AI_App_Builder SHALL complete the audit within 120 seconds as a Service_Level_Objective under normal load and SHALL report each detected lock-in signal (telemetry/beacons, injected UI, hardcoded platform hosts, enforcement rules, hash-protected files, undeclared outbound hosts) with file path and line number evidence, or SHALL report that no lock-in signals were found.
+11. WHERE a prior Lockin_Audit result exists for a Project, THE AI_App_Builder MAY scan only the files changed since the last audit and combine the result with the prior findings, provided the combined report still reflects the current Project state.
+12. IF a Lockin_Audit encounters a file it cannot scan, THEN THE AI_App_Builder SHALL report that file as an unverified surface in the audit results rather than omitting it silently.
+13. WHERE a Lockin_Audit reports a lock-in signal in AI_App_Builder-generated code, THE AI_App_Builder SHALL treat it as a defect to be corrected rather than a required feature.
 
 ### Requirement 12: Lock-In Awareness Skills Available to the Builder Agent
 
@@ -264,9 +272,10 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 3. WHEN a user creates a User_Skill by providing a `name`, a `description`, and an instruction body, THE AI_App_Builder SHALL add the User_Skill to that user's Skill_Library and make it available to the user's Projects.
 4. WHEN a user imports a Skill in the open Agent Skills format, THE AI_App_Builder SHALL validate that the Skill contains at least a `name` and a `description` and SHALL add the Skill to the user's Skill_Library.
 5. IF an imported Skill is missing a `name` or a `description`, or is not in the open Agent Skills format, THEN THE AI_App_Builder SHALL reject the import with an error identifying the missing or invalid field and SHALL NOT add the Skill to the Skill_Library.
-6. IF a User_Skill's `name` collides with an existing Skill in the user's Skill_Library, THEN THE AI_App_Builder SHALL reject the addition with a naming-collision error and SHALL leave the existing Skill unchanged.
-7. WHEN a user edits or deletes a User_Skill, THE AI_App_Builder SHALL apply the change to the user's Skill_Library and SHALL leave every Stocked_Skill unchanged.
-8. THE AI_App_Builder SHALL keep every Skill in the open Agent Skills format so that Skills remain usable by, and importable from, other Agent Skills-compatible tools.
+6. WHEN a User_Skill's `name` would collide with an existing Skill available to the user, THE AI_App_Builder SHALL namespace the User_Skill under the owning User_Account (for example, an invocation name of the form `user/skill-name`) so that the user can still add it, and IF a collision remains even within the user's own namespace, THEN THE AI_App_Builder SHALL reject the addition with a naming-collision error and SHALL leave the existing Skill unchanged.
+7. THE AI_App_Builder SHALL reserve a base namespace for Stocked_Skills and vendored lock-in Skills (the Guard_Skill and the Devendor_Skill), such that a User_Skill SHALL NOT overwrite a Stocked_Skill or a vendored lock-in Skill.
+8. WHEN a user edits or deletes a User_Skill, THE AI_App_Builder SHALL apply the change to the user's Skill_Library and SHALL leave every Stocked_Skill unchanged.
+9. THE AI_App_Builder SHALL keep every Skill in the open Agent Skills format so that Skills remain usable by, and importable from, other Agent Skills-compatible tools.
 
 ### Requirement 14: Persistent Memory Across Chats
 
@@ -370,9 +379,13 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 2. IF the `verify` tool cannot produce a Verify_Result (no command discovered, timeout, or safety-guard refusal), THEN THE AI_App_Builder SHALL report the verify failure with its cause and SHALL leave Project files unchanged.
 3. IF a Verify_Result reports verdict FAIL, THEN THE AI_App_Builder SHALL initiate Self_Healing by supplying the failure output (failure lines and output tail) to the Builder_Agent for correction.
 4. WHILE Self_Healing is active, THE AI_App_Builder SHALL re-run the `verify` tool after each correction attempt to obtain a new Verify_Result.
-5. WHILE Self_Healing is active, THE AI_App_Builder SHALL stop after a configured maximum number of correction attempts (default 3, configurable 1–10).
-6. IF Self_Healing reaches the maximum number of correction attempts without a verdict PASS, THEN THE AI_App_Builder SHALL report the unresolved error output and the number of attempts made, and SHALL stop attempting further automatic corrections.
-7. WHEN Self_Healing produces a verdict PASS, THE AI_App_Builder SHALL report the resolution, the number of attempts made, and the corrective Diffs to the user.
+5. THE AI_App_Builder SHALL allow the user to configure Self_Healing behavior, including enabling or disabling automatic Self_Healing and setting the maximum number of correction attempts (default 3, configurable 1–10), with automatic Self_Healing enabled by default.
+6. WHERE Self_Healing is disabled, THE AI_App_Builder SHALL report the failing Verify_Result to the user and SHALL NOT attempt automatic correction.
+7. WHILE Self_Healing is active, THE AI_App_Builder SHALL stop after the configured maximum number of correction attempts (default 3, configurable 1–10).
+8. IF Self_Healing detects that a correction attempt reproduces a previously-seen failure signature — the same error recurring across attempts — THEN THE AI_App_Builder SHALL stop Self_Healing early, report the oscillation to the user, and SHALL NOT continue retrying variations of the failing approach.
+9. IF Self_Healing reaches the maximum number of correction attempts without a verdict PASS, THEN THE AI_App_Builder SHALL report the unresolved error output and the number of attempts made, and SHALL stop attempting further automatic corrections.
+10. WHEN Self_Healing stops without a verdict PASS, whether because the attempt cap was reached or an oscillation was detected, THE AI_App_Builder SHALL surface the unresolved error to the user with the captured failure output and the attempt history so the user can intervene.
+11. WHEN Self_Healing produces a verdict PASS, THE AI_App_Builder SHALL report the resolution, the number of attempts made, and the corrective Diffs to the user.
 
 ### Requirement 21: Model and Provider Selection
 
@@ -401,7 +414,40 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 6. WHERE a Builder_Agent operation is delegated to a plumby sub-agent, THE AI_App_Builder SHALL run the sub-agent's commands under plumby's read-only sub-agent policy, blocking any confirm-class or refuse-class command without execution.
 7. WHEN the AI_App_Builder truncates captured command or build output exceeding 64 KB per stream, THE AI_App_Builder SHALL retain the first 64 KB and append a truncation notice, on its own line, indicating the number of bytes omitted.
 
-### Requirement 23: Collaboration and Sharing (Nice-to-Have)
+### Requirement 23: Platform Operations: Rate Limiting, Quotas, and Abuse Prevention
+
+**User Story:** As a platform operator, I want per-account rate limits, resource quotas, and abuse mitigation, so that no single user can exhaust shared platform capacity or degrade service for others.
+
+#### Acceptance Criteria
+
+1. THE AI_App_Builder SHALL enforce per-User_Account Rate_Limits on resource-creating operations, including Project creation, builds, deployments, and generation turns.
+2. THE AI_App_Builder SHALL enforce per-User_Account and per-Project Resource_Quotas, at minimum a maximum number of concurrent Sandboxes, a maximum total number of Projects, and the CPU, memory, and execution-time limits already applied per Sandbox.
+3. IF a User_Account exceeds a configured Rate_Limit or Resource_Quota, THEN THE AI_App_Builder SHALL reject the offending request with a quota or rate-limit error indicating which limit was exceeded and SHALL NOT allocate additional resources for that request.
+4. WHEN the AI_App_Builder detects an abusive usage pattern, such as sustained failed builds or runaway resource consumption, THE AI_App_Builder SHALL mitigate it by throttling or suspending the offending Sandbox and SHALL report the action taken.
+
+### Requirement 24: Data Retention, Deletion, and Secret Protection
+
+**User Story:** As a builder user, I want clear control over how long my data is kept and the ability to delete it, and I want my secrets protected, so that I retain ownership of my data and my credentials stay safe.
+
+#### Acceptance Criteria
+
+1. WHEN a user requests deletion of a Project, THE AI_App_Builder SHALL delete the Project's files, Snapshots, Sandbox, and associated Secrets, and SHALL confirm the deletion to the user.
+2. WHEN a user requests deletion of their User_Account, THE AI_App_Builder SHALL delete or irreversibly anonymize all data owned by that User_Account, including Projects, Skills, Project_Memory and Global_Memory, Connectors, and Secrets.
+3. THE AI_App_Builder SHALL store every Secret and every Connector credential with Encryption_At_Rest.
+4. THE AI_App_Builder SHALL NOT log any Secret value or Connector credential value in plaintext in any platform log or audit record.
+5. THE AI_App_Builder SHALL retain a Project's persisted state and Snapshots until the user deletes the Project or the User_Account, and SHALL document the retention behavior to the user.
+
+### Requirement 25: Observability and Audit Logging
+
+**User Story:** As a platform operator, I want audit logs of security-relevant actions and operational telemetry, so that I can investigate security events and diagnose failures.
+
+#### Acceptance Criteria
+
+1. THE AI_App_Builder SHALL record an audit log of security-relevant actions — authentication, authorization decisions, Secret access, destructive confirm-class operations, and deletions — scoped to the acting User_Account, and SHALL exclude Secret values from the audit log.
+2. THE AI_App_Builder SHALL emit platform operational metrics and error events sufficient to detect and diagnose failures in Sandbox provisioning, generation turns, builds, and deployments.
+3. WHEN a platform-level error occurs during an operation on behalf of a User_Account, THE AI_App_Builder SHALL surface a user-facing error indication and SHALL record the error in the operational log with correlation to the operation.
+
+### Requirement 26: Collaboration and Sharing (Nice-to-Have)
 
 **User Story:** As a builder user, I want to share a project or its live preview, so that others can view my work.
 

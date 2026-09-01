@@ -24,8 +24,10 @@ provider so they stay cheap and hermetic. Every property test runs **≥100 iter
 `Feature: ai-app-builder, Property N: {title}`.
 
 **Task convention:** sub-tasks postfixed with `*` are test tasks and are optional/skippable for a faster MVP;
-they are still scheduled in the dependency graph. Requirement 23 (Sharing) is a nice-to-have and is grouped
-last and marked deferrable.
+they are still scheduled in the dependency graph. Requirement 26 (Sharing) is a nice-to-have and is grouped
+last and marked deferrable. The cross-cutting platform-operations subsystems — rate limiting/quotas (Req 23),
+data retention/deletion + secret encryption (Req 24), and observability/audit logging (Req 25) — are built on
+top of the security foundations (Auth, SecretStore, Builder Server) once those exist.
 
 ## Tasks
 
@@ -69,13 +71,23 @@ last and marked deferrable.
 
 - [ ] 4. Implement Authentication & Authorization (security foundation)
   - [ ] 4.1 Implement AuthService/IdentityManager
-    - Implement `authenticate(request) → User_Account | Denied` requiring an authenticated account before
-      create/open/modify; unauthenticated attempts denied without disclosing Project contents
-    - Implement `authorize(userAccount, action, resource) → Allowed | AccessDenied` as the per-resource
-      ownership/grant check for Projects, User_Skills, Global_Memory, Connectors, Secrets, Share_Links
+    - Implement `authenticate(request) → User_Account | Denied` via **OAuth 2.0 / OIDC** delegated to
+      third-party identity providers (GitHub, Google) — the platform stores **no passwords or credentials of
+      its own**; it records only the IdP-issued subject as `User_Account.authIdentity`. Require an
+      authenticated account before create/open/modify; unauthenticated attempts denied without disclosing
+      Project contents
+    - Implement short-lived **signed session tokens** (documented lifetime ~24h) with **refresh/rotation**
+      (renew before expiry, rotate on renewal), each session **bound to exactly one User_Account**;
+      `scopeSession(userAccount)` attaches that account to every downstream request/Project/memory. Session
+      issuance/rotation/expiry are auditable security events (feeds Req 25.1 audit log in task 12)
+    - Implement `authorize(userAccount, action, resource) → Allowed | AccessDenied` as the single
+      **ownership-based owner-or-grant** check (no RBAC/ABAC) for Projects, User_Skills, Global_Memory,
+      Connectors, Secrets, Share_Links — the account owns its resources and shared access is expressed as
+      explicit grants (today only a read-only Share_Link)
     - Implement `resolveAccess(userAccount, ref)` as the single "authorized to access" resolution (import
-      repos, fork sources, share links) against the requesting account, and `scopeSession(userAccount)` to
-      scope sessions/projects/memory to the account
+      repos, fork sources, share links) against the requesting account; enforce three-axis multi-tenant data
+      isolation — control-plane records keyed/filtered by `ownerId`, per-Project (hence per-owner) storage
+      paths, and per-Project runtime isolation via the Isolation_Boundary
     - _Requirements: 7.1, 7.2, 7.3, 7.4, 7.5, 7.6_
 
   - [ ]* 4.2 Write unit tests for auth/authz
@@ -87,11 +99,24 @@ last and marked deferrable.
   - This is the single largest scope item: plumby ships **no** per-project isolation (its README says "a
     permission model, not a sandbox"), so the boundary is genuinely new. It must hold independently of the
     permission classifier.
+  - **v1 technology choice:** the boundary is an **OS-level container (Docker/OCI)** using **filesystem
+    (bind-mount only that Project's tree), PID/process-namespace, and network-namespace isolation** plus
+    **cgroup CPU/memory/execution-time limits** (reused by the Req 23 quota model). **gVisor / Firecracker
+    microVMs are a documented upgrade path** reachable **without changing the `SandboxManager` interface**
+    (`acquire`/`exec`/`release`).
+  - **Prototype-first + overhead budget:** because this is the highest-risk item, prototype and **benchmark
+    the per-command boundary-check overhead early** (budget: well under ~5% / sub-second per command) before
+    dependent subsystems are built out; cold-start provisioning is why Req 1.1 is stated as an SLO.
   - [ ] 5.1 Implement SandboxManager provisioning and reaping
-    - Implement `acquire(projectId) → Sandbox`: provision a per-Project Isolation_Boundary (container/VM) with
-      filesystem, process, and network isolation; apply resource limits (CPU, memory, execution-time); mount
-      only that Project's tree. Use plumby's opt-in `Dockerfile` (non-root, keys from env at run time) as a
+    - Implement `acquire(projectId) → Sandbox`: provision a per-Project Isolation_Boundary as an OS-level
+      container with filesystem (per-container root, only that Project's tree bind-mounted), PID/process, and
+      network-namespace isolation; apply cgroup resource limits (CPU, memory, execution-time); mount only
+      that Project's tree. Use plumby's opt-in `Dockerfile` (non-root, keys from env at run time) as a
       starting input, not the boundary itself
+    - Implement a **deny-by-default egress allowlist** derived from the Project's configured Connectors
+      (reconciling Req 8.1 network isolation with Req 10 connector egress): no inbound/lateral/host access,
+      outbound denied except explicitly-configured Connector hosts (plus the Package_Manager registry for
+      Req 17); adding a Connector adds its endpoint(s), removing it revokes them
     - Implement `release(projectId)` reaping in a `finally`, including orphan cleanup on failed import
     - _Requirements: 8.1, 8.2, 8.3, 8.4, 6.5_
 
@@ -227,78 +252,154 @@ last and marked deferrable.
       diff; turn-complete indicator; over-cap truncation notice — reusing `src/web/events.js` assertions
     - _Requirements: 4.1, 4.2, 4.3, 4.5, 4.6_
 
-- [ ] 12. Implement Project lifecycle and creation orchestration
-  - [ ] 12.1 Implement ProjectManager input validation and creation timing
+- [ ] 12. Implement platform-operations foundations (rate limiting/quotas, data retention/deletion + secret encryption, observability/audit logging)
+  - These cross-cutting subsystems build on the security foundations: they come after Auth (task 4), the
+    SecretStore (task 7), and the Builder Server (task 10) exist, and the QuotaManager gate sits in the
+    Builder Server request path (authn/authz → rate-limit/quota → allocation → loop turn).
+  - [ ] 12.1 Implement the QuotaManager / RateLimiter pre-allocation gate (Req 23)
+    - Implement a QuotaManager / RateLimiter that gates requests in the Builder Server **before any resource
+      is allocated** (ordered after authn/authz and before `SandboxManager.acquire`): `checkRate(userAccount,
+      operation)` enforcing per-User_Account Rate_Limits on resource-creating operations (Project creation,
+      builds, deployments, generation turns); `checkQuota(userAccount, projectId, resource)` enforcing
+      per-User_Account and per-Project Resource_Quotas — max concurrent Sandboxes, max total Projects, and the
+      per-Sandbox CPU/memory/execution-time limits **reused from the Isolation_Boundary (Req 8.2)**
+    - On exceeding a Rate_Limit or Resource_Quota, reject the request with a quota/rate-limit error **naming
+      the exceeded limit** and allocate nothing (the over-limit request never provisions a boundary)
+    - Implement `observeUsage(sandboxId, signal)` abuse detection: on sustained failed builds (reusing the
+      Self-Healing failure-signature signal from task 17) or runaway resource consumption, **throttle or
+      suspend** the offending Sandbox and **report the action taken**, emitting an audit + operational event
+    - _Requirements: 23.1, 23.2, 23.3, 23.4_
+    - Note: reuses the per-Sandbox CPU/memory/execution-time limits from Req 8.2 (task 5) rather than
+      redefining them.
+
+  - [ ]* 12.2 Write unit tests for rate limiting, quotas, and abuse mitigation
+    - Over-Rate_Limit and over-Resource_Quota requests rejected naming the exceeded limit with nothing
+      allocated; abuse pattern (sustained failed builds / runaway consumption) throttles or suspends the
+      Sandbox and reports the action
+    - _Requirements: 23.3, 23.4_
+
+  - [ ] 12.3 Implement Project and User_Account deletion (Req 24.1, 24.2)
+    - Implement Project deletion removing the Project's **files, Snapshots, Sandbox (via
+      `SandboxManager.release`), and associated Secrets**, then confirm the deletion to the user; implement
+      User_Account deletion that **deletes or irreversibly anonymizes all data owned by the account** —
+      Projects, Skills, Project_Memory and Global_Memory, Connectors, and Secrets — iterating every resource
+      keyed by `ownerId`, and confirms to the user
+    - Document retain-until-deletion behavior: a Project's persisted state and Snapshots are retained until
+      the user deletes the Project or the User_Account (no silent expiry)
+    - _Requirements: 24.1, 24.2, 24.5_
+
+  - [ ] 12.4 Extend the SecretStore with Encryption_At_Rest and plaintext-safe logging (Req 24.3, 24.4)
+    - Extend the out-of-tree SecretStore so **every Secret and every Connector credential is stored with
+      Encryption_At_Rest** via envelope encryption (value encrypted with a data key; data key wrapped by a
+      master key held in a KMS/keystore), decrypted only for Sandbox env injection at runtime; add
+      `deleteProjectSecrets(projectId)` / `deleteAccountData(userAccountId)` used by task 12.3
+    - Ensure **no Secret or Connector credential value is ever written in plaintext** to any platform log or
+      audit record (route all values through the centralized secret-redaction filter)
+    - _Requirements: 24.3, 24.4_
+
+  - [ ]* 12.5 Write unit tests for deletion completeness and secret protection
+    - Project/account deletion removes (or irreversibly anonymizes) all owned data; Secrets and Connector
+      credentials are stored encrypted at rest (raw value not recoverable from stored bytes without the key);
+      no plaintext secret value appears in any log/audit record
+    - _Requirements: 24.1, 24.2, 24.3, 24.4_
+
+  - [ ] 12.6 Implement the AuditLog / Observability component (Req 25)
+    - Implement an append-only **audit log** of security-relevant actions — authentication, authorization
+      decisions, Secret access, destructive confirm-class operations, and deletions — **scoped to the acting
+      User_Account** with **Secret values redacted**; wire the choke points already identified: session
+      issuance/rotation (task 4), `AuthService.authorize` decisions (task 4), SecretStore access (tasks 7,
+      12.4), the CommandGuard confirm path (task 6), and the deletion flows (task 12.3)
+    - Emit operational **metrics / error events** for Sandbox provisioning, generation turns, builds, and
+      deployments; implement `reportError(userAccount, op, cause) → correlationId` so that on a platform-level
+      error the platform **surfaces a user-facing error indication and records a correlated operational log
+      entry**; centralize secret redaction so no log path (audit, metrics, error) leaks a value
+    - _Requirements: 25.1, 25.2, 25.3_
+
+  - [ ]* 12.7 Write unit tests for audit logging and correlated error reporting
+    - Audit entries recorded for authn/authz/secret-access/confirm-class/deletion scoped to the acting
+      account with secret values redacted; a platform-level error produces a user-facing error indication
+      plus a correlated operational log entry
+    - _Requirements: 25.1, 25.3_
+
+- [ ] 13. Implement Project lifecycle and creation orchestration
+  - [ ] 13.1 Implement ProjectManager input validation and creation timing
     - Validate description trimmed to 1–5,000 chars and `Target_Category`/`Project_Origin` against closed
       enums **before** any Project is created; reject empty/short description, unsupported category, or
       unsupported origin with a specific message and no partial Project
-    - Implement the 10s "begins creation" bound: record the Project and allocate its Sandbox (via
-      SandboxManager) so it becomes available for streaming; delegate generation to a Builder_Agent
+    - Implement the 10s "begins creation" **SLO** (per revised Req 1: target for ≥95% of requests under
+      normal load, not a hard per-request bound — cold Sandbox provisioning may occasionally exceed it):
+      record the Project and allocate its Sandbox (via SandboxManager) so it becomes available for streaming;
+      delegate generation to a Builder_Agent
     - _Requirements: 1.1, 1.4, 1.5, 1.6, 5.7_
 
-  - [ ] 12.2 Wire generation → verify → Dev_Server start / editable-on-fail
+  - [ ] 13.2 Wire generation → verify → Dev_Server start / editable-on-fail
     - On generation completion run verify; on PASS start Dev_Server (Preview available ≤60s of start); on FAIL
       report captured error, do not start Dev_Server, retain files editable
     - _Requirements: 1.3, 1.7_
 
-  - [ ]* 12.3 Write unit tests for creation validation boundaries
+  - [ ]* 13.3 Write unit tests for creation validation boundaries
     - 0 chars, 5,000 chars, 5,001 chars; each invalid enum value; verify-FAIL keeps files editable and does
       not start Dev_Server
     - _Requirements: 1.4, 1.5, 1.6, 1.7_
 
-- [ ] 13. Implement Project Origins (blank, template, github-import, fork)
-  - [ ] 13.1 Implement blank and template origins
+- [ ] 14. Implement Project Origins (blank, template, github-import, fork)
+  - [ ] 14.1 Implement blank and template origins
     - `blank`: write only the minimal files for the Sandbox + Dev_Server to start, no Template applied.
       `template`: copy the Template matching the `Target_Category`, populating all Template files + dependency
-      manifest within 30s; on write failure abort, remove partial files, name the failed artifact
+      manifest within a **30s SLO** (per revised Req 5.2: target for ≥95% of Templates under normal load;
+      larger Templates may take proportionally longer); on write failure abort, remove partial files, name
+      the failed artifact
     - Converge all origins onto the identical downstream refinement/preview/persist/verify pipeline
     - _Requirements: 6.1, 6.2, 6.3, 6.8, 5.2, 5.3_
 
-  - [ ] 13.2 Implement github-import and fork origins
-    - `github-import`: clone the repository into the Project's Sandbox within 120s as a `bash` command
-      (passes the classifier); on invalid/inaccessible ref or timeout abort with cause, create no partial
-      Project, leave no orphaned Sandbox (reap in `finally`)
+  - [ ] 14.2 Implement github-import and fork origins
+    - `github-import`: clone the repository into the Project's Sandbox as a `bash` command (passes the
+      classifier) — for a small repo (≤100 MB) within a **120s SLO** under normal load (per revised Req 6.4);
+      for a repo **>100 MB report ongoing clone progress** and apply a **configurable maximum clone time
+      (default 600s)** (Req 6.5); on invalid/inaccessible ref or exceeding the applicable max clone time
+      abort with cause, create no partial Project, leave no orphaned Sandbox (reap in `finally`)
     - `fork`: after authorization check, copy the referenced Project's **most recent Snapshot** as the new
       starting state, fully independent of the origin; reject fork of nonexistent/unauthorized Project,
       creating nothing
-    - _Requirements: 6.4, 6.5, 6.6, 6.7_
+    - _Requirements: 6.4, 6.5, 6.6, 6.7, 6.8_
 
-  - [ ]* 13.3 Write property test for blank origin still runs
+  - [ ]* 14.3 Write property test for blank origin still runs
     - **Property 11: Blank origin still runs** — for all `blank` Projects, the Sandbox and Dev_Server start
       successfully with only the minimal generated files
     - Toolchain-backed via `eval/runner.js` (hermetic temp dir, scripted provider); bounded generators; ≥100
       iterations; tag `Feature: ai-app-builder, Property 11: Blank origin still runs`
     - **Validates: Requirements 6.2**
 
-  - [ ]* 13.4 Write property test for fork independence
+  - [ ]* 14.4 Write property test for fork independence
     - **Property 10: Fork independence** — for all forked Projects, mutating the fork does not change the
       origin Project's file state
     - `fast-check` fork/mutate/compare over generated trees; ≥100 iterations; tag
       `Feature: ai-app-builder, Property 10: Fork independence`
     - **Validates: Requirements 6.6**
 
-  - [ ]* 13.5 Write integration tests for import timing and orphan cleanup
-    - github-import clone ≤120s success path; failure/orphan-cleanup path leaves no running Sandbox; creation
-      begins ≤10s; Template population ≤30s
+  - [ ]* 14.5 Write integration tests for import timing and orphan cleanup
+    - github-import clone ≤120s SLO success path (≤100 MB repo); >100 MB repo reports progress and honors the
+      configurable 600s max clone time; failure/orphan-cleanup path leaves no running Sandbox; creation
+      begins within the 10s SLO; Template population within the 30s SLO
     - _Requirements: 6.4, 6.5, 1.1, 5.2_
 
-- [ ] 14. Implement Project Scaffolding and Templates (per Target_Category)
-  - [ ] 14.1 Implement Template set and baseline build
+- [ ] 15. Implement Project Scaffolding and Templates (per Target_Category)
+  - [ ] 15.1 Implement Template set and baseline build
     - Provide at least one Template per `Target_Category` (`web`, `full-stack-web`, `mobile`, `multi-target`);
       a `multi-target` Template scaffolds exactly four Targets (`web`, `backend`, `mobile`, `shared`); each
       Template's baseline build completes with exit 0 and no errors before any refinement; a baseline build
       exceeding 300s marks instantiation failed with a build-failure error
     - _Requirements: 5.1, 5.4, 5.5, 5.6, 16.1_
 
-  - [ ]* 14.2 Write property test for template baseline builds
+  - [ ]* 15.2 Write property test for template baseline builds
     - **Property 7: Template baseline builds** — for all Templates, instantiating a Project and running
       plumby's `verify` produces `verdict: PASS` before any user refinement
     - Toolchain-backed via `eval/runner.js` (hermetic temp dir, scripted provider); iterate over each
       Template; ≥100 iterations; tag `Feature: ai-app-builder, Property 7: Template baseline builds`
     - **Validates: Requirements 5.4, 5.5**
 
-- [ ] 15. Implement iterative refinement routing (edit_file semantics)
-  - [ ] 15.1 Implement refinement application via plumby edit_file
+- [ ] 16. Implement iterative refinement routing (edit_file semantics)
+  - [ ] 16.1 Implement refinement application via plumby edit_file
     - Route refinement messages to apply changes only to files within the existing Project (no new Project,
       no regen from scratch), using plumby's `edit_file` exact-string replacement against a single contiguous
       target; preserve every byte outside edited regions; render the change as a visual Diff within 2s
@@ -306,13 +407,13 @@ last and marked deferrable.
       found", all files unchanged; no actionable change → "no changes applied", files unchanged
     - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7_
 
-  - [ ]* 15.2 Write unit tests for edit_file failure modes
+  - [ ]* 16.2 Write unit tests for edit_file failure modes
     - Zero-match, multi-match, missing file, no-op refinement each leave files unchanged with the correct
       report
     - _Requirements: 2.5, 2.6, 2.7_
 
-- [ ] 16. Implement the Self-Healing controller (reuse plumby verify)
-  - [ ] 16.1 Implement the verify-driven heal loop
+- [ ] 17. Implement the Self-Healing controller (reuse plumby verify)
+  - [ ] 17.1 Implement the verify-driven heal loop
     - Run plumby `verify` (default 120s, max 600s) to get a Verify_Result whose first line is the verdict; if
       verify cannot produce a result report the cause and leave files unchanged; on FAIL feed failure
       lines + output tail to the Builder_Agent, re-run verify after each attempt, cap at a configured max
@@ -320,20 +421,20 @@ last and marked deferrable.
       on PASS report resolution + attempt count + corrective Diffs and trigger a Snapshot commit
     - _Requirements: 20.1, 20.2, 20.3, 20.4, 20.5, 20.6, 20.7_
 
-  - [ ]* 16.2 Write unit tests for self-heal cap and reporting
+  - [ ]* 17.2 Write unit tests for self-heal cap and reporting
     - verify-cannot-produce path leaves files unchanged; FAIL→heal→re-verify; cap stops without infinite loop;
       PASS reports diffs and triggers snapshot
     - _Requirements: 20.2, 20.5, 20.6, 20.7_
 
-- [ ] 17. Implement the Preview pipeline (web + mobile/Expo)
-  - [ ] 17.1 Implement PreviewController publish-on-commit and web preview
+- [ ] 18. Implement the Preview pipeline (web + mobile/Expo)
+  - [ ] 18.1 Implement PreviewController publish-on-commit and web preview
     - Serve an interactive in-browser `web` Preview reflecting the most-recent successfully-built **committed**
       Snapshot; label uncommitted hot-reload as in-progress/building; on Snapshot commit point the served
       Preview at the committed tree and update within 5s; if a committed Snapshot fails to build, retain the
       last successfully-built Preview, show the captured build error, and indicate a prior state is shown
     - _Requirements: 3.1, 3.3, 3.4_
 
-  - [ ] 17.2 Implement Dev_Server lifecycle and mobile/Expo preview
+  - [ ] 18.2 Implement Dev_Server lifecycle and mobile/Expo preview
     - Preview-loading status while starting; 60s startup-timeout error with a restart offer; unexpected-exit
       handling preserves state and offers restart; restart capped at 3 attempts then a persistent-failure
       error with no further automatic restarts. For `mobile`, expose an Expo-compatible Preview endpoint
@@ -341,7 +442,7 @@ last and marked deferrable.
       report cause and retain prior reachable Preview
     - _Requirements: 3.2, 3.5, 3.6, 3.7, 15.2, 15.3_
 
-  - [ ]* 17.3 Write property test for Preview reflecting committed state
+  - [ ]* 18.3 Write property test for Preview reflecting committed state
     - **Property 3: Preview reflects committed state** — for all sequences of committed Snapshots and
       uncommitted edits, served Preview content corresponds to the most-recently successfully-built committed
       Snapshot, never uncommitted intermediate state
@@ -349,39 +450,39 @@ last and marked deferrable.
       `Feature: ai-app-builder, Property 3: Preview reflects committed state`
     - **Validates: Requirements 3.1, 3.3, 3.4**
 
-- [ ] 18. Implement dependency and package management
-  - [ ] 18.1 Implement Package_Manager install inside the Sandbox
+- [ ] 19. Implement dependency and package management
+  - [ ] 19.1 Implement Package_Manager install inside the Sandbox
     - The Builder_Agent adds to the manifest, then the Package_Manager (npm) installs inside the Sandbox
       within 300s, resolvable to build/Dev_Server with no extra step; on failure/timeout report installer
       output, restore the manifest to its prior state, expose no partial deps; route every package command
       through the classifier; a denied command cancels install, changes nothing, reports the denial
     - _Requirements: 17.1, 17.2, 17.3, 17.4, 17.5_
 
-  - [ ]* 18.2 Write unit tests for install failure and denial
+  - [ ]* 19.2 Write unit tests for install failure and denial
     - Failure/timeout restores manifest and exposes no partial deps; classifier-denied command cancels with
       no change and a denial report
     - _Requirements: 17.3, 17.5_
 
-- [ ] 19. Implement full-stack + database support
-  - [ ] 19.1 Implement backend scaffolding and database provisioning
+- [ ] 20. Implement full-stack + database support
+  - [ ] 20.1 Implement backend scaffolding and database provisioning
     - For `full-stack-web`/`multi-target`, scaffold a `backend` Target with at least one reachable endpoint
       returning HTTP < 400 in the Sandbox; provision a Database_Service within 60s and report it ready before
       scaffolding completes; on timeout/failure report the cause and leave no partially provisioned DB active
     - _Requirements: 9.1, 9.2, 9.3_
 
-  - [ ] 19.2 Implement confirm-gated schema migrations
+  - [ ] 20.2 Implement confirm-gated schema migrations
     - Run schema migrations through the confirm-gated command path (classifier tags migrations as
       `db-migration` → confirm) within 120s and report the applied version; on failure/timeout report the
       cause and leave the prior schema in effect with no partial changes
     - _Requirements: 9.4, 9.5_
 
-  - [ ]* 19.3 Write integration tests for DB provisioning and migration timing
+  - [ ]* 20.3 Write integration tests for DB provisioning and migration timing
     - DB ready ≤60s before scaffolding completes; migration ≤120s via the confirm path; failure paths leave no
       partial DB / prior schema intact
     - _Requirements: 9.2, 9.3, 9.4, 9.5_
 
-- [ ] 20. Implement the Connector subsystem (catalog, capture, injection)
-  - [ ] 20.1 Implement Connector catalog and credential capture
+- [ ] 21. Implement the Connector subsystem (catalog, capture, injection)
+  - [ ] 21.1 Implement Connector catalog and credential capture
     - Provide a Connector_Catalog across all six categories (`database`, `auth`, `payments`,
       `hosting-deploy`, `storage`, `ai-model`); initiate the per-Connector OAuth or API-key capture flow; on
       success store the credential as a Secret and inject it into the Sandbox env at runtime; on
@@ -392,20 +493,20 @@ last and marked deferrable.
     - Keep the `ai-model` Connector (a service the generated app calls) distinct from the builder provider
     - _Requirements: 10.1, 10.2, 10.3, 10.5, 10.6, 10.7, 10.8_
 
-  - [ ]* 20.2 Write property test for Connector credential non-leakage
+  - [ ]* 21.2 Write property test for Connector credential non-leakage
     - **Property 9: Connector credential non-leakage** — for all Connectors added to a Project, no generated
       source file committed to a Snapshot contains the literal credential value
     - `fast-check` generates credential strings, grep the committed tree; ≥100 iterations; tag
       `Feature: ai-app-builder, Property 9: Connector credential non-leakage`
     - **Validates: Requirements 10.4, 11.4**
 
-  - [ ]* 20.3 Write unit tests for capture failure handling
+  - [ ]* 21.3 Write unit tests for capture failure handling
     - Capture fail/cancel/deny stores nothing partial and leaves existing Connectors/Secrets unchanged;
       removal revokes injection and reports
     - _Requirements: 10.6, 10.7_
 
-- [ ] 21. Implement Skill Library + vendored lock-in skills
-  - [ ] 21.1 Implement the build/release-time vendoring copy step
+- [ ] 22. Implement Skill Library + vendored lock-in skills
+  - [ ] 22.1 Implement the build/release-time vendoring copy step
     - Add a build/release-time step that **copies** the `vendor-lockin-guard/` and `devendor-project/`
       SKILL.md folders from the `agent-skills-lockin` repo into plumby's skills directory, so they are
       discoverable at session start with **no runtime fetch/clone**; keep the vendored copies in sync with the
@@ -413,7 +514,7 @@ last and marked deferrable.
       `name` + `description`)
     - _Requirements: 12.1, 12.2, 12.13, 12.14, 12.15_
 
-  - [ ] 21.2 Wire skill loading and lock-in behavioral hooks via plumby
+  - [ ] 22.2 Wire skill loading and lock-in behavioral hooks via plumby
     - Reuse plumby `src/core/skills.js` + `src/tools/load_skill.js` progressive disclosure: expose only
       `name` + `description` at session start (description clipped ≤500 chars, listing block capped 16 KiB
       with truncation notice), load a body by exact `name` (stripped, ≤64 KiB with notice); unknown name →
@@ -426,14 +527,19 @@ last and marked deferrable.
       pre-operation state)
     - _Requirements: 12.3, 12.4, 12.5, 12.6, 12.7, 12.8, 12.9, 12.10, 12.11, 12.12_
 
-  - [ ] 21.3 Implement Skill Library CRUD
+  - [ ] 22.3 Implement Skill Library CRUD with per-user namespacing
     - Ship a curated set of Stocked_Skills; create a User_Skill by `name` + `description` + body; import an
-      Agent-Skills-format skill validated for `name` + `description`; missing field → reject naming it; name
-      collision → reject, existing unchanged; edit/delete of a User_Skill leaves Stocked_Skills untouched;
-      everything stays in the open format
+      Agent-Skills-format skill validated for `name` + `description`; missing field → reject naming it;
+      edit/delete of a User_Skill leaves Stocked_Skills untouched; everything stays in the open format
+    - **Namespacing (Req 13.6, 13.7):** a User_Skill whose `name` collides with an existing available Skill
+      is placed under the owning User_Account namespace (invocation name `user/skill-name`) so it can still
+      be added; Stocked_Skills and vendored lock-in skills (Guard/Devendor) occupy a **reserved base
+      namespace a User_Skill can never overwrite**; only an **intra-user-namespace duplicate** (`user/<name>`
+      already present for this owner) is rejected with a naming-collision error, leaving the existing Skill
+      unchanged
     - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.5, 13.6, 13.7, 13.8_
 
-  - [ ]* 21.4 Write property test for skills remaining portable
+  - [ ]* 22.4 Write property test for skills remaining portable
     - **Property 19: Skills remain portable** — for all Skills in a user's library, each remains a valid
       open-format Agent Skill (SKILL.md with `name` + `description`) exportable and loadable by another Agent
       Skills tool
@@ -441,17 +547,19 @@ last and marked deferrable.
       `Feature: ai-app-builder, Property 19: Skills remain portable`
     - **Validates: Requirements 12.13, 13.8**
 
-  - [ ]* 21.5 Write unit tests for vendoring and skill CRUD edges
+  - [ ]* 22.5 Write unit tests for vendoring and skill CRUD edges
     - Guard/Devendor SKILL.md folders present in plumby's skills dir at session start with no runtime fetch;
       description clip / 16 KiB listing cap / 64 KiB body cap; missing-name → dir name; duplicate → first
-      wins; import missing field rejected; name collision rejected leaving existing unchanged
-    - _Requirements: 12.1, 12.3, 12.4, 12.10, 12.15, 13.5, 13.6_
+      wins; import missing field rejected; colliding User_Skill placed under `user/<name>` namespace and
+      still added; User_Skill cannot overwrite a reserved base-namespace (Stocked/vendored-lockin) skill;
+      only an intra-user-namespace duplicate is rejected leaving the existing skill unchanged
+    - _Requirements: 12.1, 12.3, 12.4, 12.10, 12.15, 13.5, 13.6, 13.7_
 
-- [ ] 22. Checkpoint - generation, previews, connectors, and skills
+- [ ] 23. Checkpoint - generation, previews, connectors, and skills
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 23. Implement the Memory subsystem (Project + Global, files-on-disk)
-  - [ ] 23.1 Implement memory stores, modes, and manual controls
+- [ ] 24. Implement the Memory subsystem (Project + Global, files-on-disk)
+  - [ ] 24.1 Implement memory stores, modes, and manual controls
     - Maintain Project_Memory (per-Project, persisted with the Project, restored on reopen) and Global_Memory
       (per-user across Projects) as human-readable files on disk; default Memory_Mode `auto` until changed;
       `auto` lets the Builder_Agent add/update entries for durable preferences/decisions/corrections; user may
@@ -459,7 +567,7 @@ last and marked deferrable.
       management; no hidden/non-exportable state
     - _Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 14.11, 14.12, 14.13_
 
-  - [ ] 23.2 Implement Memory_Cap and summarize-and-evict
+  - [ ] 24.2 Implement Memory_Cap and summarize-and-evict
     - Enforce a per-store cap (default 64 KiB and 200 entries, either binds; configurable). In `auto` at cap:
       keep the newest KEEP_RECENT (default 20) verbatim, structured-summarize the oldest overflow (DECISIONS,
       PREFERENCES, CONVENTIONS, CORRECTIONS) into one synthetic entry, evict summarized content first if still
@@ -467,34 +575,34 @@ last and marked deferrable.
       require manual pruning. In `off`: add nothing automatically, only explicit user entries
     - _Requirements: 14.7, 14.8, 14.9, 14.10_
 
-  - [ ]* 23.3 Write property test for memory staying within cap
+  - [ ]* 24.3 Write property test for memory staying within cap
     - **Property 16: Memory stays within cap** — for all `auto` stores, after any sequence of automatic
       additions the store stays at or below both the byte cap and entry cap, preserving the summarized gist
     - `fast-check` generates add sequences vs. cap; ≥100 iterations; tag
       `Feature: ai-app-builder, Property 16: Memory stays within cap`
     - **Validates: Requirements 14.7, 14.8**
 
-  - [ ]* 23.4 Write property test for memory being fully exportable
+  - [ ]* 24.4 Write property test for memory being fully exportable
     - **Property 17: Memory is fully exportable** — for all stores, exporting reproduces every current
       Memory_Entry as human-readable content with no hidden state omitted
     - `fast-check` generates a store, checks export completeness; ≥100 iterations; tag
       `Feature: ai-app-builder, Property 17: Memory is fully exportable`
     - **Validates: Requirements 14.6, 14.13**
 
-  - [ ]* 23.5 Write property test for off mode adding nothing automatically
+  - [ ]* 24.5 Write property test for off mode adding nothing automatically
     - **Property 18: Off mode adds nothing automatically** — for all `off` stores, no Memory_Entry is added
       except by explicit user action
     - `fast-check` generates off-mode add sequences; ≥100 iterations; tag
       `Feature: ai-app-builder, Property 18: Off mode adds nothing automatically`
     - **Validates: Requirements 14.10**
 
-  - [ ]* 23.6 Write unit tests for memory mode transitions
+  - [ ]* 24.6 Write unit tests for memory mode transitions
     - `auto`→`manual` freeze-and-notify at cap; `off` explicit-only; mode change applies to subsequent
       management
     - _Requirements: 14.9, 14.11_
 
-- [ ] 24. Implement Provider / model selection (reuse plumby resolution)
-  - [ ] 24.1 Implement ProviderResolver
+- [ ] 25. Implement Provider / model selection (reuse plumby resolution)
+  - [ ] 25.1 Implement ProviderResolver
     - Allow selecting a provider from `anthropic | gemini | openrouter`; the selection applies to every turn
       started after it until changed; unsupported provider → reject, Session unchanged, name it; unsupported
       model → reject, Session unchanged; with no explicit selection resolve the first provider in plumby's env
@@ -502,20 +610,20 @@ last and marked deferrable.
       Session unchanged. Keep this distinct from the `ai-model` Connector
     - _Requirements: 21.1, 21.2, 21.3, 21.4, 21.5, 21.6_
 
-  - [ ]* 24.2 Write unit tests for provider/model selection edges
+  - [ ]* 25.2 Write unit tests for provider/model selection edges
     - Unsupported provider/model rejected leaving Session unchanged; env-order default resolution; no-credential
       reports missing provider and starts no turn
     - _Requirements: 21.3, 21.4, 21.5, 21.6_
 
-- [ ] 25. Implement Build, Deploy, Mobile build, and Multi-target
-  - [ ] 25.1 Implement build + deploy for non-mobile Targets
+- [ ] 26. Implement Build, Deploy, Mobile build, and Multi-target
+  - [ ] 26.1 Implement build + deploy for non-mobile Targets
     - Build a non-`mobile` Target's Deployment_Artifact (exit 0) within 300s; non-zero exit or >300s → error,
       no artifact; deploy a Deployment_Artifact to a hosting destination returning the URL within 120s;
       deploy failure/timeout → report cause, prior deployed state unchanged; a `confirm`-classified deploy
       needs consent within 60s; deploying a nonexistent artifact is rejected
     - _Requirements: 18.1, 18.3, 18.4, 18.5, 18.6, 18.7, 18.8_
 
-  - [ ] 25.2 Implement mobile build timing (execution timeout, queue-aware)
+  - [ ] 26.2 Implement mobile build timing (execution timeout, queue-aware)
     - Scaffold Expo/RN `mobile` Target within 30s (exit 0); produce the `mobile` Deployment_Artifact within a
       configurable mobile-build-execution timeout (default 1800s) **measured from build-execution start,
       excluding queue time**; while queued on a shared build service report the queued status separately and
@@ -523,7 +631,7 @@ last and marked deferrable.
       artifacts unchanged; execution timeout or non-zero exit → failure cause, no artifact
     - _Requirements: 15.1, 15.4, 15.5, 15.6, 15.7, 18.2, 18.3_
 
-  - [ ] 25.3 Implement multi-target coordination
+  - [ ] 26.3 Implement multi-target coordination
     - Maintain exactly four Targets (`web`/`mobile`/`backend`/`shared`); propagate `shared` changes to the
       other three within 5s; failed propagation retains the last good `shared` in all Targets and names the
       failed Target(s); Preview selector with `web` default and an explicit "default used" indication; build
@@ -532,14 +640,14 @@ last and marked deferrable.
       invalid Target is rejected with the invalid Target named, no artifact modified
     - _Requirements: 16.2, 16.3, 16.4, 16.5, 16.6, 16.7, 16.8_
 
-  - [ ]* 25.4 Write integration tests for build/deploy/mobile/multi-target timing
+  - [ ]* 26.4 Write integration tests for build/deploy/mobile/multi-target timing
     - web/backend/shared build ≤300s; deploy URL ≤120s; confirm-gated deploy; mobile scaffold ≤30s, Expo
       endpoint ≤60s, build bounded by 1800s execution timeout with queued status reported separately and not
       counted; exactly four Targets; `shared` propagation ≤5s; per-Target artifact selection
     - _Requirements: 15.1, 15.2, 15.4, 15.5, 16.1, 16.2, 16.6, 18.1, 18.4_
 
-- [ ] 26. Implement Export + Lockin-Audit subsystem (portability)
-  - [ ] 26.1 Implement Project_Export
+- [ ] 27. Implement Export + Lockin-Audit subsystem (portability)
+  - [ ] 27.1 Implement Project_Export
     - Produce a self-contained copy of the Project's full file state that builds/runs outside the platform
       with a Standard_Toolchain, requiring no platform account and no network to a platform host, within 300s
       for ≤10,000 files; strip every Secret and Connector credential and include an env-var template listing
@@ -547,7 +655,7 @@ last and marked deferrable.
       returns a cause
     - _Requirements: 11.6, 11.7, 11.8_
 
-  - [ ] 26.2 Implement Lockin_Audit
+  - [ ] 27.2 Implement Lockin_Audit
     - Reuse the `detect-lockin.sh` concept + Guard/Devendor methodology: scan a Project (≤10,000 files,
       ≤120s) and report each detected signal (telemetry/beacons, injected UI/badges, hardcoded platform
       hosts, enforcement lint/convention rules, hash-protected files, undeclared outbound hosts) with file
@@ -556,7 +664,7 @@ last and marked deferrable.
       read-only sub-agent. Ensure generated projects carry no telemetry/branding/enforcement rules
     - _Requirements: 11.1, 11.2, 11.3, 11.9, 11.10, 11.11_
 
-  - [ ]* 26.3 Write property test for no enforcement lock-in
+  - [ ]* 27.3 Write property test for no enforcement lock-in
     - **Property 12: No enforcement lock-in in generated projects** — for all generated Projects, removing
       AI_App_Builder-specific code does not cause the baseline build to fail
     - Toolchain-backed via `eval/runner.js` (hermetic temp dir, scripted provider): remove platform markers,
@@ -564,14 +672,14 @@ last and marked deferrable.
       `Feature: ai-app-builder, Property 12: No enforcement lock-in in generated projects`
     - **Validates: Requirements 11.1, 11.2, 11.3**
 
-  - [ ]* 26.4 Write property test for export building standalone
+  - [ ]* 27.4 Write property test for export building standalone
     - **Property 13: Export builds standalone** — for all Project_Exports, the exported Project builds/runs
       with a Standard_Toolchain, no platform account, and no network to a platform host
     - Toolchain-backed via `eval/runner.js`: export → build in a no-network, no-credential sandbox; ≥100
       iterations; tag `Feature: ai-app-builder, Property 13: Export builds standalone`
     - **Validates: Requirements 11.6**
 
-  - [ ]* 26.5 Write property test for export credential non-leakage
+  - [ ]* 27.5 Write property test for export credential non-leakage
     - **Property 14: Export credential non-leakage** — for all Project_Exports, no exported file contains a
       literal Secret or Connector credential value, and the export includes an env-var template listing every
       required variable name with no value
@@ -579,34 +687,34 @@ last and marked deferrable.
       `Feature: ai-app-builder, Property 14: Export credential non-leakage`
     - **Validates: Requirements 11.8**
 
-  - [ ]* 26.6 Write property test for audit soundness on clean projects
+  - [ ]* 27.6 Write property test for audit soundness on clean projects
     - **Property 15: Audit soundness on clean projects** — for all generated Projects with no lock-in signals,
       a Lockin_Audit reports no signals (no false positives on clean output)
     - `fast-check` generates clean projects, audit reports nothing; ≥100 iterations; tag
       `Feature: ai-app-builder, Property 15: Audit soundness on clean projects`
     - **Validates: Requirements 11.9**
 
-- [ ] 27. Checkpoint - memory, providers, build/deploy, and portability
+- [ ] 28. Checkpoint - memory, providers, build/deploy, and portability
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 28. Implement Collaboration and Sharing (Nice-to-Have, deferrable)
-  - This epic implements Requirement 23, a lower-priority nice-to-have that MAY be deferred to a later
+- [ ] 29. Implement Collaboration and Sharing (Nice-to-Have, deferrable)
+  - This epic implements Requirement 26, a lower-priority nice-to-have that MAY be deferred to a later
     release. If implemented, its criteria are binding exactly as written.
-  - [ ] 28.1 Implement Share_Link generation, access, revocation
+  - [ ] 29.1 Implement Share_Link generation, access, revocation
     - Authorized share (authorization resolved against the requesting User_Account) → unique read-only
       Share_Link within 5s, expiring 7 days later; unauthorized/nonexistent → reject, no link; valid
       unexpired unrevoked link → read-only access within 5s; expired/revoked/malformed → deny, disclose
       nothing; a recipient's modification attempt is rejected, Project unchanged; revoke → deny all
       subsequent access within 5s; revoking a nonexistent/already-revoked link → report no match, other
       links unchanged
-    - _Requirements: 23.1, 23.2, 23.3, 23.4, 23.5, 23.6, 23.7, 7.5_
+    - _Requirements: 26.1, 26.2, 26.3, 26.4, 26.5, 26.6, 26.7, 7.5_
 
-  - [ ]* 28.2 Write unit tests for the Share_Link state machine
+  - [ ]* 29.2 Write unit tests for the Share_Link state machine
     - valid/expired/revoked/malformed access; recipient modification rejected; revoke-then-access;
       revoke nonexistent reports no match
-    - _Requirements: 23.3, 23.4, 23.5, 23.6, 23.7_
+    - _Requirements: 26.3, 26.4, 26.5, 26.6, 26.7_
 
-- [ ] 29. Final checkpoint - full-system wiring
+- [ ] 30. Final checkpoint - full-system wiring
   - Ensure all tests pass, confirm every subsystem is wired through the Builder Server behind Auth and the
     Isolation_Boundary + CommandGuard, and ask the user if questions arise.
 
@@ -621,10 +729,15 @@ last and marked deferrable.
   scripted provider.
 - The security-critical foundations (Isolation_Boundary, Auth, CommandGuard fail-closed / refuse-never-runs,
   secret non-leakage) are built and tested early (tasks 4–8) because every later subsystem depends on them.
+- The cross-cutting platform-operations subsystems — rate limiting/quotas (Req 23), data
+  retention/deletion + Secret Encryption_At_Rest (Req 24), and observability/audit logging (Req 25) — are in
+  task 12, placed after Auth (task 4), the SecretStore (task 7), and the Builder Server (task 10) so their
+  prerequisites exist; the QuotaManager gate sits in the Builder Server request path before allocation, the
+  retention work extends the SecretStore, and the AuditLog centralizes secret redaction across all log paths.
 - This is a NEW dedicated repository consuming plumby and agent-skills-lockin as dependencies; no task edits
   those upstream repos' cores — plumby's classifier, loop, and skills mechanism stay unmodified and are
   consumed through their seams.
-- Requirement 23 (Sharing) is a deferrable nice-to-have (task 28).
+- Requirement 26 (Sharing) is a deferrable nice-to-have (task 29).
 
 ## Task Dependency Graph
 
@@ -640,26 +753,28 @@ last and marked deferrable.
     { "id": 6, "tasks": ["7.2", "8.1"] },
     { "id": 7, "tasks": ["8.2", "8.5"] },
     { "id": 8, "tasks": ["8.3", "8.4", "10.1"] },
-    { "id": 9, "tasks": ["10.2", "11.1"] },
-    { "id": 10, "tasks": ["11.2", "11.3", "12.1"] },
-    { "id": 11, "tasks": ["12.2", "12.3", "13.1"] },
-    { "id": 12, "tasks": ["13.2", "14.1"] },
-    { "id": 13, "tasks": ["13.3", "13.4", "13.5", "14.2", "15.1"] },
-    { "id": 14, "tasks": ["15.2", "16.1"] },
-    { "id": 15, "tasks": ["16.2", "17.1"] },
-    { "id": 16, "tasks": ["17.2", "18.1"] },
-    { "id": 17, "tasks": ["17.3", "18.2", "19.1"] },
-    { "id": 18, "tasks": ["19.2", "20.1"] },
-    { "id": 19, "tasks": ["19.3", "20.2", "20.3", "21.1"] },
-    { "id": 20, "tasks": ["21.2"] },
-    { "id": 21, "tasks": ["21.3"] },
-    { "id": 22, "tasks": ["21.4", "21.5", "23.1"] },
-    { "id": 23, "tasks": ["23.2", "24.1"] },
-    { "id": 24, "tasks": ["23.3", "23.4", "23.5", "23.6", "24.2", "25.1"] },
-    { "id": 25, "tasks": ["25.2", "25.3", "26.1"] },
-    { "id": 26, "tasks": ["25.4", "26.2"] },
-    { "id": 27, "tasks": ["26.3", "26.4", "26.5", "26.6", "28.1"] },
-    { "id": 28, "tasks": ["28.2"] }
+    { "id": 9, "tasks": ["10.2", "11.1", "12.1", "12.4"] },
+    { "id": 10, "tasks": ["11.2", "11.3", "12.2", "12.3"] },
+    { "id": 11, "tasks": ["12.5", "12.6"] },
+    { "id": 12, "tasks": ["12.7", "13.1"] },
+    { "id": 13, "tasks": ["13.2", "13.3", "14.1"] },
+    { "id": 14, "tasks": ["14.2", "15.1"] },
+    { "id": 15, "tasks": ["14.3", "14.4", "14.5", "15.2", "16.1"] },
+    { "id": 16, "tasks": ["16.2", "17.1"] },
+    { "id": 17, "tasks": ["17.2", "18.1"] },
+    { "id": 18, "tasks": ["18.2", "19.1"] },
+    { "id": 19, "tasks": ["18.3", "19.2", "20.1"] },
+    { "id": 20, "tasks": ["20.2", "21.1"] },
+    { "id": 21, "tasks": ["20.3", "21.2", "21.3", "22.1"] },
+    { "id": 22, "tasks": ["22.2"] },
+    { "id": 23, "tasks": ["22.3"] },
+    { "id": 24, "tasks": ["22.4", "22.5", "24.1"] },
+    { "id": 25, "tasks": ["24.2", "25.1"] },
+    { "id": 26, "tasks": ["24.3", "24.4", "24.5", "24.6", "25.2", "26.1"] },
+    { "id": 27, "tasks": ["26.2", "26.3", "27.1"] },
+    { "id": 28, "tasks": ["26.4", "27.2"] },
+    { "id": 29, "tasks": ["27.3", "27.4", "27.5", "27.6", "29.1"] },
+    { "id": 30, "tasks": ["29.2"] }
   ]
 }
 ```

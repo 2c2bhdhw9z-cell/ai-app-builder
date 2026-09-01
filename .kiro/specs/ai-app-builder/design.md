@@ -176,14 +176,57 @@ that runs *before* any request reaches the Project lifecycle or the plumby loop.
   the action via `Authorization` and returns an access-denied indication.
 - **"Authorized to access" resolves against the requester (Req 7.5).** Wherever another requirement speaks
   of a user being "authorized to access" a repository (`github-import`, Req 6.4), a Project (`fork`, Req
-  6.6–6.7), or a `Share_Link` (Req 23), that authorization is determined against the **requesting
+  6.6–6.7), or a `Share_Link` (Req 26), that authorization is determined against the **requesting
   `User_Account`**. This subsection is the single place that decision lives, and the origins/sharing
   subsystems delegate to it.
 - **Scoping (Req 7.6).** On authentication, Builder_Agent sessions, Projects, and memory (Project_Memory and
   Global_Memory) are scoped to that `User_Account`, so one user never sees another user's sessions, projects,
   or memory.
 
-**Satisfies:** Req 7.
+**Concrete, buildable design.** The subsection above states the *contract*; the following is the *mechanism*
+the platform builds to satisfy it.
+
+- **Authentication mechanism — OAuth 2.0 / OIDC via third-party identity providers.** The primary sign-in
+  flow is **OAuth 2.0 / OpenID Connect** delegated to external identity providers (e.g., **GitHub** and
+  **Google**). The platform **does not store user passwords or credentials of its own** — authentication is
+  delegated to the IdP and the platform only receives the IdP-issued subject/identity (recorded as
+  `User_Account.authIdentity`). This fits the platform's anti-lock-in and secret-minimization stance: there
+  is no in-house password database to breach, and one fewer class of secret to protect (see the new Req 24
+  secret-encryption/audit interplay below). It also makes `github-import` (Req 6.4) natural, since a GitHub
+  IdP grant can carry the repo-read scope the requester is "authorized to access" (Req 7.5).
+- **Session management — short-lived signed session tokens.** After a successful OIDC exchange the platform
+  issues a **short-lived signed session token** (a signed JWT-style token, or an opaque server-side session
+  handle backed by a session store — either is acceptable at the interface level) with a **documented
+  lifetime (~24 hours)** and **refresh/rotation**: the token is renewed via a refresh grant before expiry
+  and rotated on renewal so a leaked token has a bounded blast radius. Every session is **bound to exactly
+  one `User_Account`**; `scopeSession(userAccount)` (see the AuthService component) attaches that account to
+  every downstream request, and session issuance/rotation/expiry are auditable security events (new Req
+  25.1).
+- **Authorization model — ownership-based with explicit grants.** Authorization is **ownership-based**: a
+  `User_Account` **owns** its Projects, User_Skills, Global_Memory, Connectors, and Secrets (Req 7.3), and
+  shared access is expressed as **explicit grants** — today the only grant type is a read-only `Share_Link`
+  (Req 26). Every resource action performs a single check: **owner-or-grant**. If the requesting account is
+  neither the owner nor the holder of a matching grant, the action is denied (Req 7.4). This is deliberately
+  **simpler than full RBAC/ABAC** (no role hierarchies, no attribute policies) and is sufficient for this
+  product's **single-owner-plus-explicit-share** model; RBAC/ABAC can be layered later without changing the
+  owner-or-grant call site, which is the single place authorization is decided (`AuthService.authorize`).
+- **Multi-tenant data isolation.** Users are isolated at the data layer on three axes so one tenant cannot
+  read another's data or sandboxes:
+  1. **Control-plane scoping** — the Project registry, Connector bindings, and Skill/Memory ownership records
+     are keyed by `ownerId`; every query is filtered by the authenticated `User_Account`, so a tenant can
+     only enumerate and open its own resources (Req 7.6).
+  2. **Per-project storage paths** — each Project's file tree, Snapshots, and out-of-tree Secret store live
+     under a per-Project (hence per-owner) storage path, so no tenant's persisted bytes are reachable through
+     another tenant's paths.
+  3. **Per-project runtime isolation** — at execution time the per-project `Isolation_Boundary` (Architecture
+     §3, Security Layer 1) confines a running command to that one Project's Sandbox, so isolation is enforced
+     at runtime as well as at the data layer, even for `allow`-class commands (Req 8.5).
+
+  Secrets and Connector credentials in that per-project store are held with **Encryption_At_Rest** and are
+  never logged in plaintext — see Architecture §7 and the new Req 24 subsection.
+
+**Satisfies:** Req 7 (with secret-at-rest and audit interplay handled in the new Req 24 and Req 25
+subsections).
 
 ### 1. Orchestration / surface layer (Builder Server)
 
@@ -261,6 +304,55 @@ routes every command through the classifier on top of the enforced boundary (Req
 tools emit is executed *inside* that Project's Isolation_Boundary. A command that attempts to reach another
 Project's Sandbox or the host outside the boundary is blocked, the target state is preserved unchanged, and
 a denied error is returned (Req 8.6, Req 22.2).
+
+**Isolation_Boundary technology choice (v1) and upgrade path.** The v1 `Isolation_Boundary` is an
+**OS-level container** (Docker / OCI container), chosen because it delivers the four properties Req 8
+demands at low per-command overhead and is a natural fit for plumby's existing opt-in whole-agent
+`Dockerfile`:
+
+- **Per-container filesystem isolation** — the container's own root filesystem with only that Project's tree
+  bind-mounted in (Req 8.1, 8.4).
+- **PID / process-namespace isolation** — a private PID namespace so a Project's processes cannot see or
+  signal another Project's or the host's processes (Req 8.1, 8.4).
+- **Network-namespace isolation** — a private network namespace (see the egress model below) (Req 8.1).
+- **cgroup-based resource limits** — CPU shares/quota, a memory hard limit, and an execution-time limit
+  enforced by the cgroup and a wall-clock reaper (Req 8.2), which are also the per-Sandbox limits the new
+  Req 23 quota model reuses.
+
+Stronger isolation technologies — **gVisor** (a user-space kernel that narrows the host-syscall surface) or
+**Firecracker microVMs** (hardware-virtualized, per-Project kernels) — are a **documented upgrade path**:
+if OS-container isolation proves insufficient for genuinely untrusted generated code, the boundary is swapped
+to gVisor or Firecracker **without changing the `Isolation_Boundary` interface** (`acquire` / `exec` /
+`release` on `SandboxManager`). Because callers depend only on that interface — never on "it's a Docker
+container" — the choice can be revisited later without touching the classifier, the command guard, or any
+Architecture consumer.
+
+**Network isolation vs. Connector egress (reconciling Req 8.1 with Req 10).** A private network namespace
+alone would forbid the outbound calls that Connectors (Supabase, Stripe, Expo EAS, …) require. The model is
+therefore **isolation with a per-Project egress allowlist**:
+
+- A Project's Sandbox has **no inbound access from other sandboxes** and **no access to the host or to any
+  other Project** (Req 8.1, 8.4, 8.6, 22.2) — nothing on the platform can reach into it and it cannot reach
+  laterally.
+- The Sandbox **may reach approved external Connector endpoints** (e.g., the Supabase or Stripe API hosts)
+  through an **egress allowlist derived from the Project's configured Connectors** (Req 10). Adding a
+  Connector adds its endpoint(s) to that Project's allowlist; removing it revokes them (Req 10.7).
+- **All other outbound network is denied by default.** Egress is deny-by-default; only explicitly-configured
+  Connector hosts (and the Package_Manager registry needed for Req 17 installs) are reachable.
+
+This reconciles "network isolation" (Req 8.1) with "connectors reach external services" (Req 10): the
+boundary blocks lateral and host traffic absolutely while permitting exactly the declared third-party egress,
+and the allowlist itself is auditable (new Req 25).
+
+**Prototype-first + overhead budget (highest-risk item).** Because the `Isolation_Boundary` is **the single
+largest and highest-risk build item** in this design, it is **prototyped and benchmarked FIRST**, before the
+subsystems that depend on it are built out. The prototype targets a **low per-command overhead budget** —
+aiming for **well under a ~5% overhead / sub-second boundary-check cost on command execution** — so that
+routing every `bash`/`verify` command through the boundary does not dominate turn latency. Separately,
+**container cold-start cost** (pulling/creating a fresh container for a new Project) is exactly why **Req 1.1
+is stated as a Service_Level_Objective rather than a hard bound** — cold provisioning may occasionally exceed
+the 10-second "begins creation" target, which the SLO framing explicitly permits. Warm-pool / pre-warmed
+container strategies are an optimization the prototype benchmark informs, not a correctness requirement.
 
 **Command path (two separable gates):**
 
@@ -342,6 +434,13 @@ defined against **committed Snapshot state**, and the pipeline enforces this exp
 Startup/liveness handling: preview-loading status while starting; 60s startup-timeout error with a restart
 offer (Req 3.5); unexpected-exit handling that preserves state and offers restart (Req 3.6); restart capped
 at **3 attempts** then a persistent-failure error with no further automatic restarts (Req 3.7).
+
+**Preview/startup timing are sequential phases, not conflicting bounds (clarification).** Req 3.5's 60s
+**Dev_Server startup-timeout** and Req 1.3's "Preview available within 60s **of Dev_Server start** (on
+verify PASS)" describe **two sequential phases**, not two bounds on the same interval: **phase 1** is the
+Dev_Server becoming ready (≤60s, or a startup-timeout error, Req 3.5); **phase 2**, measured *from
+Dev_Server start*, is the Preview becoming available (≤60s, Req 1.3). They do not conflict and are not a
+single 60s window.
 
 **Satisfies:** Req 3, Req 15, Req 16.4–16.5.
 
@@ -495,9 +594,24 @@ credential, run a migration, force-push, change DNS — all in `CONFIRM_RULES`) 
 **Skill Library CRUD (Req 13).** Beyond the two lock-in skills, ship a curated set of **Stocked_Skills**
 (pre-installed, available to every Project). Users create **User_Skills** by `name` + `description` + body
 (Req 13.3), or import Agent-Skills-format skills validated for `name` + `description` (Req 13.4); missing
-fields → reject with the offending field (Req 13.5); name collision → reject, existing unchanged (Req 13.6);
-edit/delete of a User_Skill leaves Stocked_Skills untouched (Req 13.7). Everything stays in the open format
-(Req 13.8, Property 19).
+fields → reject with the offending field (Req 13.5); edit/delete of a User_Skill leaves Stocked_Skills
+untouched (Req 13.8). Everything stays in the open format (Req 13.9, Property 19).
+
+**Skill namespacing (decision — Req 13.6–13.7).** Skill invocation names are resolved in **two namespaces**:
+
+- A **reserved base namespace** holds every **Stocked_Skill** and the two **vendored lock-in skills**
+  (Guard_Skill, Devendor_Skill). A `User_Skill` **can never overwrite** a name in this base namespace (Req
+  13.7) — the reserved names always win.
+- Each user's **User_Skills live under a per-`User_Account` namespace**. When a user-created or imported
+  skill's `name` would collide with an existing skill available to that user (a base-namespace skill or one
+  of their own), the platform **namespaces the new skill under the owning `User_Account`** — the invocation
+  name takes the form **`user/skill-name`** — so the user can still add it rather than being blocked (Req
+  13.6). Only when a collision **remains even within that user's own namespace** (the same `user/skill-name`
+  already exists for that account) is the addition **rejected with a naming-collision error, leaving the
+  existing Skill unchanged** (Req 13.6).
+
+So a User_Skill never shadows a Stocked_Skill or a vendored lock-in skill, cross-user name reuse is fine
+(each user's skills are namespaced), and the only rejected case is an intra-user-namespace duplicate.
 
 **Satisfies:** Req 12, Req 13.
 
@@ -632,6 +746,15 @@ unchanged (Req 21.6). This is the *builder* model, distinct from the `ai-model` 
   files/artifacts unchanged (Req 15.6); build-**execution** timeout (default 1800s, excluding queue time)
   or non-zero exit → failure cause, no artifact (Req 15.7). Web/backend/shared build bounds remain **300s**
   (Req 18.1); only the mobile bound is 1800s.
+  **Why 1800s for mobile vs. 300s for web/backend (justification).** Expo/EAS mobile builds realistically
+  take **15–30 minutes of execution** (native Android/iOS compilation, signing, packaging) **plus separate
+  queue time** on shared build infrastructure — an order of magnitude beyond a web/backend bundle. The
+  mobile bound is therefore intentionally larger and, critically, **measured from execution start, not from
+  when the job is queued**: queue time on a shared build service is reported to the user as **queued status**
+  and is **not counted against the mobile-build-execution timeout** (Req 15.5). The cost implication is that
+  a mobile build holds a **long-running build sandbox** for up to the execution timeout, which the Req 23
+  quota model accounts for as a per-Sandbox execution-time limit; queue time is reported separately and does
+  not consume the execution budget.
 - **Multi-target (Req 16):** maintain exactly four Targets `web`/`mobile`/`backend`/`shared` (Req 16.1);
   propagate `shared` changes to the other three within 5s (Req 16.2); failed propagation retains last good
   `shared` in all Targets and names the failed Target(s) (Req 16.3); Preview selector + `web` default (Req
@@ -639,13 +762,103 @@ unchanged (Req 21.6). This is the *builder* model, distinct from the `ai-model` 
   Target build still completes the others, produces no artifact for the failed one, names it, preserves
   prior artifacts (Req 16.7); an invalid Target is rejected with the invalid Target named, no artifact
   modified (Req 16.8).
-- **Sharing (Req 23, nice-to-have):** authorized share → unique read-only `Share_Link` within 5s, expiring
-  7 days later (Req 23.1); unauthorized/nonexistent → rejected, no link (Req 23.2); valid unexpired
-  unrevoked link → read-only access within 5s (Req 23.3); expired/revoked/malformed → deny, disclose
-  nothing (Req 23.4); a recipient's modification attempt is rejected, Project unchanged (Req 23.5); revoke
-  → deny all subsequent access within 5s (Req 23.6); revoking a nonexistent/already-revoked link → reports
-  no match, other links unchanged (Req 23.7). Share authorization resolves against the requesting
+- **Sharing (Req 26, nice-to-have):** authorized share → unique read-only `Share_Link` within 5s, expiring
+  7 days later (Req 26.1); unauthorized/nonexistent → rejected, no link (Req 26.2); valid unexpired
+  unrevoked link → read-only access within 5s (Req 26.3); expired/revoked/malformed → deny, disclose
+  nothing (Req 26.4); a recipient's modification attempt is rejected, Project unchanged (Req 26.5); revoke
+  → deny all subsequent access within 5s (Req 26.6); revoking a nonexistent/already-revoked link → reports
+  no match, other links unchanged (Req 26.7). Share authorization resolves against the requesting
   `User_Account` (Req 7.5).
+
+### 15. Platform operations: rate limiting, quotas, and abuse prevention
+
+**Responsibility:** protect shared platform capacity so no single `User_Account` can exhaust it or degrade
+service for others. This is a **new builder-layer component** (no plumby analog) that **gates requests in
+the Builder Server before any resource is allocated**.
+
+- **Per-`User_Account` Rate_Limits (Req 23.1).** A `Rate_Limit` caps resource-creating operations within a
+  time window — at minimum **Project creation, builds, deployments, and generation turns**. The
+  `RateLimiter` checks the account's window counters *before* the operation is admitted.
+- **Per-`User_Account` and per-`Project` Resource_Quotas (Req 23.2).** A `Resource_Quota` caps concurrent
+  and total resource consumption — at minimum **maximum concurrent Sandboxes**, **maximum total Projects**,
+  and the **per-Sandbox CPU / memory / execution-time limits** already applied by the `Isolation_Boundary`
+  (Architecture §3, Req 8.2). The quota layer reuses those per-Sandbox limits rather than redefining them.
+- **Reject over-limit requests before allocation (Req 23.3).** IF an account exceeds a configured Rate_Limit
+  or Resource_Quota, the offending request is **rejected with a quota / rate-limit error naming which limit
+  was exceeded**, and **no additional resources are allocated** for it. Because the gate runs **before**
+  `SandboxManager.acquire`, an over-quota request never provisions an `Isolation_Boundary` in the first
+  place.
+- **Abuse detection & mitigation (Req 23.4).** The component watches for **abusive usage patterns** —
+  **sustained failed builds** or **runaway resource consumption** — and mitigates by **throttling or
+  suspending the offending Sandbox**, then **reports the action taken**. Sustained-failure detection reuses
+  the same failure-signature signal the Self-Healing controller already computes for oscillation detection
+  (Architecture §13, Req 20.8), so a build that repeatedly fails is both self-heal-halted *and*, if it keeps
+  consuming resources, throttled here. Mitigation actions are recorded as operational + audit events (§17,
+  Req 25).
+
+The gate sits in the Builder Server request path: **authn/authz (§0) → rate-limit / quota check (§15) →
+resource allocation (SandboxManager, §3) → loop turn**. It is deliberately ordered after authorization (so
+limits are attributed to the authenticated account) and before allocation (so rejected requests cost
+nothing).
+
+**Satisfies:** Req 23.
+
+### 16. Data retention, deletion, and secret protection
+
+**Responsibility:** give users real control over how long data is kept and the ability to delete it, and
+protect Secrets and Connector credentials at rest. **New builder-layer behavior** spanning the persistence,
+connector, and secret subsystems.
+
+- **Project deletion (Req 24.1).** WHEN a user requests deletion of a Project, the platform deletes the
+  Project's **files, Snapshots, Sandbox (Isolation_Boundary), and associated Secrets**, then **confirms the
+  deletion** to the user. Sandbox teardown reuses the `SandboxManager.release` `finally`-reap path
+  (Architecture §3); Secret deletion removes the out-of-tree entries in the `SecretStore`.
+- **Account deletion (Req 24.2).** WHEN a user requests deletion of their `User_Account`, the platform
+  **deletes or irreversibly anonymizes all data owned by that account** — Projects, Skills, Project_Memory
+  and Global_Memory, Connectors, and Secrets. Ownership (`ownerId`, Architecture §0) is the enumeration key:
+  account deletion iterates every resource owned by the account and applies per-resource deletion.
+- **Encryption_At_Rest for Secrets and Connector credentials (Req 24.3).** Every `Secret` and every
+  Connector credential is **stored encrypted at rest** via a **key-management approach**: values are
+  encrypted with a per-Project (or per-Secret) data key, and that data key is itself wrapped by a master key
+  held in a **KMS / keystore** (**envelope encryption**), so the raw value is not recoverable from the
+  stored bytes without the KMS-held key. This extends the existing out-of-tree `SecretStore` (Architecture
+  §7) — the store was already out-of-tree and injected only into the Sandbox env; it now also holds
+  ciphertext, not plaintext.
+- **Never log secret values in plaintext (Req 24.4).** No Secret value or Connector credential value is
+  written in plaintext to **any** platform log or audit record. The audit/observability subsystem (§17)
+  redacts secret values; the injection path passes values only into the Sandbox environment, never into a
+  log line.
+- **Documented retention (Req 24.5).** A Project's persisted state and Snapshots are **retained until the
+  user deletes the Project or the User_Account** (no silent expiry), and this retention behavior is
+  **documented to the user**.
+
+**Satisfies:** Req 24 (extends Architecture §6 persistence, §7 connectors/secrets, and §0 ownership).
+
+### 17. Observability and audit logging
+
+**Responsibility:** record security-relevant actions for investigation and emit operational telemetry to
+diagnose failures. **New builder-layer component** (`AuditLog` / `Observability`).
+
+- **Audit log of security-relevant actions (Req 25.1).** The platform records an **audit log** of
+  authentication, **authorization decisions**, **Secret access**, **destructive confirm-class operations**,
+  and **deletions** (Project and account), each **scoped to the acting `User_Account`**. The audit log
+  **excludes Secret values** — every entry passes through **secret redaction** before it is written (Req
+  24.4). These are exactly the choke points already identified elsewhere: session issuance (§0),
+  `AuthService.authorize` decisions (§0), `SecretStore` access (§7/§16), the CommandGuard confirm path
+  (§3), and the deletion flows (§16).
+- **Operational metrics & error events (Req 25.2).** The platform emits metrics and error events sufficient
+  to detect and diagnose failures in **Sandbox provisioning, generation turns, builds, and deployments** —
+  the four subsystems most likely to fail operationally.
+- **User-facing error + correlated operational entry (Req 25.3).** WHEN a platform-level error occurs during
+  an operation on behalf of a `User_Account`, the platform **surfaces a user-facing error indication** (on
+  the Activity_Stream, consistent with the Error Handling discipline) **and** records the error in the
+  operational log **with a correlation id** tying the user-visible error to the operational entry, so an
+  operator can trace a reported failure to its diagnostics.
+
+**Redaction is centralized:** all three flows (audit, operational metrics, error logging) route through the
+same secret-redaction filter, so Req 24.4 holds uniformly and there is no log path that could leak a Secret.
+
+**Satisfies:** Req 25 (with secret redaction shared with Req 24.4).
 
 ---
 
@@ -725,9 +938,39 @@ timeout (default 1800s, excluding queue time), with queued status surfaced separ
 ### ConnectorRegistry + SecretStore  *(new)*
 - `catalog() → Connector[]` across six categories (Req 10.1).
 - `connect(projectId, connector) → captureFlow` (Req 10.2).
-- `SecretStore.put(projectId, name, value)` — stored out-of-tree, injected into Sandbox env (Req 9.6, 10.3);
-  **never written to source** (Req 9.7, 10.4, Properties 8–9).
+- `SecretStore.put(projectId, name, value)` — stored out-of-tree **encrypted at rest** (envelope
+  encryption; data key wrapped by a KMS/keystore master key — Req 24.3), injected into Sandbox env only at
+  runtime (Req 9.6, 10.3); **never written to source** (Req 9.7, 10.4, Properties 8–9) and **never logged in
+  plaintext** (Req 24.4).
+- `SecretStore.get(projectId, name)` — decrypts via the KMS-held key for Sandbox injection; access is
+  recorded as an audit event with the value redacted (Req 25.1, 24.4).
 - `remove(projectId, connector)` — revoke injection (Req 10.7).
+- `deleteProjectSecrets(projectId)` / `deleteAccountData(userAccountId)` — remove all Secrets for a Project
+  (part of Project deletion, Req 24.1) or all owned data for an account (part of account deletion, Req 24.2).
+
+### QuotaManager / RateLimiter  *(new; no plumby analog — gates the Builder Server before allocation)*
+The pre-allocation gate that enforces per-account limits. Runs after authn/authz (§0) and **before**
+`SandboxManager.acquire`, so a rejected request provisions nothing.
+- `checkRate(userAccount, operation) → Allowed | RateLimited` — window counters for Project creation,
+  builds, deployments, generation turns (Req 23.1); over-limit → reject naming the limit, allocate nothing
+  (Req 23.3).
+- `checkQuota(userAccount, projectId, resource) → Allowed | QuotaExceeded` — max concurrent Sandboxes, max
+  total Projects, and the per-Sandbox CPU/memory/execution-time limits reused from the Isolation_Boundary
+  (Req 23.2); over-quota → reject naming the limit, allocate nothing (Req 23.3).
+- `observeUsage(sandboxId, signal)` — abuse detection: on sustained failed builds (reusing the Self-Healing
+  failure-signature signal, §13) or runaway resource consumption, **throttle or suspend** the offending
+  Sandbox and report the action taken (Req 23.4), emitting an audit + operational event (§17).
+
+### AuditLog / Observability  *(new; no plumby analog)*
+Records security-relevant actions and operational telemetry; centralizes **secret redaction** so no log path
+leaks a value.
+- `audit(userAccount, action, resourceRef)` — append a redacted audit entry for authentication, authorization
+  decisions, Secret access, destructive confirm-class operations, and deletions, scoped to the acting
+  `User_Account`, **excluding Secret values** (Req 25.1, 24.4).
+- `metric(name, tags)` / `errorEvent(op, cause)` — operational metrics + error events for Sandbox
+  provisioning, generation turns, builds, and deployments (Req 25.2).
+- `reportError(userAccount, op, cause) → correlationId` — surface a user-facing error indication and record
+  a correlated operational entry so a reported failure can be traced to its diagnostics (Req 25.3).
 
 ### ExportService + LockinAuditor  *(new; reuses `detect-lockin.sh` concept + Guard/Devendor skills)*
 - `export(projectId) → archive` — self-contained, secrets stripped, env template included (Req 11.6–11.8).
@@ -740,7 +983,12 @@ timeout (default 1800s, excluding queue time), with queued status surfaced separ
   step** (copy the SKILL.md folders in; **no runtime fetch** of the Skills_Source_Repository), keeping the
   vendored copies in sync with the upstream repo (Req 12.1, 12.14–12.15).
 - `createUserSkill / importSkill / editUserSkill / deleteUserSkill` with validation + collision rules (Req
-  13.3–13.7).
+  13.3–13.5, 13.8).
+- **Namespacing:** Stocked_Skills and vendored lock-in skills occupy a **reserved base namespace** a
+  User_Skill can never overwrite (Req 13.7); a colliding User_Skill is placed under the owning
+  `User_Account` namespace (invocation name `user/skill-name`) so it can still be added, and only an
+  intra-user-namespace duplicate is rejected with a naming-collision error, leaving the existing Skill
+  unchanged (Req 13.6).
 
 ### MemoryStore  *(new; files-on-disk; reuses compaction discipline as its model)*
 - `Project_Memory` + `Global_Memory` as human-readable files (Req 14.1–14.2).
@@ -821,15 +1069,26 @@ ConnectorBinding                  # a Connector attached to a Project
 Secret                            # NEVER written to source or export (Properties 8, 9, 14)
   projectId: string
   name: string                   # e.g. 'DATABASE_URL', 'STRIPE_SECRET_KEY'
-  value: string                  # stored out-of-tree; injected into Sandbox env (Req 9.6, 10.3)
-  # owned by a User_Account (Req 7.3)
+  ciphertext: bytes              # stored out-of-tree, ENCRYPTED AT REST (Req 24.3):
+                                 #   value encrypted with a data key; data key wrapped by a
+                                 #   KMS/keystore master key (envelope encryption)
+  wrappedDataKey: bytes          # the envelope-wrapped data key (Req 24.3)
+  # decrypted only for Sandbox env injection at runtime (Req 9.6, 10.3);
+  # never logged in plaintext (Req 24.4); owned by a User_Account (Req 7.3)
 
 Skill                             # open Agent Skills format (Property 19)
   name: string                   # frontmatter (or dir name if omitted — Req 12.10)
+  invocationName: string         # resolved name used to load the skill (Req 13.6):
+                                 #   base namespace for stocked/vendored-lockin (reserved, never
+                                 #   overwritten by a user skill — Req 13.7);
+                                 #   'user/<name>' for a User_Skill that collides with an existing name
   description: string            # frontmatter; clipped to ≤500 chars in listing (Req 12.3)
   body: string                   # SKILL.md body, frontmatter stripped; ≤64 KiB on load (Req 12.4)
   kind: 'stocked' | 'vendored-lockin' | 'user'   # user skills owned by a User_Account (Req 7.3)
+  ownerId?: string               # → User_Account.id for kind 'user'; the User_Skill namespace (Req 13.6)
   path: string                   # must resolve inside the skills dir (Req 12.9)
+  # A User_Skill never overwrites a base-namespace name (Req 13.7); an intra-user-namespace
+  # duplicate ('user/<name>' already present for this owner) is rejected (Req 13.6).
 
 MemoryEntry                       # individually viewable/editable (Req 14.5)
   id: string
@@ -850,14 +1109,41 @@ DeploymentArtifact
   path: string                   # build output in Sandbox
   exitStatus: number             # 0 on success (Req 18.1)
 
-ShareLink                         # control-plane only, never exported (Req 23)
+ShareLink                         # control-plane only, never exported (Req 26, nice-to-have)
   token: string                  # unique, unguessable
   projectId: string
   access: 'read-only'
   createdAt: timestamp
-  expiresAt: timestamp           # createdAt + 7 days (Req 23.1)
+  expiresAt: timestamp           # createdAt + 7 days (Req 26.1)
   revoked: boolean
   # share authorization resolves against the requesting User_Account (Req 7.5)
+
+RateLimitPolicy                   # per-User_Account rate limits (Req 23.1)
+  userAccountId: string
+  operation: 'project-create' | 'build' | 'deploy' | 'generation-turn'
+  maxPerWindow: number           # ceiling of resource-creating ops per window
+  windowSeconds: number
+  # over-limit ⇒ reject naming the limit, allocate nothing (Req 23.3)
+
+ResourceQuota                     # per-User_Account and per-Project quotas (Req 23.2)
+  scope: 'account' | 'project'
+  scopeId: string                # User_Account.id or Project.id
+  maxConcurrentSandboxes?: number   # account-scope (Req 23.2)
+  maxTotalProjects?: number         # account-scope (Req 23.2)
+  cpuLimit?: string                 # per-Sandbox; reuses the Isolation_Boundary limits (Req 8.2, 23.2)
+  memoryLimitBytes?: number         # per-Sandbox (Req 8.2, 23.2)
+  executionTimeLimitSeconds?: number  # per-Sandbox (Req 8.2, 23.2)
+  # over-quota ⇒ reject naming the limit, allocate nothing (Req 23.3)
+
+AuditLogEntry                     # security-relevant action record (Req 25.1); NO secret values (Req 24.4)
+  id: string
+  userAccountId: string          # the acting account (scope of the audit log — Req 25.1)
+  action: 'authenticate' | 'authz-decision' | 'secret-access'
+        | 'destructive-confirm' | 'project-delete' | 'account-delete'
+  resourceRef?: string           # resource acted on (no secret values recorded — Req 24.4)
+  outcome: string                # e.g. 'allowed' | 'denied' | 'confirmed' | 'refused'
+  correlationId?: string         # ties a user-facing error to its operational log entry (Req 25.3)
+  createdAt: timestamp
 
 VerifyResult                      # from plumby verify (Req 20.1)
   verdict: 'PASS' | 'FAIL'
@@ -1076,11 +1362,31 @@ Empty/too-short description, unsupported `Target_Category`, or unsupported `Proj
 - **Unknown skill name → error listing available names, no change** (Req 12.7).
 - **Unreadable/empty skill body → error, no change** (Req 12.8); **path outside skills dir → refuse** (Req
   12.9).
-- **Import missing name/description → reject naming the field** (Req 13.5); **name collision → reject,
-  existing unchanged** (Req 13.6).
+- **Import missing name/description → reject naming the field** (Req 13.5); **name collision → namespace
+  the User_Skill under the owning User_Account (`user/skill-name`); reject only an intra-user-namespace
+  duplicate, leaving the existing Skill unchanged** (Req 13.6); a User_Skill never overwrites a Stocked_Skill
+  or vendored lock-in skill in the reserved base namespace (Req 13.7).
 - **Unsupported provider → reject, Session unchanged, name it** (Req 21.3); **unsupported model → reject,
   Session unchanged** (Req 21.4); **no credential → report missing provider, start no turn, Session
   unchanged** (Req 21.6).
+
+### Platform operations (Req 23)
+- **Rate_Limit or Resource_Quota exceeded → reject the offending request with an error naming which limit
+  was exceeded; allocate no additional resources** (Req 23.3).
+- **Abusive pattern detected (sustained failed builds / runaway consumption) → throttle or suspend the
+  offending Sandbox and report the action taken** (Req 23.4).
+
+### Data retention / deletion / secret protection (Req 24)
+- **Project deletion → remove files, Snapshots, Sandbox, and Secrets; confirm to the user** (Req 24.1).
+- **Account deletion → delete or irreversibly anonymize all owned data** (Projects, Skills, memory,
+  Connectors, Secrets) (Req 24.2).
+- **Secrets / Connector credentials → stored with Encryption_At_Rest** (envelope encryption via a
+  KMS/keystore) and **never logged in plaintext** (Req 24.3–24.4).
+
+### Observability / audit (Req 25)
+- **Security-relevant actions → recorded in a User_Account-scoped audit log with Secret values excluded**
+  (Req 25.1, 24.4).
+- **Platform-level error → user-facing error indication plus a correlated operational log entry** (Req 25.3).
 
 ---
 
@@ -1132,7 +1438,7 @@ requirement clauses it validates.
 - Skills vendoring: the Guard/Devendor SKILL.md folders are present in plumby's skills dir at session start
   with no runtime fetch (build/release-time copy step) — Req 12.1, 12.15.
 - Share_Link state machine: valid/expired/revoked/malformed; revoke-then-access; revoke nonexistent — Req
-  23.
+  26.
 
 ### Integration tests (external wiring + timing bounds; 1–3 examples each, not PBT)
 - Creation **begins ≤10s** (Project recorded + Sandbox allocated, available for streaming); Template
@@ -1148,6 +1454,14 @@ requirement clauses it validates.
   file change → inline diff; turn-complete indicator; over-cap truncation notice — Req 4, reusing
   `src/web/events.js` assertions.
 - Multi-target: exactly four Targets; `shared` propagation ≤5s; per-Target artifact selection — Req 16.
+- Platform ops: over-limit request rejected before allocation naming the limit; abusive pattern →
+  throttle/suspend + report — Req 23.
+- Data retention/deletion: Project deletion removes files/Snapshots/Sandbox/Secrets + confirms; account
+  deletion removes/anonymizes all owned data; Secret persisted as ciphertext (Encryption_At_Rest) and no
+  plaintext secret in any log — Req 24.
+- Observability/audit: security-relevant actions recorded (auth, authz, secret access, destructive confirm,
+  deletions) with secret values redacted; platform error surfaces a user-facing indication with a correlated
+  operational entry — Req 25.
 
 ### What the tests deliberately do NOT prove
 Following plumby's honesty note: the scripted-provider tests prove the **machinery** (isolation, gating,
@@ -1185,6 +1499,18 @@ boundary is **enforced independently of the classifier**, so isolation holds eve
 marks `allow` (Req 8.5) — this is the layer that actually contains untrusted generated code. Boundaries are
 reaped in a `finally`, including orphan cleanup on failed import (Req 6.5).
 
+**Technology decision (v1) and risk plan.** The v1 boundary is an **OS-level container** (Docker / OCI) with
+per-container filesystem, private PID namespace, and private network namespace, plus **cgroup-based CPU /
+memory / execution-time limits** (Req 8.1–8.2) — see Architecture §3 for the full rationale. **gVisor** or
+**Firecracker microVMs** are a documented upgrade path if container isolation proves insufficient for
+untrusted code, chosen later **without changing the `Isolation_Boundary` interface**. Network isolation is
+**deny-by-default egress with a per-Project Connector allowlist**: the Sandbox has no inbound, host, or
+cross-Project access, but may reach the specific external endpoints of its configured Connectors (Req 10) and
+the Package_Manager registry (Req 17); all other outbound traffic is denied. Because the boundary is the
+largest, highest-risk item, it is **prototyped and benchmarked first**, targeting a low per-command overhead
+budget (aim for well under ~5% overhead / sub-second boundary-check cost); container cold-start cost is why
+Req 1.1 is an SLO, not a hard bound.
+
 ### Layer 2 — Permission classifier (the pure heuristic gate)
 On top of the enforced boundary, every command also routes through `classifyCommand`
 (`src/core/permissions.js`) **before** execution (Req 8.7, 22.1). It is **pure** — imports nothing, does no
@@ -1213,12 +1539,19 @@ is blocked **in code**, not by convention (README "Sub-agents", `src/core/subage
 codebase investigations are delegated here safely (Req 22.6).
 
 ### Secret handling
-Secrets and Connector credentials are stored **out of the Project tree**, injected into the Sandbox
-**environment at runtime**, and **never written to any source file** (Req 9.6–9.7, 10.3–10.4, Properties 8,
-9). If generation would emit a literal credential or hardcoded platform host, it is replaced with an env-var
-reference and the substitution is recorded in a user-visible report (Req 11.5). Exports strip every secret
-and ship only an env-var name template (Req 11.8, Property 14). API keys for the *builder* provider are read
-only from the server process environment and never reach the browser (README web-surface key handling).
+Secrets and Connector credentials are stored **out of the Project tree**, **encrypted at rest** (envelope
+encryption: a data key encrypts the value, and the data key is wrapped by a KMS/keystore master key — Req
+24.3), injected into the Sandbox **environment at runtime**, and **never written to any source file** (Req
+9.6–9.7, 10.3–10.4, Properties 8, 9). They are **never logged in plaintext** in any platform log or audit
+record — every audit/operational/error path routes through a shared secret-redaction filter (Req 24.4,
+Req 25.1). Credential handling is **layered, not contradictory**: **Req 11.4 is the PRIMARY mechanism** —
+Connector credentials are referenced only through injected Secrets, so no literal credential or hardcoded
+platform host is ever written into source — and **Req 11.5 is a SECONDARY safety net**: if generation ever
+*would* emit a literal credential or hardcoded platform host, it is replaced with an env-var reference and
+the substitution is recorded in a user-visible report. The safety net should rarely trigger when the primary
+mechanism is working. Exports strip every secret and ship only an env-var name template (Req 11.8, Property
+14). API keys for the *builder* provider are read only from the server process environment and never reach
+the browser (README web-surface key handling).
 
 ### Portability as a security-adjacent guarantee
 Generated projects carry **no platform telemetry, no injected branding, and no enforcement rules** that
