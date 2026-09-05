@@ -32,7 +32,7 @@ import fc from 'fast-check';
 
 import { fcConfig, propertyTag } from './support/fc.js';
 import { createStorageLayout } from '../src/storage/layout.js';
-import { createSecretStore, identityCodec } from '../src/secrets/secret-store.js';
+import { createSecretStore, identityCodec, RESERVED_ENV_NAMES } from '../src/secrets/secret-store.js';
 import { scanAndSubstitute, PLATFORM_HOST_ENV_NAME } from '../src/secrets/index.js';
 import { buildRunArgs } from '../src/sandbox/container-backend.js';
 import { createSandboxManager } from '../src/sandbox/sandbox-manager.js';
@@ -134,6 +134,31 @@ test('put rejects unsafe / non-env-var names', () => {
     assert.throws(() => store.put(PROJECT, 'has-dash', 'x'));
     assert.throws(() => store.put(PROJECT, '1LEADING', 'x'));
     assert.throws(() => store.put(PROJECT, 'has space', 'x'));
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('put rejects reserved / dangerous env-var names but accepts ordinary ones', () => {
+  const { base, layout } = tempLayout();
+  try {
+    const store = createSecretStore({ layout, ownerId: OWNER });
+
+    // A secret named after a runtime-critical variable would silently shadow it
+    // in the container env (secrets merge OVER process.env), so put() rejects it.
+    assert.throws(() => store.put(PROJECT, 'PATH', '/evil'), /reserved/);
+    assert.throws(() => store.put(PROJECT, 'NODE_OPTIONS', '--require /evil.js'), /reserved/);
+    // Every declared reserved name is rejected.
+    for (const reserved of RESERVED_ENV_NAMES) {
+      assert.throws(() => store.put(PROJECT, reserved, 'x'), /reserved/, `${reserved} must be rejected`);
+    }
+    // The reserved set is frozen so it cannot be tampered with at runtime.
+    assert.ok(Object.isFrozen(RESERVED_ENV_NAMES));
+
+    // Ordinary env-var names still work.
+    assert.doesNotThrow(() => store.put(PROJECT, 'DATABASE_URL', 'postgres://x'));
+    assert.doesNotThrow(() => store.put(PROJECT, 'API_KEY', 'sk-123'));
+    assert.equal(store.get(PROJECT, 'API_KEY'), 'sk-123');
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

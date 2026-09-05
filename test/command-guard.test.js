@@ -213,7 +213,7 @@ test('(d) confirm-class is denied when no consent mechanism is supplied', async 
   assert.equal(res.outcome, 'confirm');
   assert.equal(res.executed, false);
   assert.equal(res.denied, true);
-  assert.equal(res.reason, 'confirmation not granted within 60s');
+  assert.equal(res.reason, 'confirmation not granted within 60000ms');
   assert.equal(manager.calls.length, 0);
 });
 
@@ -228,7 +228,7 @@ test('(d) confirm-class is denied when consent is not granted within confirmTime
   assert.equal(res.outcome, 'confirm');
   assert.equal(res.executed, false);
   assert.equal(res.denied, true);
-  assert.equal(res.reason, 'confirmation not granted within 60s');
+  assert.equal(res.reason, 'confirmation not granted within 20ms');
   assert.equal(manager.calls.length, 0);
 });
 

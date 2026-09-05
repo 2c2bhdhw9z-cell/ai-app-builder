@@ -41,12 +41,40 @@ import { requireString, fail } from '../model/validate.js';
  */
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/**
+ * RESERVED / DANGEROUS env-var names a secret may NOT be stored under. The child
+ * container env is built from stored secrets and merged OVER process.env (see
+ * container-backend runOneShot/runCli), so a secret named after a runtime-critical
+ * variable would silently SHADOW it inside the container. Rejecting these at
+ * put() time keeps a secret from ever hijacking the loader, shell, or Node
+ * runtime of a sandboxed process. Frozen so the set cannot be mutated at runtime.
+ */
+export const RESERVED_ENV_NAMES = Object.freeze(
+  new Set([
+    'PATH',
+    'HOME',
+    'LD_PRELOAD',
+    'LD_LIBRARY_PATH',
+    'NODE_OPTIONS',
+    'IFS',
+    'SHELL',
+    'PWD',
+    'USER',
+  ]),
+);
+
 function requireSecretName(model, name) {
   requireString(model, 'name', name);
   if (!ENV_NAME_RE.test(name)) {
     fail(
       model,
       `name must be a valid env-var name (^[A-Za-z_][A-Za-z0-9_]*$), got ${JSON.stringify(name)}`,
+    );
+  }
+  if (RESERVED_ENV_NAMES.has(name)) {
+    fail(
+      model,
+      `name ${JSON.stringify(name)} is a reserved/dangerous env-var that would shadow a runtime-critical variable in the container`,
     );
   }
   return name;

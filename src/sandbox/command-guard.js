@@ -181,7 +181,7 @@ export function createCommandGuard({
    */
   async function awaitConsent(request, seam) {
     if (typeof seam !== 'function') {
-      return { granted: false, reason: 'confirmation not granted within 60s' };
+      return { granted: false, reason: `confirmation not granted within ${confirmTimeoutMs}ms` };
     }
     const outcome = await withTimeout(
       (async () => seam(request))(),
@@ -189,7 +189,7 @@ export function createCommandGuard({
       undefined,
     );
     if (!outcome.settled) {
-      return { granted: false, reason: 'confirmation not granted within 60s' };
+      return { granted: false, reason: `confirmation not granted within ${confirmTimeoutMs}ms` };
     }
     if (outcome.error !== undefined) {
       return { granted: false, reason: 'confirmation denied' };
