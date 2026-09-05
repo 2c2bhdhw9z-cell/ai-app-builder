@@ -43,6 +43,7 @@ import { execFileSync } from 'node:child_process';
 import { requireString, requireOneOf, fail } from '../model/validate.js';
 import { createSnapshot, SNAPSHOT_TRIGGERS } from '../model/project.js';
 import { VERIFY_VERDICTS } from '../model/deployment.js';
+import { normalizeContents, decodeTreeEntry } from './tree-codec.js';
 
 /** The deterministic committer/author identity pinned on every commit. */
 export const SNAPSHOT_IDENTITY = Object.freeze({
@@ -233,8 +234,10 @@ export function createSnapshotStore({
   }
 
   /**
-   * Validate + normalize a projectTree map into [[relPath, contents]] entries.
-   * Shares the same in-tree/relative-path safety rules as the PersistenceStore.
+   * Validate + normalize a projectTree map into [[relPath, contents]] entries,
+   * where contents is a utf8 String (text) or a Buffer (binary). Shares the same
+   * in-tree/relative-path safety rules as the PersistenceStore, plus rejecting a
+   * reserved .git entry (owned by the snapshot repo).
    */
   function normalizeTree(projectTree) {
     if (projectTree === null || typeof projectTree !== 'object' || Array.isArray(projectTree)) {
@@ -255,19 +258,28 @@ export function createSnapshotStore({
       if (norm === '.git' || norm.startsWith(`.git${path.sep}`)) {
         fail(model, 'projectTree must not contain a .git entry (reserved for the snapshot repo)');
       }
-      // Contract: file contents are TEXT (utf8 strings). restore() reads the
-      // working tree back with readWorkingTree, which decodes as utf8, so a
-      // Buffer of non-utf8 bytes would not round-trip byte-exact. Reject
-      // non-strings so the commit->restore contract stays honest (text-only).
-      if (typeof contents !== 'string') {
-        fail(model, `projectTree[${JSON.stringify(rel)}] must be a string (file contents are utf8 text)`);
+      // Contract: file contents are a utf8 STRING (text) OR a Buffer/Uint8Array
+      // (binary). A string commits as utf8 and restores as a String; a Buffer
+      // commits raw and restores as a Buffer (readWorkingTree decides
+      // text-vs-binary via decodeTreeEntry, and git stores binary bytes exactly),
+      // so both round-trip losslessly. Genuinely invalid content types (numbers,
+      // plain objects, null) are rejected so the commit->restore contract stays
+      // honest.
+      const normalized = normalizeContents(contents);
+      if (!normalized.ok) {
+        fail(model, `projectTree[${JSON.stringify(rel)}] must be a string or Buffer (file contents are utf8 text or binary bytes)`);
       }
-      entries.push([norm, contents]);
+      entries.push([norm, normalized.value]);
     }
     return entries;
   }
 
-  /** Read the working-tree file map (excluding .git) as { relPath: utf8 }. */
+  /**
+   * Read the working-tree file map (excluding .git) as { relPath: contents },
+   * where each entry is a utf8 String for text files and a Buffer for binary
+   * files (decodeTreeEntry decides per file). git restores committed bytes
+   * exactly, so this read-back must not utf8-mangle binary content.
+   */
   function readWorkingTree(root) {
     const tree = {};
     const walk = (dir) => {
@@ -277,7 +289,10 @@ export function createSnapshotStore({
         if (ent.isDirectory()) walk(full);
         else if (ent.isFile()) {
           const rel = path.relative(root, full).split(path.sep).join('/');
-          tree[rel] = fs.readFileSync(full, 'utf8');
+          // Read RAW bytes and decide text-vs-binary: text returns a String
+          // (byte-for-byte identical to what was committed), binary returns the
+          // raw Buffer, so both round-trip losslessly.
+          tree[rel] = decodeTreeEntry(fs.readFileSync(full));
         }
       }
     };
