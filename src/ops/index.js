@@ -17,3 +17,10 @@ export {
   REDACTION_PLACEHOLDER,
   MIN_SECRET_LENGTH,
 } from './redaction.js';
+
+export {
+  createQuotaManager,
+  RATE_LIMITED_OPERATIONS,
+  QUOTA_RESOURCES,
+  DEFAULT_QUOTA_CONFIG,
+} from './quota-manager.js';

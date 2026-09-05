@@ -111,6 +111,14 @@ const ACCESS_DENIED = { error: 'access denied' };
  *        command reaches this server's POST /confirm.
  * @param {object} [opts.sandboxManager]  a SandboxManager whose acquire(projectId)
  *        yields the Sandbox handle (mountSource = the Project tree host path).
+ * @param {object} [opts.quotaManager]    an OPTIONAL QuotaManager (src/ops/quota-manager.js).
+ *        When present, its checkRate/checkQuota gate runs in POST /message AFTER
+ *        gate() (authn+authz) succeeds and BEFORE any allocation (session,
+ *        agent, sandbox acquire), so an over-limit request allocates NOTHING and
+ *        is refused with an HTTP 429 whose body NAMES the exceeded limit. When
+ *        absent, behaviour is unchanged (backward compatible). The gate never
+ *        runs before auth passes, so an unauthenticated over-limit request still
+ *        receives the generic access-denied — no limit disclosure before auth.
  * @param {object} [opts.layout]          a StorageLayout, for exportableProjectTree.
  * @param {object} [opts.commandGuard]    the CommandGuard the agent's commands go
  *        through; the server supplies its onConfirmRequest seam per session.
@@ -129,6 +137,7 @@ export function createBuilderServer(opts = {}) {
     layout,
     commandGuard,
     projectResolver,
+    quotaManager,
     confirmTimeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS,
     now = () => Date.now(),
   } = opts;
@@ -477,6 +486,39 @@ export function createBuilderServer(opts = {}) {
 
     const text = typeof body?.text === 'string' ? body.text.trim() : '';
     if (!text) return sendJson(res, 400, { error: "a non-empty 'text' field is required" });
+
+    // QUOTA / RATE-LIMIT GATE — runs AFTER authn+authz has succeeded and BEFORE
+    // any allocation (no Project Session is created, no Builder_Agent is built,
+    // no Sandbox is acquired below this point). An over-limit request therefore
+    // allocates NOTHING. The gate is skipped entirely when no quotaManager is
+    // injected (backward compatible). Because it sits after gate(), an
+    // unauthenticated request never reaches here — no limit is disclosed before
+    // auth passes. A rejection is a 429 whose body NAMES the exceeded limit.
+    if (quotaManager) {
+      const rate =
+        typeof quotaManager.checkRate === 'function'
+          ? quotaManager.checkRate(result.account, 'generation.turn')
+          : { ok: true };
+      if (rate && rate.ok === false) {
+        return sendJson(res, 429, {
+          error: rate.message ?? 'rate limit exceeded',
+          limit: rate.limit,
+          operation: rate.operation,
+        });
+      }
+
+      const quota =
+        typeof quotaManager.checkQuota === 'function'
+          ? quotaManager.checkQuota(result.account, projectId, 'concurrentSandboxes')
+          : { ok: true };
+      if (quota && quota.ok === false) {
+        return sendJson(res, 429, {
+          error: quota.message ?? 'resource quota exceeded',
+          limit: quota.limit,
+          resource: quota.resource,
+        });
+      }
+    }
 
     const session = sessionFor(result.account.id, projectId);
 
