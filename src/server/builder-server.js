@@ -47,11 +47,11 @@ import { randomUUID } from 'node:crypto';
 import {
   createAgent,
   buildSystemPrompt,
-  toViewEvent,
   defaultTools,
   spawnSubagentTool,
   subagentTools,
 } from '../engine/plumby.js';
+import { createActivityStream } from './activity-stream.js';
 
 /** Cap on a POST body we will buffer, so a client cannot exhaust memory. */
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -143,6 +143,17 @@ export function createBuilderServer(opts = {}) {
   const baselineHeaders = securityHeaders();
 
   /**
+   * The ActivityStream mapping (spec Task 11.1): the pure projection from core
+   * loop events to the rich Activity_Stream frames broadcast over SSE. It wraps
+   * plumby's toViewEvent through the engine boundary and adds the binary
+   * write_file guard. Constructed once (it is pure and stateless) and reused by
+   * every session's onEvent. Kept without a readFileSync so a write_file renders
+   * exactly as the prior direct toViewEvent call did (an all-green "new file");
+   * the seam is available to wire a real before/after reader in a later task.
+   */
+  const activityStream = createActivityStream();
+
+  /**
    * Project Sessions, keyed by `${accountId}::${projectId}`. Each is lazily
    * created on first authenticated+authorized touch and holds everything scoped
    * to that (account, project) pair — see makeSession().
@@ -196,9 +207,9 @@ export function createBuilderServer(opts = {}) {
       }
     };
 
-    /** Map a core loop event to a view event and broadcast it. */
+    /** Map a core loop event to an Activity_Stream frame and broadcast it. */
     session.onEvent = (event) => {
-      const view = toViewEvent(event);
+      const view = activityStream.toFrame(event);
       if (view) session.broadcast(view);
     };
 
