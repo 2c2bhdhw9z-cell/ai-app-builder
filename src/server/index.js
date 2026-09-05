@@ -15,3 +15,4 @@
  */
 
 export { createBuilderServer, securityHeaders } from './builder-server.js';
+export { createActivityStream, toActivityFrame } from './activity-stream.js';

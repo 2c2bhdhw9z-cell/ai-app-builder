@@ -39,8 +39,14 @@ export { loadSkills } from 'plumby/src/cli/project_context.js';
 export { indexSkills } from 'plumby/src/core/skills.js';
 
 // Web surface helpers: event projection and diff computation.
-export { toViewEvent } from 'plumby/src/web/events.js';
-export { computeDiff } from 'plumby/src/web/diff.js';
+export { toViewEvent, RESULT_PREVIEW_CHARS } from 'plumby/src/web/events.js';
+export {
+  computeDiff,
+  deriveChange,
+  diffForToolCall,
+  truncationNotice,
+  tooLargeNotice,
+} from 'plumby/src/web/diff.js';
 
 // Tool bundles: the default toolset, the spawn_subagent tool, and the
 // read-only sub-agent toolset.
