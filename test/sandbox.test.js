@@ -46,6 +46,7 @@ import { classifyCommand } from '../src/engine/plumby.js';
 
 import os from 'node:os';
 import fs from 'node:fs';
+import { performance } from 'node:perf_hooks';
 
 const BASE = '/var/lib/aab';
 const REGISTRY = ['registry.npmjs.org'];
@@ -710,3 +711,36 @@ function createFakeBackend() {
     },
   };
 }
+
+// --- FEAT-003: per-command overhead path returns a numeric measurement -----
+//
+// A LIGHTWEIGHT smoke assertion for the prototype-first overhead path, guarded
+// behind containerRuntimeAvailable() so CI stays green where no runtime can
+// launch. It does NOT assert a specific latency number (latency is
+// environment-dependent — the AUTHORITATIVE numbers come from running
+// `node eval/sandbox-benchmark.js`, reported by the agent). It only proves that
+// routing a command through the boundary completes and yields a finite,
+// non-negative wall-clock measurement, so the budgeted quantity is always
+// measurable. In this sandbox containers launch, so this runs for real.
+
+test('(FEAT-003) per-command overhead path returns a finite numeric measurement', { skip: !RUNTIME_LIVE ? 'no container runtime' : false }, async () => {
+  const { baseDir, layout, manager } = liveSetup();
+  try {
+    ensureTree(layout.exportableProjectTree('projA'));
+    manager.acquire('projA');
+    // Warm up so we time steady-state per-command overhead, not first spin-up.
+    await manager.exec('projA', 'true');
+
+    const t0 = performance.now();
+    const res = await manager.exec('projA', 'true');
+    const elapsedMs = performance.now() - t0;
+
+    assert.equal(res.exitCode, 0, 'the no-op command runs inside the boundary');
+    assert.ok(Number.isFinite(elapsedMs), 'the overhead path yields a finite measurement');
+    assert.ok(elapsedMs >= 0, 'a wall-clock measurement is non-negative');
+    // Deliberately NO hard latency bound here — see the block comment above.
+  } finally {
+    await manager.release('projA');
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+});
