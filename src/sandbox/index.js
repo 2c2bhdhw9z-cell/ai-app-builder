@@ -12,6 +12,14 @@
 export { createSandboxManager } from './sandbox-manager.js';
 
 export {
+  createCommandGuard,
+  truncateStream,
+  DEFAULT_TRUNCATE_LIMIT_BYTES,
+  DEFAULT_CLASSIFY_TIMEOUT_MS,
+  DEFAULT_CONFIRM_TIMEOUT_MS,
+} from './command-guard.js';
+
+export {
   createContainerBackend,
   containerRuntimeAvailable,
   buildRunArgs,

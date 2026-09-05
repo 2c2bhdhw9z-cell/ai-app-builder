@@ -94,9 +94,14 @@ function containerNameFor(projectId) {
  * @param {number} [args.config.execTimeoutMs]           default wall-clock exec limit (enforced in-process)
  * @param {boolean} [args.config.readOnlyMount]          mount the project tree read-only
  * @param {(projectId:string)=>Array<object>} [args.bindingsFor]  resolve a project's ConnectorBindings
+ * @param {object} [args.secretStore]  a SecretStore (src/secrets/secret-store.js) whose
+ *        envForProject(projectId) supplies the per-project secret env injected at exec time.
+ * @param {(projectId:string)=>Object<string,string>} [args.config.envForProject]  alternative
+ *        secret-env provider; takes precedence over secretStore when both are given. Either
+ *        seam is OPTIONAL — with neither, exec injects no secret env (behaviour is unchanged).
  * @returns {object} manager
  */
-export function createSandboxManager({ layout, backend, config = {}, bindingsFor } = {}) {
+export function createSandboxManager({ layout, backend, config = {}, bindingsFor, secretStore } = {}) {
   if (!layout || typeof layout.exportableProjectTree !== 'function') {
     fail('SandboxManager', 'layout with exportableProjectTree(projectId) is required');
   }
@@ -125,6 +130,28 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
     if (typeof bindingsFor !== 'function') return [];
     const bindings = bindingsFor(projectId);
     return Array.isArray(bindings) ? bindings : [];
+  }
+
+  // Secret-env provider seam: an explicit config.envForProject wins; otherwise a
+  // SecretStore's envForProject is used; with neither, no secret env is injected.
+  const envForProject =
+    typeof config.envForProject === 'function'
+      ? config.envForProject
+      : secretStore && typeof secretStore.envForProject === 'function'
+        ? (projectId) => secretStore.envForProject(projectId)
+        : null;
+
+  /**
+   * Materialize the in-memory { NAME: value } secret env for a project. Values
+   * are read here ONLY to hand to the backend for runtime injection — they are
+   * never written into the mounted tree or the logged argv (see container-backend
+   * buildRunArgs / runOneShot). Returns undefined when no provider is configured.
+   */
+  function resolveSecretEnv(projectId) {
+    if (!envForProject) return undefined;
+    const env = envForProject(projectId);
+    if (!env || typeof env !== 'object' || Object.keys(env).length === 0) return undefined;
+    return env;
   }
 
   /**
@@ -283,6 +310,10 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
         limits: record.limits,
         network: record.network,
         readOnlyMount: record.readOnlyMount,
+        // Per-project secret env, injected at runtime ONLY. undefined when no
+        // secret provider is configured — env injection is strictly additive and
+        // does not change the denial contract or signature.
+        env: resolveSecretEnv(projectId),
         timeoutMs,
         signal: opts.signal,
       });
