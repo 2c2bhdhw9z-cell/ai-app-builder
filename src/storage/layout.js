@@ -37,6 +37,7 @@ const REGISTRY_DIR = 'registry'; // project registry, keyed by ownerId
 const SHARE_LINKS_DIR = 'share-links'; // ShareLink records, keyed by ownerId
 const BINDINGS_DIR = 'connector-bindings'; // ConnectorBinding records
 const SECRETS_DIR = 'secrets'; // Secret ciphertext (out-of-tree only)
+const SNAPSHOTS_DIR = 'snapshots'; // Snapshot registry/metadata (out-of-tree only)
 
 /**
  * Create a storage layout rooted at `baseDir`. `exportRoot` and `controlRoot`
@@ -124,6 +125,22 @@ class StorageLayout {
       projectId,
       `${secretName}.enc`,
     );
+  }
+
+  /**
+   * Snapshot REGISTRY / metadata for an owner's project. This is the list of
+   * committed Snapshot records ({ id: gitSha, createdAt, trigger, parentId }),
+   * NOT the file bytes: the file bytes and the project's Git repository (.git)
+   * live INSIDE the exportable project tree (exportableProjectTree), because
+   * that IS "the Project's repository" per Req 19.9 and is what an export
+   * produces. The registry, by contrast, is control-plane bookkeeping that must
+   * never enter an exported tree, so it resolves OUT-OF-TREE under controlRoot
+   * (asserted with assertOutsideExportTrees at the call sites).
+   */
+  controlSnapshotRegistryPath(ownerId, projectId) {
+    requireId('ownerId', ownerId);
+    requireId('projectId', projectId);
+    return path.join(this.controlRoot, SNAPSHOTS_DIR, ownerId, `${projectId}.json`);
   }
 
   // --- INVARIANT HELPERS --------------------------------------------------
