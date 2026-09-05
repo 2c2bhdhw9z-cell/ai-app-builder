@@ -119,9 +119,13 @@ function looksLikeCgroupRejection(text) {
  * @param {object} [opts]
  * @param {number} [opts.timeoutMs]  wall-clock kill timeout
  * @param {AbortSignal} [opts.signal]
+ * @param {Object<string,string>} [opts.childEnv]  env for the CHILD process; the
+ *        runtime reads name-only `-e NAME` references from here so secret VALUES
+ *        travel through the child environment, NOT the logged argv. Merged over
+ *        process.env.
  * @returns {Promise<{ code:number|null, stdout:string, stderr:string, timedOut:boolean, signal:string|null }>}
  */
-function runCli(bin, args, { timeoutMs, signal } = {}) {
+function runCli(bin, args, { timeoutMs, signal, childEnv } = {}) {
   return new Promise((resolve) => {
     const child = execFile(
       bin,
@@ -132,6 +136,10 @@ function runCli(bin, args, { timeoutMs, signal } = {}) {
         timeout: typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : undefined,
         killSignal: 'SIGKILL',
         signal,
+        // Secret values are injected here (merged over process.env) so the
+        // runtime's `-e NAME` references resolve WITHOUT the value ever
+        // appearing in `args` (the logged command line).
+        env: childEnv ? { ...process.env, ...childEnv } : undefined,
       },
       (error, stdout, stderr) => {
         const timedOut = !!error && error.killed === true && error.signal === 'SIGKILL';
@@ -175,7 +183,17 @@ export function cgroupFlagsFor(limits = {}) {
 /**
  * Build the `docker run` argument vector for a one-shot command.
  *
+ * SECRET ENV INJECTION (spec subtask 7.1): when `env` is a { NAME: value } map,
+ * we emit NAME-ONLY `-e NAME` references — NEVER `-e NAME=value` — so the secret
+ * VALUE does not appear in the argv (the logged command line). The runtime reads
+ * the value from the CHILD process environment (see runOneShot's childEnv, passed
+ * to execFile's `env` option), which is where the actual values travel. Podman /
+ * Docker both support `-e NAME` (no `=`): the variable is copied from the CLI
+ * process environment into the container. This keeps values out of argv AND out
+ * of the mounted project tree.
+ *
  * @param {object} spec
+ * @param {Object<string,string>} [spec.env]  { NAME: value } secret env map
  * @returns {string[]}
  */
 export function buildRunArgs(spec) {
@@ -189,6 +207,7 @@ export function buildRunArgs(spec) {
     cgroupFlags = [],
     command = [],
     labelValue,
+    env,
   } = spec;
 
   const args = ['run', '--rm'];
@@ -207,6 +226,13 @@ export function buildRunArgs(spec) {
     const mode = readOnlyMount ? ':ro' : '';
     args.push('-v', `${mountSource}:${workspacePath}${mode}`);
     args.push('-w', workspacePath);
+  }
+  // Secret env injection: name-only references. The VALUE is supplied to the
+  // child process environment (execFile `env`), never embedded here.
+  if (env && typeof env === 'object') {
+    for (const envName of Object.keys(env).sort()) {
+      args.push('-e', envName);
+    }
   }
   // (e) Requested cgroup limits (may be dropped on the graceful-degrade retry).
   args.push(...cgroupFlags);
@@ -282,6 +308,10 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
    * @param {object} [run.limits]          { memoryMb, cpus, pids }
    * @param {string} [run.network]         network mode (default 'none')
    * @param {boolean} [run.readOnlyMount]
+   * @param {Object<string,string>} [run.env]  { NAME: value } secret env map. The
+   *        NAMES are emitted as name-only `-e NAME` references (values stay out of
+   *        argv) and the VALUES are passed to the child process env so the runtime
+   *        resolves them. Values never touch the mounted project tree.
    * @param {number} [run.timeoutMs]       in-process wall-clock kill timeout
    * @param {AbortSignal} [run.signal]
    * @returns {Promise<{ code, stdout, stderr, timedOut, limitsApplied, limitsSupported, degraded }>}
@@ -293,6 +323,7 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
     limits = {},
     network = 'none',
     readOnlyMount = false,
+    env,
     timeoutMs,
     signal,
   }) {
@@ -309,6 +340,13 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
     const cgroupFlags = cgroupFlagsFor(limits);
     const requestedLimits = cgroupFlags.length > 0;
 
+    // Secret env injection: the NAMES become name-only `-e NAME` references in
+    // argv, and the VALUES are handed to the child process environment so the
+    // runtime resolves each reference WITHOUT the value appearing on the command
+    // line. `childEnv` is undefined when there are no secrets (no-op).
+    const hasEnv = env && typeof env === 'object' && Object.keys(env).length > 0;
+    const childEnv = hasEnv ? { ...env } : undefined;
+
     const baseSpec = {
       image,
       name,
@@ -317,10 +355,11 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
       readOnlyMount,
       labelValue: name,
       command,
+      env: hasEnv ? env : undefined,
     };
 
     // First attempt: WITH the requested cgroup flags (if any).
-    let res = await exec(bin, buildRunArgs({ ...baseSpec, cgroupFlags }), { timeoutMs, signal });
+    let res = await exec(bin, buildRunArgs({ ...baseSpec, cgroupFlags }), { timeoutMs, signal, childEnv });
 
     // Graceful degrade: if the ONLY reason we failed to launch is that the
     // runtime rejected the cgroup flags, retry WITHOUT them and flag that limits
@@ -332,7 +371,7 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
       degraded = true;
       limitsApplied = false;
       limitsSupported = false;
-      res = await exec(bin, buildRunArgs({ ...baseSpec, cgroupFlags: [] }), { timeoutMs, signal });
+      res = await exec(bin, buildRunArgs({ ...baseSpec, cgroupFlags: [] }), { timeoutMs, signal, childEnv });
     }
 
     return {
