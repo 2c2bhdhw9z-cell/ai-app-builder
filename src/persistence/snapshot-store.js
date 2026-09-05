@@ -171,6 +171,41 @@ export function createSnapshotStore({
   }
 
   /**
+   * Roll HEAD back after a just-created commit could not be recorded in the
+   * registry, so the repo and the (registry-gated) store APIs stay in agreement
+   * and no orphaned/unreachable commit lingers.
+   *   - With a parent: hard-reset HEAD to the parent so the working tree + ref
+   *     return to the most recent COMPLETE snapshot (Req 19.4).
+   *   - Without a parent (this was the FIRST commit): delete the branch ref so
+   *     the repo returns to its pre-commit "no commits yet" state. `git reset`
+   *     cannot remove the root commit, so we clear the ref via update-ref -d and
+   *     restore the working tree to empty best-effort.
+   * All steps are best-effort/allowFail: rollback must never itself throw past
+   * the structured error we are already returning.
+   */
+  function rollbackHead(root, parentId) {
+    if (parentId) {
+      git(root, ['reset', '-q', '--hard', parentId], { allowFail: true });
+      return;
+    }
+    // No parent: this was the initial commit. Drop the branch ref back to the
+    // unborn state and clean the working tree so nothing is reachable.
+    const branch = git(root, ['symbolic-ref', '--quiet', 'HEAD'], { allowFail: true });
+    if (branch.ok && branch.stdout) {
+      git(root, ['update-ref', '-d', branch.stdout], { allowFail: true });
+    }
+    git(root, ['clean', '-q', '-fd'], { allowFail: true });
+    for (const ent of safeReaddir(root)) {
+      if (ent === '.git') continue;
+      try {
+        fs.rmSync(path.join(root, ent), { recursive: true, force: true });
+      } catch {
+        /* best-effort: rollback must not throw */
+      }
+    }
+  }
+
+  /**
    * Materialize the given projectTree into `root`, replacing any tracked/working
    * files so the committed tree is EXACTLY the passed tree. Preserves .git.
    */
@@ -220,8 +255,12 @@ export function createSnapshotStore({
       if (norm === '.git' || norm.startsWith(`.git${path.sep}`)) {
         fail(model, 'projectTree must not contain a .git entry (reserved for the snapshot repo)');
       }
-      if (typeof contents !== 'string' && !Buffer.isBuffer(contents)) {
-        fail(model, `projectTree[${JSON.stringify(rel)}] must be a string or Buffer`);
+      // Contract: file contents are TEXT (utf8 strings). restore() reads the
+      // working tree back with readWorkingTree, which decodes as utf8, so a
+      // Buffer of non-utf8 bytes would not round-trip byte-exact. Reject
+      // non-strings so the commit->restore contract stays honest (text-only).
+      if (typeof contents !== 'string') {
+        fail(model, `projectTree[${JSON.stringify(rel)}] must be a string (file contents are utf8 text)`);
       }
       entries.push([norm, contents]);
     }
@@ -298,6 +337,14 @@ export function createSnapshotStore({
     }
 
     // Build the Snapshot record via the EXISTING model and append it out-of-tree.
+    //
+    // COMMIT/REGISTRY ATOMICITY (Req 19.4): restore/resume are registry-gated, so
+    // a commit that lands in Git but whose registry append fails would be an
+    // ORPHAN — HEAD would advance to a commit no store API can reach. We keep the
+    // repo and registry in agreement by ROLLING HEAD BACK on a registry-append
+    // failure: reset --hard to the parent (or delete the ref when there was no
+    // parent), so the most recent COMPLETE snapshot (the parent) is retained and
+    // no unreachable commit lingers. The returned error is structured.
     let record;
     try {
       record = createSnapshot({
@@ -311,14 +358,15 @@ export function createSnapshotStore({
       registry.push(record);
       saveRegistry(projectId, registry);
     } catch (err) {
+      rollbackHead(root, parentId);
       return {
         ok: false,
         projectId,
         error: {
           kind: 'snapshot-registry-failure',
-          message: `commit ${sha} recorded but registry update failed: ${err?.message ?? err}`,
+          message: `commit ${sha} could not be recorded (registry update failed); rolled HEAD back to retain the most recent complete snapshot: ${err?.message ?? err}`,
           cause: err,
-          snapshotId: sha,
+          rolledBackTo: parentId ?? null,
         },
       };
     }

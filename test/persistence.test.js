@@ -175,6 +175,89 @@ test('persistence FAILURE retains the last good state unchanged and returns an e
   }
 });
 
+test('auto-flush (debounce timer path) failure is surfaced via onError and retains state', () => {
+  const { base, layout } = tempLayout();
+  try {
+    // First persist a good v1 durably (debounce 0) with a plain store, so there
+    // is a last-good state to retain.
+    const good = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    good.persist(PROJECT, { 'data.txt': 'good-v1' });
+    assert.deepEqual(good.readPersistedTree(PROJECT), { 'data.txt': 'good-v1' });
+
+    // A store whose writeTree throws, wired with the injected clock/scheduler and
+    // observable error/persist sinks. We drive the ACTUAL scheduled timer callback.
+    let clock = 0;
+    const timers = [];
+    const errors = [];
+    const persists = [];
+    const store = createPersistenceStore({
+      layout,
+      ownerId: OWNER,
+      now: () => clock,
+      debounceMs: 2000,
+      writeTree: () => {
+        throw new Error('disk full');
+      },
+      setTimer: (fn, ms) => {
+        const t = { fireAt: clock + ms, fn, cancelled: false };
+        timers.push(t);
+        return t;
+      },
+      clearTimer: (t) => {
+        if (t) t.cancelled = true;
+      },
+      onError: (projectId, error) => errors.push({ projectId, error }),
+      onPersist: (projectId, result) => persists.push({ projectId, result }),
+    });
+
+    // Schedule the idle-debounced write of v2 (which will fail when it fires).
+    const scheduled = store.persist(PROJECT, { 'data.txt': 'bad-v2' });
+    assert.equal(scheduled.scheduled, true);
+    assert.equal(store.hasPending(PROJECT), true);
+
+    // Fire the real scheduled timer callback (the "became idle for 2s" event).
+    const live = timers.filter((t) => !t.cancelled);
+    assert.equal(live.length, 1);
+    live[0].fn();
+
+    // (a) the onError sink was invoked with a structured error.
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].projectId, PROJECT);
+    assert.equal(errors[0].error.kind, 'persistence-failure');
+    assert.match(errors[0].error.message, /disk full/);
+    // onPersist observed the same failed result.
+    assert.equal(persists.length, 1);
+    assert.equal(persists[0].result.ok, false);
+
+    // (b) the last-good persisted state is unchanged (v1 still on disk).
+    assert.deepEqual(good.readPersistedTree(PROJECT), { 'data.txt': 'good-v1' });
+
+    // (c) the pending state is retained so a later flush can retry.
+    assert.equal(store.hasPending(PROJECT), true);
+    // A later flush with the failing writer still fails and still returns the
+    // structured error directly to the caller (explicit-path contract unchanged).
+    const retried = store.flush(PROJECT);
+    assert.equal(retried.ok, false);
+    assert.equal(retried.error.kind, 'persistence-failure');
+    assert.equal(store.hasPending(PROJECT), true);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('persist rejects non-string (Buffer) contents to keep the utf8 round-trip honest', () => {
+  const { base, layout } = tempLayout();
+  try {
+    const store = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    assert.throws(
+      () => store.persist(PROJECT, { 'bin.dat': Buffer.from([0xff, 0xfe, 0x00]) }),
+      /must be a string/,
+    );
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
 // --- 8.2 SnapshotStore ----------------------------------------------------
 
 test('commitSnapshot records a content-addressed commit in the project OWN repo', () => {
@@ -225,6 +308,89 @@ test('the ai-app-builder repo .git is never touched by snapshot commits', () => 
   const afterStatus = execFileSync('git', ['status', '--porcelain'], { cwd: sourceRepo, encoding: 'utf8' });
   assert.equal(afterHead, beforeHead, 'source repo HEAD must be unchanged');
   assert.equal(afterStatus, beforeStatus, 'source repo working tree must be unchanged');
+});
+
+test('registry-write failure rolls HEAD back so no orphaned commit is retained', () => {
+  const { base, layout } = tempLayout();
+  try {
+    // First commit succeeds normally, establishing a parent HEAD + registry.
+    const store = createSnapshotStore({ layout, ownerId: OWNER });
+    const first = store.commitSnapshot(PROJECT, { 'a.js': 'v1' }, { trigger: 'explicit' });
+    assert.equal(first.ok, true);
+
+    const root = layout.exportableProjectTree(PROJECT);
+    const parentHead = gitHead(root);
+    assert.equal(parentHead, first.snapshotId);
+
+    // A second store whose registry path is FORCED to be unwritable: point it at
+    // a path whose parent dir is actually a regular file, so saveRegistry's
+    // mkdirSync throws ENOTDIR AFTER the git commit has already succeeded.
+    const blocker = path.join(base, 'registry-blocker');
+    fs.writeFileSync(blocker, 'i am a file, not a dir');
+    const brokenLayout = Object.create(layout);
+    brokenLayout.controlSnapshotRegistryPath = () => path.join(blocker, 'nested', 'registry.json');
+
+    const failing = createSnapshotStore({ layout: brokenLayout, ownerId: OWNER });
+    const res = failing.commitSnapshot(PROJECT, { 'a.js': 'v2' }, { trigger: 'turn-pass' });
+
+    // Structured error returned.
+    assert.equal(res.ok, false);
+    assert.equal(res.error.kind, 'snapshot-registry-failure');
+    assert.equal(res.error.rolledBackTo, parentHead);
+
+    // The repo does NOT retain an unreachable/orphaned commit: HEAD is back at
+    // the parent, and the working tree reflects the parent (v1, not v2).
+    assert.equal(gitHead(root), parentHead);
+    assert.equal(fs.readFileSync(path.join(root, 'a.js'), 'utf8'), 'v1');
+
+    // And restore/resume of the most recent COMPLETE snapshot still works and is
+    // the parent (the orphan is neither reachable nor recorded).
+    assert.equal(store.latestSnapshot(PROJECT).id, parentHead);
+    const resumed = store.resume(PROJECT);
+    assert.equal(resumed.ok, true);
+    assert.equal(resumed.snapshotId, parentHead);
+    assert.deepEqual(resumed.projectTree, { 'a.js': 'v1' });
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('registry-write failure on the FIRST commit leaves the repo with no reachable commit', () => {
+  const { base, layout } = tempLayout();
+  try {
+    const blocker = path.join(base, 'registry-blocker-first');
+    fs.writeFileSync(blocker, 'file');
+    const brokenLayout = Object.create(layout);
+    brokenLayout.controlSnapshotRegistryPath = () => path.join(blocker, 'nested', 'registry.json');
+
+    const failing = createSnapshotStore({ layout: brokenLayout, ownerId: OWNER });
+    const res = failing.commitSnapshot(PROJECT, { 'a.js': 'v1' }, { trigger: 'explicit' });
+    assert.equal(res.ok, false);
+    assert.equal(res.error.kind, 'snapshot-registry-failure');
+    assert.equal(res.error.rolledBackTo, null);
+
+    // No parent existed, so after rollback the repo has no reachable HEAD commit
+    // (rev-parse on an unborn HEAD exits non-zero).
+    const root = layout.exportableProjectTree(PROJECT);
+    let head = '';
+    try {
+      head = execFileSync('git', ['rev-parse', '--verify', '--quiet', 'HEAD'], {
+        cwd: root,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+    } catch {
+      head = '';
+    }
+    assert.equal(head, '', 'HEAD must be unborn after rolling back the first commit');
+
+    // The registry has no record and there is no latest snapshot.
+    const store = createSnapshotStore({ layout, ownerId: OWNER });
+    assert.equal(store.listSnapshots(PROJECT).length, 0);
+    assert.equal(store.latestSnapshot(PROJECT), null);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });
 
 // --- 8.5* turn-trigger policy ---------------------------------------------

@@ -63,8 +63,12 @@ function normalizeTree(model, projectTree) {
     if (norm === '..' || norm.startsWith(`..${path.sep}`) || norm.split(/[\\/]/).includes('..')) {
       fail(model, `projectTree path must not escape the project tree, got ${JSON.stringify(rel)}`);
     }
-    if (typeof contents !== 'string' && !Buffer.isBuffer(contents)) {
-      fail(model, `projectTree[${JSON.stringify(rel)}] must be a string or Buffer`);
+    // Contract: file contents are TEXT (utf8 strings). The read-back paths
+    // (readPersistedTree) decode as utf8, so a Buffer of non-utf8 bytes would
+    // not round-trip byte-exact. Rather than silently corrupt non-utf8 input we
+    // reject non-strings, keeping the persist->read contract honest (text-only).
+    if (typeof contents !== 'string') {
+      fail(model, `projectTree[${JSON.stringify(rel)}] must be a string (file contents are utf8 text)`);
     }
     entries.push([norm, contents]);
   }
@@ -149,10 +153,22 @@ function pruneStale(treeRoot, dir, keep) {
  * @param {string} [args.ownerId]       owning account id; defaults to 'default'
  * @param {() => number} [args.now]     injectable clock (ms) for deterministic tests
  * @param {number} [args.debounceMs]    idle debounce budget (<= 2000); default 2000
- * @param {(treeRoot: string, entries: [string, (string|Buffer)][]) => void} [args.writeTree]
- *        injectable atomic tree writer (default materializes files on disk)
+ * @param {(treeRoot: string, entries: [string, string][]) => void} [args.writeTree]
+ *        injectable atomic tree writer (default materializes files on disk);
+ *        entries carry utf8-string contents (the store rejects non-string input)
  * @param {(fn: () => void, ms: number) => any} [args.setTimer]  injectable scheduler (default setTimeout)
  * @param {(handle: any) => void} [args.clearTimer]              injectable canceller (default clearTimeout)
+ * @param {(projectId: string, error: object) => void} [args.onError]
+ *        OPTIONAL error sink invoked when an AUTOMATIC (debounce-timer-path)
+ *        persist fails. Because the timer fires with no caller to observe the
+ *        { ok:false, error } result, this callback is how a failed idle persist
+ *        (Req 19.1 auto-path) surfaces its structured error (Req 19.2). The
+ *        pending state and last-good state are retained so a later flush retries.
+ * @param {(projectId: string, result: object) => void} [args.onPersist]
+ *        OPTIONAL observer invoked on EVERY timer-path persist attempt with the
+ *        full result object ({ ok:true|false, ... }), so callers can react to
+ *        automatic success as well as failure. Never invoked for explicit
+ *        persist/flush/persistNow calls (those return the result directly).
  * @returns {object} store (frozen)
  */
 export function createPersistenceStore({
@@ -163,6 +179,8 @@ export function createPersistenceStore({
   writeTree = defaultWriteTree,
   setTimer = (fn, ms) => setTimeout(fn, ms),
   clearTimer = (h) => clearTimeout(h),
+  onError = null,
+  onPersist = null,
 } = {}) {
   const model = 'PersistenceStore';
   if (!layout || typeof layout.exportableProjectTree !== 'function') {
@@ -177,6 +195,8 @@ export function createPersistenceStore({
     fail(model, `debounceMs must be <= ${MAX_DEBOUNCE_MS} (the 2s idle budget)`);
   }
   if (typeof writeTree !== 'function') fail(model, 'writeTree must be a function');
+  if (onError !== null && typeof onError !== 'function') fail(model, 'onError must be a function');
+  if (onPersist !== null && typeof onPersist !== 'function') fail(model, 'onPersist must be a function');
 
   /**
    * Per-project pending write state:
@@ -241,9 +261,27 @@ export function createPersistenceStore({
     const state = existing ?? {};
     state.entries = entries;
     state.deadline = deadline;
-    // The timer flushes the durable write once the change has been idle.
+    // The timer flushes the durable write once the change has been idle. Unlike
+    // the explicit persist/flush/persistNow paths, NO caller observes this
+    // result, so we route it to the optional sinks: onPersist for every timer
+    // attempt, onError for a failed one. On failure persistNow retains the
+    // pending state and last-good state, so a later flush can still retry.
     state.timer = debounceMs === 0 ? null : setTimer(() => {
-      persistNow(projectId);
+      const result = persistNow(projectId);
+      if (typeof onPersist === 'function') {
+        try {
+          onPersist(projectId, result);
+        } catch {
+          /* an observer must never break the persistence path */
+        }
+      }
+      if (result && result.ok === false && typeof onError === 'function') {
+        try {
+          onError(projectId, result.error);
+        } catch {
+          /* an error sink must never break the persistence path */
+        }
+      }
     }, debounceMs);
     pending.set(projectId, state);
 
