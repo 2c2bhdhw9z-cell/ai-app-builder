@@ -33,6 +33,8 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import { createStorageLayout } from '../src/storage/layout.js';
 import { createProjectRegistry } from '../src/project/project-registry.js';
@@ -350,6 +352,165 @@ test('createProject: over the totalProjects quota is refused naming the limit, w
   }
 });
 
+test('createProject: over the concurrentSandboxes quota is refused naming the limit BEFORE acquire, with NO acquire and NO registry write (review finding 1)', () => {
+  const { base, layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    const sandboxManager = fakeSandboxManager();
+    const devServer = fakeDevServer();
+    // A QuotaManager whose concurrent-Sandbox ceiling is 0 (via a fixed
+    // concurrency counter) so ANY create is over the concurrent boundary — the
+    // same ceiling the /message path enforces. totalProjects is left generous.
+    const quotaManager = createQuotaManager({
+      config: { quota: { maxConcurrentSandboxes: 0, maxTotalProjects: 50 } },
+      projectCounter: (accountId) => registry.countForOwner(accountId),
+      concurrencyCount: () => 0,
+    });
+    const manager = createProjectManager({
+      registry,
+      sandboxManager,
+      quotaManager,
+      devServer,
+      agentFactory: fakeAgentFactory(),
+      verify: () => 'verdict: PASS',
+      now: steppingClock(),
+      idFactory: seqIdFactory(),
+    });
+
+    const created = manager.createProject({ accountId: OWNER, description: 'nope', ...VALID });
+    assert.equal(created.ok, false);
+    assert.equal(created.code, 'QUOTA_EXCEEDED');
+    assert.equal(created.limit, 'Resource_Quota');
+    assert.equal(created.resource, 'concurrentSandboxes');
+    assert.match(created.message, /concurrent Sandboxes/);
+
+    // Refused BEFORE any allocation and BEFORE any registry write — matching the
+    // gate ordering (quota -> acquire). If the concurrentSandboxes gate were
+    // removed, acquire would run and this assertion would flip.
+    assert.equal(sandboxManager.acquireCalls.length, 0, 'no acquire when over concurrent quota');
+    assert.equal(registry.countForOwner(OWNER), 0, 'no project persisted when over concurrent quota');
+  } finally {
+    cleanup();
+  }
+});
+
+test('createProject: rolls back the registry entry when acquire throws AFTER registration — no partial Project (review finding 5)', () => {
+  const { base, layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    // A SandboxManager whose acquire THROWS (simulating a provisioning failure
+    // after the record has been registered).
+    const acquireCalls = [];
+    const sandboxManager = {
+      acquire(projectId) {
+        acquireCalls.push(projectId);
+        throw new Error('provisioning failed');
+      },
+      activeProjectIds() {
+        return [];
+      },
+    };
+    const manager = createProjectManager({
+      registry,
+      sandboxManager,
+      devServer: fakeDevServer(),
+      agentFactory: fakeAgentFactory(),
+      verify: () => 'verdict: PASS',
+      now: steppingClock(),
+      idFactory: seqIdFactory(),
+    });
+
+    const created = manager.createProject({ accountId: OWNER, description: 'app', ...VALID });
+    assert.equal(created.ok, false);
+    assert.equal(created.code, 'SANDBOX_ACQUIRE_FAILED');
+    assert.equal(acquireCalls.length, 1, 'acquire was attempted (after registration)');
+
+    // The compensating rollback removed the registry entry — no orphaned record.
+    // Without the rollback this count would be 1 (a partial Project).
+    assert.equal(registry.countForOwner(OWNER), 0, 'registry has NO leftover entry after acquire failure');
+    assert.equal(makeRegistryCount(base, OWNER), 0, 'on-disk registry has NO leftover entry');
+    // The projectId no longer resolves — nothing partial survives.
+    assert.equal(registry.get('proj-1'), null, 'the rolled-back project does not resolve');
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------- registry concurrency + lookup (findings 2, 3) --
+
+test('registry.register: concurrent CROSS-PROCESS registrations for one owner do not clobber each other (review finding 2)', async () => {
+  const { base, layout, cleanup } = tempLayout();
+  try {
+    // Genuinely concurrent registrations must exercise the cross-process lock:
+    // spawn N child processes that each register a distinct project for the SAME
+    // owner into the SAME on-disk registry, started as close to simultaneously
+    // as possible. Without the per-owner file lock, overlapping read-modify-write
+    // cycles clobber each other and the final count is < N (a lost update).
+    const N = 12;
+    const workers = Array.from({ length: N }, (_, i) =>
+      runRegisterWorker({ base, ownerId: OWNER, projectId: `p-${i}`, index: i }),
+    );
+    const codes = await Promise.all(workers);
+    assert.ok(codes.every((c) => c === 0), `all ${N} register workers exit 0 (codes: ${codes})`);
+
+    // EVERY record survived — no lost update under real concurrency.
+    const registry = createProjectRegistry({ layout });
+    assert.equal(registry.countForOwner(OWNER), N, `all ${N} concurrent registrations must survive`);
+    for (let i = 0; i < N; i += 1) {
+      assert.ok(registry.get(`p-${i}`), `p-${i} must be resolvable`);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test('registry.get/resolver: resolves across MANY owners via the index without a full scan (review finding 3)', () => {
+  const { base, layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    // Register one project each for several owners.
+    const owners = ['acct-a', 'acct-b', 'acct-c', 'acct-d'];
+    owners.forEach((ownerId, i) => {
+      registry.register({
+        id: `proj-${ownerId}`,
+        ownerId,
+        description: `d${i}`,
+        targetCategory: 'web',
+        origin: 'blank',
+        sandboxId: `proj-${ownerId}`,
+        targets: [],
+        snapshots: [],
+        connectors: [],
+        provider: 'anthropic',
+        model: 'claude-sonnet',
+        createdAt: '2020-01-01T00:00:00.000Z',
+        updatedAt: '2020-01-01T00:00:00.000Z',
+      });
+    });
+
+    // Each project resolves to its correct owner, cross-owner.
+    for (const ownerId of owners) {
+      const rec = registry.get(`proj-${ownerId}`);
+      assert.ok(rec, `proj-${ownerId} resolves`);
+      assert.equal(rec.ownerId, ownerId);
+      assert.deepEqual(registry.resolver(`proj-${ownerId}`), { id: `proj-${ownerId}`, ownerId });
+    }
+    // An unknown id resolves to null (deny without disclosure).
+    assert.equal(registry.get('nope'), null);
+    assert.equal(registry.resolver('nope'), null);
+
+    // The projectId -> ownerId index exists on disk and maps every project to
+    // its owner, so lookups do not need to scan every owner file.
+    const indexPath = path.join(base, 'control-plane', 'registry', 'index.json');
+    const index = JSON.parse(fs.readFileSync(indexPath, 'utf8'));
+    for (const ownerId of owners) {
+      assert.equal(index[`proj-${ownerId}`], ownerId, `index maps proj-${ownerId} -> ${ownerId}`);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 // ---------------------------- generation -> verify -> Dev_Server (1.3, 1.7)
 
 test('pipeline: verify PASS starts the Dev_Server exactly once and commits a turn-pass snapshot', async () => {
@@ -583,6 +744,47 @@ test('POST /projects: unauthenticated request is denied 401 with no disclosure a
 });
 
 // --------------------------------------------------------------- test helpers
+
+/**
+ * Spawn a child Node process that registers ONE project into the shared on-disk
+ * registry under `base`, for cross-process concurrency testing (review finding
+ * 2). All workers target the SAME owner file, so the per-owner cross-process
+ * lock is what keeps their read-modify-write cycles from clobbering each other.
+ * Resolves with the child's exit code.
+ */
+function runRegisterWorker({ base, ownerId, projectId, index }) {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const registryModule = path.resolve(here, '../src/project/project-registry.js');
+  const layoutModule = path.resolve(here, '../src/storage/layout.js');
+  const src = `
+    import { createStorageLayout } from ${JSON.stringify(layoutModule)};
+    import { createProjectRegistry } from ${JSON.stringify(registryModule)};
+    const layout = createStorageLayout(${JSON.stringify(base)});
+    const registry = createProjectRegistry({ layout });
+    registry.register({
+      id: ${JSON.stringify(projectId)},
+      ownerId: ${JSON.stringify(ownerId)},
+      description: 'project ' + ${JSON.stringify(index)},
+      targetCategory: 'web',
+      origin: 'blank',
+      sandboxId: ${JSON.stringify(projectId)},
+      targets: [], snapshots: [], connectors: [],
+      provider: 'anthropic', model: 'claude-sonnet',
+      createdAt: '2020-01-01T00:00:00.000Z',
+      updatedAt: '2020-01-01T00:00:00.000Z',
+    });
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', src], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (d) => (stderr += d));
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code !== 0 && stderr) process.stderr.write(`register worker ${projectId} stderr: ${stderr}\n`);
+      resolve(code);
+    });
+  });
+}
 
 /** Count persisted projects for an owner by reading the on-disk registry file. */
 function makeRegistryCount(base, ownerId) {

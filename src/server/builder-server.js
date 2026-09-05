@@ -492,7 +492,9 @@ export function createBuilderServer(opts = {}) {
     });
 
     if (created && created.ok === false) {
-      // A totalProjects quota rejection is a 429 naming the limit; every other
+      // A Resource_Quota rejection (totalProjects OR concurrentSandboxes) is a
+      // 429 naming the limit; a post-registration Sandbox-acquire failure is a
+      // 503 (the create was rolled back, so it is retryable); every other
       // rejection (validation) is a 400 with the specific message.
       if (created.code === 'QUOTA_EXCEEDED') {
         return sendJson(res, 429, {
@@ -500,6 +502,9 @@ export function createBuilderServer(opts = {}) {
           limit: created.limit,
           resource: created.resource,
         });
+      }
+      if (created.code === 'SANDBOX_ACQUIRE_FAILED') {
+        return sendJson(res, 503, { error: created.message, code: created.code });
       }
       return sendJson(res, 400, { error: created.message, code: created.code });
     }

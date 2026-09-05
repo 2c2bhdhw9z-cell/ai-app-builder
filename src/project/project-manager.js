@@ -166,15 +166,25 @@ export function createProjectManager({
    * Order (allocate NOTHING on any rejection):
    *   1. validateCreateInput first — a validation rejection creates no Project
    *      and acquires no Sandbox.
-   *   2. If a QuotaManager is injected, enforce the totalProjects Resource_Quota
-   *      via checkQuota(account, null, 'totalProjects') using registry.countForOwner
-   *      as the projectCounter — refuse over-quota with the named limit and NO
-   *      allocation. (Rate limiting is the Builder-Server gate's job; not re-run.)
+   *   2. If a QuotaManager is injected, enforce the Resource_Quotas BEFORE any
+   *      allocation, in the same order the /message path uses (quota -> acquire):
+   *        (a) totalProjects  — checkQuota(account, null, 'totalProjects') using
+   *            registry.countForOwner as the projectCounter (a per-account
+   *            ceiling); and
+   *        (b) concurrentSandboxes — checkQuota(account, projectId,
+   *            'concurrentSandboxes') because createProject ACQUIRES a Sandbox,
+   *            so a create must count against the same concurrent-boundary
+   *            ceiling /message enforces (review finding 1). Both refuse
+   *            over-quota with the named limit and NO allocation / NO registry
+   *            write. (Rate limiting is the Builder-Server gate's job; not re-run.)
    *   3. Build the Project record (createProject from the model) with a generated
    *      id, ownerId=accountId, the validated fields, the sandboxId, empty
    *      targets/snapshots/connectors, provider/model, createdAt/updatedAt=now.
    *   4. Register it in the registry.
-   *   5. Acquire its Sandbox so it becomes available for streaming.
+   *   5. Acquire its Sandbox so it becomes available for streaming. If acquire
+   *      throws AFTER registration, ROLL BACK the registry entry so a failed
+   *      create leaves NO partial Project (review finding 5, "no partial
+   *      Project").
    *   6. Return { ok:true, project, sandbox, beganAt, beginsCreationMs } — the
    *      elapsed "begins creation" time is measured from the injected clock so
    *      the 10s SLO is observable/testable.
@@ -196,25 +206,29 @@ export function createProjectManager({
     const validated = validateCreateInput({ description, targetCategory, origin });
     if (!validated.ok) return validated;
 
-    // 2) Enforce the totalProjects Resource_Quota (behind the gate; not rate limit).
+    // The projectId is minted BEFORE the quota checks so the concurrentSandboxes
+    // gate can name the boundary it would create; it is also the sandboxId.
+    const id = idFactory();
+
+    // 2) Enforce the Resource_Quotas BEFORE any allocation, in the same order the
+    //    /message path uses: totalProjects, then concurrentSandboxes. Rate
+    //    limiting is the Builder-Server gate's job and is not re-run here.
     if (quotaManager && typeof quotaManager.checkQuota === 'function') {
-      const quota = quotaManager.checkQuota({ id: accountId }, null, 'totalProjects');
-      if (quota && quota.ok === false) {
-        return {
-          ok: false,
-          code: 'QUOTA_EXCEEDED',
-          message: quota.message ?? 'resource quota exceeded',
-          limit: quota.limit,
-          resource: quota.resource,
-          max: quota.max,
-          current: quota.current,
-        };
+      // (a) Per-account total-Projects ceiling.
+      const totalQuota = quotaManager.checkQuota({ id: accountId }, null, 'totalProjects');
+      if (totalQuota && totalQuota.ok === false) {
+        return quotaRejection(totalQuota);
+      }
+      // (b) Concurrent-Sandbox ceiling — createProject acquires a Sandbox, so a
+      //     create must count against the same boundary /message enforces.
+      const concurrentQuota = quotaManager.checkQuota({ id: accountId }, id, 'concurrentSandboxes');
+      if (concurrentQuota && concurrentQuota.ok === false) {
+        return quotaRejection(concurrentQuota);
       }
     }
 
     // 3) Build the Project record. The sandboxId is the projectId (the
     //    SandboxManager keys the per-project boundary by projectId).
-    const id = idFactory();
     const createdAt = new Date(startedAt).toISOString();
     const project = createProjectRecord({
       id,
@@ -236,14 +250,55 @@ export function createProjectManager({
     // 4) Register (persists out-of-tree, round-tripping through createProject).
     const registered = registry.register(project);
 
-    // 5) Allocate the Sandbox so the project is available for streaming.
-    const sandbox = sandboxManager.acquire(id);
+    // 5) Allocate the Sandbox so the project is available for streaming. If
+    //    acquire throws AFTER registration, ROLL BACK the registry entry so a
+    //    failed create leaves NO partial Project (review finding 5). The record
+    //    is only durable once its Sandbox is acquired.
+    let sandbox;
+    try {
+      sandbox = sandboxManager.acquire(id);
+    } catch (err) {
+      rollbackRegistration(id, accountId);
+      return {
+        ok: false,
+        code: 'SANDBOX_ACQUIRE_FAILED',
+        message: `sandbox acquisition failed after registration; rolled back: ${err?.message ?? String(err)}`,
+      };
+    }
 
     // 6) Measure the "begins creation" elapsed time for the SLO.
     const beganAt = now();
     const beginsCreationMs = beganAt - startedAt;
 
     return { ok: true, project: registered, sandbox, beganAt, beginsCreationMs };
+  }
+
+  /** Map a QuotaManager rejection to the createProject rejection shape. */
+  function quotaRejection(quota) {
+    return {
+      ok: false,
+      code: 'QUOTA_EXCEEDED',
+      message: quota.message ?? 'resource quota exceeded',
+      limit: quota.limit,
+      resource: quota.resource,
+      max: quota.max,
+      current: quota.current,
+    };
+  }
+
+  /**
+   * Compensating action: remove a just-registered Project when a later creation
+   * step fails, so no orphaned registry entry survives (review finding 5).
+   * Best-effort — a rollback failure must not mask the original error.
+   */
+  function rollbackRegistration(projectId, ownerId) {
+    if (typeof registry.unregister === 'function') {
+      try {
+        registry.unregister(projectId, ownerId);
+      } catch {
+        /* best-effort rollback */
+      }
+    }
   }
 
   /**

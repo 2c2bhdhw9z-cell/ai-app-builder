@@ -88,6 +88,16 @@ class StorageLayout {
   // --- CONTROL-PLANE (out of every project tree) --------------------------
 
   /**
+   * The project-registry ROOT directory (control-plane, out of every tree).
+   * Owner subdirectories live directly beneath it. Exposed explicitly so the
+   * ProjectRegistry can enumerate owners and derive per-owner/per-project paths
+   * WITHOUT reverse-engineering the path shape from a sentinel ownerId.
+   */
+  controlProjectRegistryRoot() {
+    return path.join(this.controlRoot, REGISTRY_DIR);
+  }
+
+  /**
    * The project registry entry for an owner. Keyed by ownerId so the registry
    * is filterable per account (three-axis isolation, Req 7.6).
    */
