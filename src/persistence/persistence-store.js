@@ -361,6 +361,29 @@ export function createPersistenceStore({
     return tree;
   }
 
+  /**
+   * deleteProjectTree(projectId): irreversibly remove a Project's persisted file
+   * state (Task 12.3 / Req 24.3, retain-until-deletion). Drops any pending
+   * (scheduled-but-not-yet-durable) write so a queued timer cannot resurrect the
+   * tree AFTER deletion, then removes the exportable project tree directory
+   * (including the SnapshotStore's .git repo living at its root — deleting the
+   * project means deleting everything under its tree). Idempotent: deleting a
+   * project that was never persisted is success. Returns a structured summary.
+   */
+  function deleteProjectTree(projectId) {
+    requireString(model, 'projectId', projectId);
+    // Drop any pending write + cancel its timer so nothing rewrites the tree.
+    const state = pending.get(projectId);
+    if (state && state.timer !== undefined && state.timer !== null) {
+      clearTimer(state.timer);
+    }
+    pending.delete(projectId);
+    const root = treeRootFor(projectId);
+    const existed = fs.existsSync(root);
+    fs.rmSync(root, { recursive: true, force: true });
+    return { ok: true, projectId, removed: existed };
+  }
+
   return Object.freeze({
     ownerId,
     debounceMs,
@@ -369,5 +392,6 @@ export function createPersistenceStore({
     flush,
     hasPending,
     readPersistedTree,
+    deleteProjectTree,
   });
 }

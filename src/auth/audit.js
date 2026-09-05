@@ -13,7 +13,16 @@
  * decisions.
  */
 
-/** Security-event type constants emitted by the auth subsystem. */
+/**
+ * Security-event type constants emitted across the platform.
+ *
+ * The session.* / authn.* / authz.* constants are emitted by the auth
+ * subsystem. The remaining constants are the Task-12 platform-operations
+ * vocabulary shared by the QuotaManager, SecretStore, deletion service, and
+ * AuditLog (secret access, confirm-class op, deletion, quota/rate-limit/abuse,
+ * operational error). Extending this set must never remove an existing member;
+ * the object stays frozen.
+ */
 export const AUDIT_EVENTS = Object.freeze({
   SESSION_ISSUED: 'session.issued',
   SESSION_ROTATED: 'session.rotated',
@@ -22,6 +31,16 @@ export const AUDIT_EVENTS = Object.freeze({
   AUTHZ_DECISION: 'authz.decision',
   AUTHN_SUCCESS: 'authn.success',
   AUTHN_DENIED: 'authn.denied',
+  // Task-12 platform-operations events (secrets, confirm-class ops, deletion,
+  // quota/rate-limit/abuse, operational errors).
+  SECRET_ACCESS: 'secret.access',
+  CONFIRM_CLASS_OP: 'command.confirm',
+  PROJECT_DELETED: 'project.deleted',
+  ACCOUNT_DELETED: 'account.deleted',
+  QUOTA_EXCEEDED: 'quota.exceeded',
+  RATE_LIMIT_EXCEEDED: 'ratelimit.exceeded',
+  ABUSE_MITIGATED: 'abuse.mitigated',
+  OPERATIONAL_ERROR: 'operational.error',
 });
 
 /**

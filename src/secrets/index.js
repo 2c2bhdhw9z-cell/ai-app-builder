@@ -10,10 +10,16 @@
  * into env-var references before source is written.
  *
  * ENCRYPTION SEAM: createSecretStore takes a pluggable `codec` (default
- * identityCodec). Real envelope encryption / KMS is Task 12.4 and slots in via
- * that seam without changing any caller here.
+ * identityCodec). Real envelope encryption / KMS (Task 12.4) is provided here by
+ * createEnvelopeCodec({ kms }) over a KMS seam (createLocalKms is the local /
+ * offline implementation; a cloud KMS slots in behind the same interface). The
+ * envelope codec drops into the SAME `codec` seam with no caller changes.
  */
 
 export { createSecretStore, identityCodec } from './secret-store.js';
+
+export { createEnvelopeCodec } from './envelope-codec.js';
+
+export { createLocalKms } from './kms.js';
 
 export { scanAndSubstitute, PLATFORM_HOST_ENV_NAME } from './generation-guardrail.js';

@@ -12,6 +12,14 @@
  * Snapshot REGISTRY is control-plane bookkeeping resolved out-of-tree. The
  * SnapshotStore's resume() takes an optional PersistenceStore so the "no
  * Snapshot yet" resume rule (Req 19.6) can read the most recent persisted state.
+ *
+ * DELETION SURFACES (Task 12.3 / Req 24.3, retain-until-deletion): the
+ * PersistenceStore exposes deleteProjectTree(projectId) (rm the exportable tree
+ * + drop any pending write) and the SnapshotStore exposes
+ * deleteSnapshots(projectId) (rm the project's .git repo + the out-of-tree
+ * Snapshot registry). Both are idempotent and return structured summaries; the
+ * RetentionService (src/ops/retention.js) composes them on project/account
+ * deletion.
  */
 
 export { createPersistenceStore, MAX_DEBOUNCE_MS } from './persistence-store.js';

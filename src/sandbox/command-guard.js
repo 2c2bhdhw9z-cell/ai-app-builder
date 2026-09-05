@@ -40,6 +40,7 @@ import { fail } from '../model/validate.js';
 // Compose plumby's PURE classifier through THE plumby boundary. Never import
 // from the plumby package directly here; never reimplement classification.
 import { classifyCommand as defaultClassify } from '../engine/plumby.js';
+import { AUDIT_EVENTS, toAuditSink } from '../auth/audit.js';
 
 /** Default per-stream truncation ceiling: 64 KB measured in BYTES (utf8). */
 export const DEFAULT_TRUNCATE_LIMIT_BYTES = 65536;
@@ -120,6 +121,15 @@ function nextRequestId() {
  * @param {(req:object)=>(Promise<boolean>|boolean)} [args.onConfirmRequest]
  *        the default consent seam (a run-level override takes precedence)
  * @param {number} [args.truncateLimitBytes=65536]
+ * @param {Function|{record:Function}} [args.auditSink]  OPTIONAL audit-sink seam
+ *        (Task 12.6 / Req 25.1 'destructive confirm-class operations'). When
+ *        injected, a confirm-class command's grant/deny decision records an
+ *        AUDIT_EVENTS.CONFIRM_CLASS_OP event. The command string is routed
+ *        through the redactor (when one is supplied) so a Secret embedded in a
+ *        command never lands in the audit record. Optional and back-compatible:
+ *        with no sink, behaviour is exactly as before.
+ * @param {{redact:Function}} [args.redactor]  OPTIONAL centralized redactor
+ *        (src/ops/redaction.js) used to redact the command in the audit event.
  * @returns {object} guard (frozen)
  */
 export function createCommandGuard({
@@ -129,6 +139,8 @@ export function createCommandGuard({
   classifyTimeoutMs = DEFAULT_CLASSIFY_TIMEOUT_MS,
   onConfirmRequest,
   truncateLimitBytes = DEFAULT_TRUNCATE_LIMIT_BYTES,
+  auditSink,
+  redactor,
 } = {}) {
   if (!manager || typeof manager.exec !== 'function') {
     fail('CommandGuard', 'manager with exec(projectId, command, opts) is required');
@@ -136,6 +148,15 @@ export function createCommandGuard({
   if (typeof classify !== 'function') {
     fail('CommandGuard', 'classify must be a function');
   }
+
+  // Optional audit seam for confirm-class decisions. Normalize into a
+  // record(event) fn (no-op when absent). The command string is redacted
+  // through the centralized filter when a redactor is supplied.
+  const emitAudit = toAuditSink(auditSink);
+  const redactCommand =
+    redactor && typeof redactor.redact === 'function'
+      ? (cmd) => redactor.redact(cmd)
+      : (cmd) => cmd;
 
   /**
    * Classify under a fail-closed ceiling. classifyCommand is pure/synchronous
@@ -233,7 +254,7 @@ export function createCommandGuard({
    * @returns {Promise<object>} a frozen structured result
    */
   async function run(projectId, command, opts = {}) {
-    const { signal, subAgent = false, timeoutMs } = opts;
+    const { signal, subAgent = false, timeoutMs, accountId } = opts;
     const seam = opts.onConfirmRequest ?? onConfirmRequest;
     // classifyCommand accepts a string; an argv vector is joined so the pattern
     // rules see the same surface a shell would. Empty command -> allow (pure).
@@ -311,6 +332,20 @@ export function createCommandGuard({
       const requestId = nextRequestId();
       const request = Object.freeze({ requestId, projectId, command, category, reason });
       const consent = await awaitConsent(request, seam);
+
+      // Audit the destructive confirm-class decision (Req 25.1). The command is
+      // routed through the redactor so a Secret embedded in it never lands in
+      // the audit record. Emitted for BOTH grant and deny. No-op when no sink.
+      emitAudit({
+        type: AUDIT_EVENTS.CONFIRM_CLASS_OP,
+        accountId: accountId ?? null,
+        projectId,
+        category,
+        reason,
+        command: redactCommand(commandString),
+        granted: consent.granted === true,
+      });
+
       if (!consent.granted) {
         return Object.freeze({
           outcome: 'confirm',

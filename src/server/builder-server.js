@@ -103,7 +103,7 @@ const ACCESS_DENIED = { error: 'access denied' };
  * @param {object} opts.authService   the AuthService gate (src/auth). Required:
  *        provides tryVerifySession(token) and authorize(account, action,
  *        resource, context) — the single authn + authz choke point.
- * @param {(args: { projectId: string, cwd: string, onEvent: Function, commandGuard?: object, onConfirmRequest: Function }) => { agent: object }} [opts.agentFactory]
+ * @param {(args: { projectId: string, accountId: string, cwd: string, onEvent: Function, commandGuard?: object, onConfirmRequest: Function }) => { agent: object }} [opts.agentFactory]
  *        builds the Builder_Agent for a Project Session. Injectable so tests
  *        drive a scripted agent; the default builds a plumby agent through the
  *        boundary with cwd = the Project tree. `onConfirmRequest` is the session's
@@ -111,6 +111,22 @@ const ACCESS_DENIED = { error: 'access denied' };
  *        command reaches this server's POST /confirm.
  * @param {object} [opts.sandboxManager]  a SandboxManager whose acquire(projectId)
  *        yields the Sandbox handle (mountSource = the Project tree host path).
+ * @param {object} [opts.observability]   an OPTIONAL Observability instance
+ *        (src/ops/observability.js). When present, a platform-level turn failure
+ *        calls observability.reportError(account, op, cause) to mint a
+ *        correlationId + record a redacted operational entry, and the server
+ *        broadcasts a user-facing `error` frame on the Activity_Stream/SSE
+ *        carrying ONLY the correlationId + generic userMessage (never the raw
+ *        cause). Optional and back-compatible: with no observability injected the
+ *        existing turn_done error fallback is unchanged.
+ * @param {object} [opts.quotaManager]    an OPTIONAL QuotaManager (src/ops/quota-manager.js).
+ *        When present, its checkRate/checkQuota gate runs in POST /message AFTER
+ *        gate() (authn+authz) succeeds and BEFORE any allocation (session,
+ *        agent, sandbox acquire), so an over-limit request allocates NOTHING and
+ *        is refused with an HTTP 429 whose body NAMES the exceeded limit. When
+ *        absent, behaviour is unchanged (backward compatible). The gate never
+ *        runs before auth passes, so an unauthenticated over-limit request still
+ *        receives the generic access-denied — no limit disclosure before auth.
  * @param {object} [opts.layout]          a StorageLayout, for exportableProjectTree.
  * @param {object} [opts.commandGuard]    the CommandGuard the agent's commands go
  *        through; the server supplies its onConfirmRequest seam per session.
@@ -129,6 +145,8 @@ export function createBuilderServer(opts = {}) {
     layout,
     commandGuard,
     projectResolver,
+    quotaManager,
+    observability,
     confirmTimeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS,
     now = () => Date.now(),
   } = opts;
@@ -321,7 +339,10 @@ export function createBuilderServer(opts = {}) {
     // Command execution flows through the injected CommandGuard, which the
     // caller wires with this session's onConfirmRequest seam (see the factory
     // call site), so a confirm-class command reaches this server's POST /confirm
-    // rather than the plumby loop's own confirm hook.
+    // rather than the plumby loop's own confirm hook. The session's `accountId`
+    // is also handed to this factory (ignored here) so a guard-wiring factory
+    // can bind it into guard.run(pid, cmd, { accountId }) and make
+    // CONFIRM_CLASS_OP audit entries attributable rather than account-null.
     const agent = createAgent({
       cwd,
       system: buildSystemPrompt({ cwd }),
@@ -478,6 +499,39 @@ export function createBuilderServer(opts = {}) {
     const text = typeof body?.text === 'string' ? body.text.trim() : '';
     if (!text) return sendJson(res, 400, { error: "a non-empty 'text' field is required" });
 
+    // QUOTA / RATE-LIMIT GATE — runs AFTER authn+authz has succeeded and BEFORE
+    // any allocation (no Project Session is created, no Builder_Agent is built,
+    // no Sandbox is acquired below this point). An over-limit request therefore
+    // allocates NOTHING. The gate is skipped entirely when no quotaManager is
+    // injected (backward compatible). Because it sits after gate(), an
+    // unauthenticated request never reaches here — no limit is disclosed before
+    // auth passes. A rejection is a 429 whose body NAMES the exceeded limit.
+    if (quotaManager) {
+      const rate =
+        typeof quotaManager.checkRate === 'function'
+          ? quotaManager.checkRate(result.account, 'generation.turn')
+          : { ok: true };
+      if (rate && rate.ok === false) {
+        return sendJson(res, 429, {
+          error: rate.message ?? 'rate limit exceeded',
+          limit: rate.limit,
+          operation: rate.operation,
+        });
+      }
+
+      const quota =
+        typeof quotaManager.checkQuota === 'function'
+          ? quotaManager.checkQuota(result.account, projectId, 'concurrentSandboxes')
+          : { ok: true };
+      if (quota && quota.ok === false) {
+        return sendJson(res, 429, {
+          error: quota.message ?? 'resource quota exceeded',
+          limit: quota.limit,
+          resource: quota.resource,
+        });
+      }
+    }
+
     const session = sessionFor(result.account.id, projectId);
 
     // ONE in-flight turn per Project Session. A second send while a turn runs is
@@ -493,6 +547,12 @@ export function createBuilderServer(opts = {}) {
       const cwd = projectCwd(projectId);
       const built = buildAgent({
         projectId,
+        // The authenticated accountId for THIS session, threaded so a real
+        // composition can bind it into the CommandGuard's run() opts and make
+        // CONFIRM_CLASS_OP audit entries attributable to a User_Account rather
+        // than account-null (Req 25.1). The default factory ignores it; a
+        // guard-wiring factory passes it as guard.run(pid, cmd, { accountId }).
+        accountId: session.accountId,
         cwd,
         onEvent: session.onEvent,
         commandGuard,
@@ -516,6 +576,22 @@ export function createBuilderServer(opts = {}) {
         await session.agent.send(text, { signal: controller.signal });
         session.broadcast({ type: 'turn_done', ok: true });
       } catch (err) {
+        // Platform-level turn failure (Req 25.3). When an Observability instance
+        // is injected, report the error to mint a correlationId + record a
+        // redacted operational entry, then broadcast a user-facing `error` frame
+        // carrying ONLY the correlationId + generic userMessage (never the raw
+        // cause). The existing turn_done error frame is preserved as the fallback
+        // (and still emitted) so behaviour is unchanged when no observability is
+        // wired — the raw cause on turn_done is the agent's own message, not a
+        // platform secret, and the redacted, correlated detail lives in the log.
+        if (observability && typeof observability.reportError === 'function') {
+          const { correlationId, userMessage } = observability.reportError(
+            { id: session.accountId },
+            'generation.turn',
+            err,
+          );
+          session.broadcast({ type: 'error', correlationId, message: userMessage });
+        }
         session.broadcast({ type: 'turn_done', ok: false, error: err?.message ?? String(err) });
       } finally {
         session.running = null;
