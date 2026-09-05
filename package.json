@@ -1,0 +1,21 @@
+{
+  "name": "ai-app-builder",
+  "version": "0.0.1",
+  "description": "Orchestration and surface platform built on top of the plumby coding agent.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "eval": "node eval/run.js"
+  },
+  "dependencies": {
+    "plumby": "file:../plumby"
+  },
+  "devDependencies": {
+    "fast-check": "^4.9.0"
+  }
+}
