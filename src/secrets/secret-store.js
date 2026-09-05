@@ -36,6 +36,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { requireString, fail } from '../model/validate.js';
+import { AUDIT_EVENTS, toAuditSink } from '../auth/audit.js';
 
 /**
  * A secret NAME must be BOTH a safe single path segment (it becomes a filename
@@ -109,9 +110,15 @@ export const identityCodec = Object.freeze({
  *                                    value simply lands under controlRoot/.../ownerId).
  * @param {object} [args.codec]       { encode(value)->bytes, decode(bytes)->value };
  *                                    defaults to identityCodec (Task 12.4 seam).
+ * @param {Function|{record:Function}} [args.auditSink]  OPTIONAL audit-sink seam
+ *        (Task 12.6 / Req 25.1). When injected, reading a secret VALUE for
+ *        injection (get/envForProject) records an AUDIT_EVENTS.SECRET_ACCESS
+ *        event carrying { accountId(=ownerId), projectId, name } — the NAME
+ *        ONLY, never the value. Optional and back-compatible: with no sink,
+ *        every existing call site and test behaves exactly as before.
  * @returns {object} store (frozen)
  */
-export function createSecretStore({ layout, ownerId = 'default', codec = identityCodec } = {}) {
+export function createSecretStore({ layout, ownerId = 'default', codec = identityCodec, auditSink } = {}) {
   const model = 'SecretStore';
   if (!layout || typeof layout.controlSecretPath !== 'function' || typeof layout.assertOutsideExportTrees !== 'function') {
     fail(model, 'layout with controlSecretPath/assertOutsideExportTrees is required');
@@ -120,6 +127,10 @@ export function createSecretStore({ layout, ownerId = 'default', codec = identit
   if (!codec || typeof codec.encode !== 'function' || typeof codec.decode !== 'function') {
     fail(model, 'codec must expose encode(value)->bytes and decode(bytes)->value');
   }
+
+  // Optional audit seam: normalize into a record(event) fn (no-op when absent).
+  // Never carries a secret VALUE — only accountId + projectId + secret NAME.
+  const emitAudit = toAuditSink(auditSink);
 
   /** Resolve + assert the out-of-tree path for a project's secret. */
   function pathFor(projectId, name) {
@@ -193,7 +204,16 @@ export function createSecretStore({ layout, ownerId = 'default', codec = identit
       if (err && err.code === 'ENOENT') return null;
       throw err;
     }
-    return codec.decode(bytes);
+    const value = codec.decode(bytes);
+    // A secret VALUE is being read for runtime injection — the one moment that
+    // is auditable (Req 25.1 'Secret access'). Record NAME only, never value.
+    emitAudit({
+      type: AUDIT_EVENTS.SECRET_ACCESS,
+      accountId: ownerId,
+      projectId,
+      name,
+    });
+    return value;
   }
 
   /**

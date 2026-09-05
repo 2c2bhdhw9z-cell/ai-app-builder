@@ -16,6 +16,15 @@
  * the User_Account (no silent expiry); it deletes-or-anonymizes every
  * ownerId-keyed category and emits redacted PROJECT_DELETED / ACCOUNT_DELETED
  * audit events.
+ *
+ * The AuditLog (createAuditLog) is the append-only stream of security events; it
+ * is itself a valid audit-sink shape so it drops into the existing toAuditSink
+ * seam used by AuthService / SessionManager / Authorizer / RetentionService, and
+ * routes every entry through the centralized redactor before appending (Req
+ * 24.4 / 25.1). Observability (createObservability) covers operational
+ * metrics/events for the four failure-prone subsystems and the user-facing
+ * reportError(userAccount, op, cause) -> { correlationId, userMessage } surface
+ * (Req 25.2 / 25.3), also routed through the same central redactor.
  */
 
 export {
@@ -35,3 +44,10 @@ export {
   createRetentionService,
   OWNER_KEYED_CATEGORIES,
 } from './retention.js';
+
+export { createAuditLog } from './audit-log.js';
+
+export {
+  createObservability,
+  OPERATIONAL_SUBSYSTEMS,
+} from './observability.js';

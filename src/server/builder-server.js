@@ -111,6 +111,14 @@ const ACCESS_DENIED = { error: 'access denied' };
  *        command reaches this server's POST /confirm.
  * @param {object} [opts.sandboxManager]  a SandboxManager whose acquire(projectId)
  *        yields the Sandbox handle (mountSource = the Project tree host path).
+ * @param {object} [opts.observability]   an OPTIONAL Observability instance
+ *        (src/ops/observability.js). When present, a platform-level turn failure
+ *        calls observability.reportError(account, op, cause) to mint a
+ *        correlationId + record a redacted operational entry, and the server
+ *        broadcasts a user-facing `error` frame on the Activity_Stream/SSE
+ *        carrying ONLY the correlationId + generic userMessage (never the raw
+ *        cause). Optional and back-compatible: with no observability injected the
+ *        existing turn_done error fallback is unchanged.
  * @param {object} [opts.quotaManager]    an OPTIONAL QuotaManager (src/ops/quota-manager.js).
  *        When present, its checkRate/checkQuota gate runs in POST /message AFTER
  *        gate() (authn+authz) succeeds and BEFORE any allocation (session,
@@ -138,6 +146,7 @@ export function createBuilderServer(opts = {}) {
     commandGuard,
     projectResolver,
     quotaManager,
+    observability,
     confirmTimeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS,
     now = () => Date.now(),
   } = opts;
@@ -558,6 +567,22 @@ export function createBuilderServer(opts = {}) {
         await session.agent.send(text, { signal: controller.signal });
         session.broadcast({ type: 'turn_done', ok: true });
       } catch (err) {
+        // Platform-level turn failure (Req 25.3). When an Observability instance
+        // is injected, report the error to mint a correlationId + record a
+        // redacted operational entry, then broadcast a user-facing `error` frame
+        // carrying ONLY the correlationId + generic userMessage (never the raw
+        // cause). The existing turn_done error frame is preserved as the fallback
+        // (and still emitted) so behaviour is unchanged when no observability is
+        // wired — the raw cause on turn_done is the agent's own message, not a
+        // platform secret, and the redacted, correlated detail lives in the log.
+        if (observability && typeof observability.reportError === 'function') {
+          const { correlationId, userMessage } = observability.reportError(
+            { id: session.accountId },
+            'generation.turn',
+            err,
+          );
+          session.broadcast({ type: 'error', correlationId, message: userMessage });
+        }
         session.broadcast({ type: 'turn_done', ok: false, error: err?.message ?? String(err) });
       } finally {
         session.running = null;
