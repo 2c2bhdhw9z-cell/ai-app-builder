@@ -37,7 +37,26 @@
 
 import { requireString, requireArray, fail } from '../model/validate.js';
 import { computeEgressAllowlist, DEFAULT_PACKAGE_REGISTRY_HOSTS } from './egress.js';
-import { WORKSPACE_MOUNT_PATH } from './container-backend.js';
+import { WORKSPACE_MOUNT_PATH, NETWORK_DENY_ALL, NETWORK_FILTERED } from './container-backend.js';
+
+/**
+ * Map an egress allowlist to the network policy the backend must enforce.
+ *
+ *   empty allowlist  -> NETWORK_DENY_ALL ('none'): total egress deny — a real,
+ *                       enforceable, live-tested Docker/Podman mode.
+ *   populated         -> NETWORK_FILTERED ('filtered'): deny-by-default egress
+ *                       limited to the allowed hosts. This is a REQUEST for
+ *                       per-host filtering; a backend that cannot enforce it
+ *                       (a plain CLI backend) FAILS CLOSED at exec time rather
+ *                       than falling back to unfiltered networking.
+ *
+ * We never emit `--network private` (verified fail-open under this Podman: it
+ * launches and grants full egress), so a connector-bearing project can never
+ * silently escape the deny-by-default boundary.
+ */
+function networkPolicyFor(egress) {
+  return egress.allowedHosts.length === 0 ? NETWORK_DENY_ALL : NETWORK_FILTERED;
+}
 
 /**
  * Validate a projectId as a single safe path segment (same rule as the storage
@@ -130,11 +149,11 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
 
     const bindings = resolveBindings(projectId);
     const egress = computeEgressAllowlist({ bindings, packageRegistryHosts });
-    // v1 network policy: deny-by-default with no reachable hosts means total
-    // network deny (`--network none`) — the honest containment we can enforce.
-    // With hosts present, a filtering-network backend applies the allowlist; in
-    // this sandbox we still request the namespace and record the allowlist.
-    const network = egress.allowedHosts.length === 0 ? 'none' : 'private';
+    // Network policy: an empty allowlist maps to total deny ('none' — honestly
+    // enforced + live-tested); a populated allowlist maps to 'filtered', a
+    // per-host filtering REQUEST that a backend without egress-filtering support
+    // fails closed on (see exec) rather than granting unfiltered access.
+    const network = networkPolicyFor(egress);
 
     const name = containerNameFor(projectId);
 
@@ -241,7 +260,7 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
    * @param {object} [opts]
    * @param {number} [opts.timeoutMs]    override the default wall-clock limit
    * @param {AbortSignal} [opts.signal]
-   * @returns {Promise<{ stdout:string, stderr:string, exitCode:number|null, denied:boolean, timedOut:boolean, signal:string|null, projectId:string, network:string, workspacePath:string, mountSource:string, limitsApplied:boolean|null }>}
+   * @returns {Promise<{ stdout:string, stderr:string, exitCode:number|null, denied:boolean, deniedReason:('launch-failure'|'timeout'|null), timedOut:boolean, signal:string|null, projectId:string, network:string, workspacePath:string, mountSource:string, limitsApplied:boolean|null }>}
    */
   async function exec(projectId, command, opts = {}) {
     requireSafeProjectId(projectId);
@@ -268,13 +287,21 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
         signal: opts.signal,
       });
     } catch (err) {
-      // The boundary actively refused to run the command (could not launch the
-      // isolated invocation). Report denied; no work escaped the box.
+      // The boundary actively refused to run the command: the isolated
+      // invocation could not even LAUNCH. Two things reach here:
+      //   - a genuine runtime failure to start the container, and
+      //   - a fail-closed egress refusal (a populated allowlist on a backend
+      //     that cannot enforce per-host filtering — see networkPolicyFor).
+      // Either way NO work escaped the box. We report denied with exitCode:null
+      // and a distinct deniedReason='launch-failure' so Task 6's CommandGuard
+      // can tell a boundary that FAILED TO LAUNCH apart from a command that ran
+      // and exited non-zero inside the box (denied:false, exitCode:number).
       return Object.freeze({
         stdout: '',
         stderr: String(err?.message ?? err),
         exitCode: null,
         denied: true,
+        deniedReason: 'launch-failure',
         timedOut: false,
         signal: null,
         projectId,
@@ -290,18 +317,27 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
       record.limitsApplied = result.limitsApplied;
     }
 
-    // `denied` marks a boundary-level refusal: the run could not launch at all,
-    // or the wall-clock limit fired (the boundary killed + reaped it). A normal
-    // non-zero exit from the command itself is NOT a denial — that is the
-    // command's own result, faithfully reported from inside the box.
-    const denied = result.timedOut === true;
+    // THE `denied` CONTRACT (consumed by Task 6's CommandGuard):
+    //   denied:true,  exitCode:null,   deniedReason:'launch-failure' — the
+    //     boundary could not launch the isolated invocation (see catch above).
+    //   denied:true,  exitCode:null,   deniedReason:'timeout'        — the
+    //     wall-clock reaper fired; the boundary killed + reaped the run.
+    //   denied:false, exitCode:<number>, deniedReason:null           — the
+    //     command RAN inside the box and produced this exit code. A non-zero
+    //     exit here is the COMMAND's own failure, NOT a boundary refusal, and
+    //     must never be mistaken for one.
+    // The single `denied` boolean + nullable `exitCode` + `deniedReason` are the
+    // only signals distinguishing "boundary refused" from "command failed".
+    const timedOut = result.timedOut === true;
+    const denied = timedOut;
 
     return Object.freeze({
       stdout: result.stdout ?? '',
       stderr: result.stderr ?? '',
       exitCode: typeof result.code === 'number' ? result.code : null,
       denied,
-      timedOut: result.timedOut === true,
+      deniedReason: denied ? 'timeout' : null,
+      timedOut,
       signal: result.signal ?? null,
       projectId,
       network: record.network,
@@ -369,7 +405,7 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
     const use = Array.isArray(bindings) ? bindings : resolveBindings(projectId);
     const egress = computeEgressAllowlist({ bindings: use, packageRegistryHosts });
     entry.record.egress = egress;
-    entry.record.network = egress.allowedHosts.length === 0 ? 'none' : 'private';
+    entry.record.network = networkPolicyFor(egress);
     // Rebuild the frozen handle so the exposed allowlist reflects the change.
     const prev = entry.handle;
     entry.handle = Object.freeze({

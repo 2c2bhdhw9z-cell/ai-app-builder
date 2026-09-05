@@ -43,6 +43,45 @@ import { execFile } from 'node:child_process';
 /** The fixed in-container path a project's tree is always mounted at. */
 export const WORKSPACE_MOUNT_PATH = '/workspace';
 
+/**
+ * Network policy sentinels the manager hands the backend.
+ *
+ *   NETWORK_DENY_ALL   ('none')     — total egress deny. A REAL Docker/Podman
+ *                                      mode; genuinely enforced + live-tested.
+ *   NETWORK_FILTERED   ('filtered') — deny-by-default egress LIMITED to an
+ *                                      allowlist of hosts. This requires a
+ *                                      backend that can install per-host
+ *                                      firewall rules. A plain docker/OCI CLI
+ *                                      backend CANNOT do this, so it must
+ *                                      FAIL CLOSED (see runOneShot) rather than
+ *                                      silently attach unfiltered networking.
+ *
+ * We deliberately do NOT use '--network private': it is NOT a filtering mode.
+ * Verified empirically under this rootful Podman 5.2.3, `docker run --network
+ * private` launches successfully (exit 0) and the container gets FULL default
+ * egress (fetched http://example.com through it) — i.e. it FAILS OPEN, quietly
+ * violating deny-by-default for exactly the projects that have connectors. So a
+ * populated allowlist is mapped to NETWORK_FILTERED, which this CLI backend does
+ * not support and therefore refuses honestly instead of faking enforcement.
+ */
+export const NETWORK_DENY_ALL = 'none';
+export const NETWORK_FILTERED = 'filtered';
+
+/**
+ * The set of network modes a plain docker/OCI CLI backend can HONESTLY enforce.
+ * 'none' (total deny) is enforceable and live-tested. Per-host egress filtering
+ * ('filtered') is NOT — a future CNI/firewall-capable backend can add it and
+ * advertise support via `supportsEgressFiltering`.
+ */
+const CLI_ENFORCEABLE_NETWORKS = Object.freeze(['none']);
+
+/** Message used when a populated egress allowlist cannot be enforced. */
+export const EGRESS_FILTERING_UNSUPPORTED =
+  'egress filtering not supported by this backend: a populated egress allowlist ' +
+  'requires per-host firewall rules this container backend cannot install, so the ' +
+  'command is DENIED rather than run with unfiltered network access (fail-closed). ' +
+  "Only an empty allowlist ('--network none', total deny) is enforceable here.";
+
 /** Default container image (matches plumby's Dockerfile base — Node 22). */
 export const DEFAULT_IMAGE = 'node:22-slim';
 
@@ -257,6 +296,16 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
     timeoutMs,
     signal,
   }) {
+    // FAIL CLOSED for any network mode this backend cannot honestly enforce.
+    // A populated egress allowlist arrives as NETWORK_FILTERED; a plain CLI
+    // backend cannot install per-host firewall rules, so it must NOT launch a
+    // container with unfiltered networking (that would fail open and break the
+    // deny-by-default promise). We refuse the launch with an explicit reason —
+    // never emit an unusable/ambiguous `--network <sentinel>` flag to docker.
+    if (!CLI_ENFORCEABLE_NETWORKS.includes(network)) {
+      throw new Error(EGRESS_FILTERING_UNSUPPORTED);
+    }
+
     const cgroupFlags = cgroupFlagsFor(limits);
     const requestedLimits = cgroupFlags.length > 0;
 
@@ -348,6 +397,10 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
     runOneShot,
     remove,
     reapOrphans,
+    // Capability flag: a plain docker/OCI CLI backend can enforce total-deny
+    // ('none') but NOT per-host egress filtering. A future CNI/firewall-capable
+    // or gVisor/Firecracker backend sets this true and enforces NETWORK_FILTERED.
+    supportsEgressFiltering: false,
     // Exposed for tests / introspection.
     buildRunArgs,
     cgroupFlagsFor,

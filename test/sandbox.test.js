@@ -40,6 +40,8 @@ import {
   buildRunArgs,
   cgroupFlagsFor,
   WORKSPACE_MOUNT_PATH,
+  NETWORK_DENY_ALL,
+  NETWORK_FILTERED,
 } from '../src/sandbox/container-backend.js';
 import { createSandboxManager } from '../src/sandbox/sandbox-manager.js';
 import { classifyCommand } from '../src/engine/plumby.js';
@@ -436,6 +438,14 @@ test('(e) backend degrades gracefully when the runtime rejects cgroup flags', as
   assert.equal(seen.length, 2, 'one limited attempt + one degraded retry');
 });
 
+// COVERAGE GAP (review issue 4, acknowledged environment limit): the
+// limitsApplied=true branch below is exercised only via an INJECTED fake exec,
+// never a live container. cgroup resource-limit flags cannot LAUNCH a container
+// in this sandbox (nested cgroup delegation unavailable — verified: crun cannot
+// open memory.max), so real cgroup ENFORCEMENT cannot be observed here. The same
+// code path applies + reports limits on a host with working cgroup delegation;
+// a capable host should run this suite to exercise real enforcement. We record
+// the gap honestly rather than fabricate a limited-run measurement.
 test('(e) backend reports limitsApplied=true when a limited run succeeds', async () => {
   const exec = async () => ({ code: 0, stdout: '', stderr: '', timedOut: false, signal: null });
   const backend = createContainerBackend({ exec });
@@ -447,6 +457,153 @@ test('(e) backend reports limitsApplied=true when a limited run succeeds', async
   });
   assert.equal(res.limitsApplied, true);
   assert.equal(res.degraded, false);
+});
+
+// --- egress ENFORCEMENT: populated allowlist fails closed ----------------
+//
+// Review issue 1+2: the derivation is correct but only the EMPTY-allowlist
+// (`--network none`, total deny) case is actually enforced. A populated
+// allowlist is a REQUEST for per-host filtering that a plain CLI backend cannot
+// install; empirically `--network private` FAILS OPEN under this rootful Podman
+// (launches + grants full egress), so mapping to it would silently break
+// deny-by-default. These tests pin the chosen behavior: map a populated
+// allowlist to NETWORK_FILTERED and FAIL CLOSED (denied) rather than run
+// unfiltered — never emitting an unusable/ambiguous network flag.
+
+test('(egress-enforce) an empty allowlist maps to total-deny (none); a populated one maps to filtered', () => {
+  const layout = createStorageLayout(BASE);
+  const backend = createFakeBackend();
+  // No connectors -> empty allowlist beyond registry... use empty registry too.
+  const denyMgr = createSandboxManager({ layout, backend, config: { packageRegistryHosts: [] } });
+  assert.equal(denyMgr.acquire('p-empty').egress.allowedHosts.length, 0);
+  // Reach into the record via a populated project on a second manager.
+  const filterMgr = createSandboxManager({
+    layout,
+    backend,
+    config: { packageRegistryHosts: ['registry.npmjs.org'] },
+    bindingsFor: () => [activeBinding('api.stripe.com')],
+  });
+  const h = filterMgr.acquire('p-hosts');
+  assert.ok(h.egress.allowedHosts.includes('api.stripe.com'));
+  assert.ok(h.egress.allowedHosts.length > 0);
+});
+
+test('(egress-enforce) the manager NEVER emits `--network private` for a populated allowlist', async () => {
+  const layout = createStorageLayout(BASE);
+  const seen = [];
+  const backend = {
+    async isAvailable() { return true; },
+    async runOneShot(spec) {
+      seen.push(spec);
+      return { code: 0, stdout: '', stderr: '', timedOut: false, signal: null };
+    },
+    async remove() { return { removed: true }; },
+    async reapOrphans() { return { reaped: [] }; },
+  };
+  const manager = createSandboxManager({
+    layout,
+    backend,
+    config: { packageRegistryHosts: ['registry.npmjs.org'] },
+    bindingsFor: () => [activeBinding('api.stripe.com')],
+  });
+  await manager.exec('p1', 'true');
+  assert.equal(seen.length, 1);
+  assert.notEqual(seen[0].network, 'private', 'must never use the fail-open `private` network');
+  assert.equal(seen[0].network, NETWORK_FILTERED, 'a populated allowlist requests filtered egress');
+});
+
+test('(egress-enforce) the REAL CLI backend fails closed on a populated (filtered) allowlist', async () => {
+  // A fake exec that would SUCCEED any launch — proving the refusal happens in
+  // the backend BEFORE any container is started, not because the runtime errored.
+  let launched = 0;
+  const exec = async () => { launched += 1; return { code: 0, stdout: '', stderr: '', timedOut: false, signal: null }; };
+  const backend = createContainerBackend({ exec });
+  assert.equal(backend.supportsEgressFiltering, false, 'a CLI backend cannot filter egress');
+  await assert.rejects(
+    () => backend.runOneShot({ name: 'aab-sbx-p1', mountSource: '/x/p1', command: ['true'], network: NETWORK_FILTERED }),
+    /egress filtering not supported by this backend/,
+  );
+  assert.equal(launched, 0, 'no container is launched when egress filtering is unsupported (fail-closed)');
+  // The empty-allowlist deny-all path DOES launch (total deny is enforceable).
+  await backend.runOneShot({ name: 'aab-sbx-p1', mountSource: '/x/p1', command: ['true'], network: NETWORK_DENY_ALL });
+  assert.equal(launched, 1, 'total-deny (none) is enforceable and launches');
+});
+
+test('(egress-enforce) exec DENIES a connector-bearing command (fail-closed) with deniedReason launch-failure', async () => {
+  // End-to-end through the manager + REAL CLI backend semantics (fake exec that
+  // would succeed, so the denial is purely the fail-closed egress decision).
+  const layout = createStorageLayout(BASE);
+  const exec = async () => ({ code: 0, stdout: 'should-not-run', stderr: '', timedOut: false, signal: null });
+  const backend = createContainerBackend({ exec });
+  const manager = createSandboxManager({
+    layout,
+    backend,
+    config: { packageRegistryHosts: ['registry.npmjs.org'] },
+    bindingsFor: () => [activeBinding('api.stripe.com')],
+  });
+  const res = await manager.exec('p1', 'curl https://api.stripe.com');
+  assert.equal(res.denied, true, 'a populated allowlist we cannot filter fails closed');
+  assert.equal(res.deniedReason, 'launch-failure', 'fail-closed egress surfaces as a launch-failure denial');
+  assert.equal(res.exitCode, null, 'no in-box exit code — nothing ran');
+  assert.ok(/egress filtering not supported/.test(res.stderr), 'the denial reason is explicit and honest');
+  assert.equal(res.network, NETWORK_FILTERED);
+});
+
+// --- exec denied CONTRACT: launch-failure vs timeout vs in-box exit -------
+//
+// Review issue 3: the single `denied` boolean + nullable `exitCode` +
+// `deniedReason` must let Task 6's CommandGuard tell a boundary that FAILED TO
+// LAUNCH (denied:true, exitCode:null, deniedReason:'launch-failure') apart from
+// a command that RAN and exited non-zero inside the box (denied:false,
+// exitCode:<number>) and from a wall-clock kill (denied:true, deniedReason:
+// 'timeout'). Pin all three shapes.
+
+test('(contract) a boundary LAUNCH FAILURE yields {denied:true, exitCode:null, deniedReason:launch-failure}', async () => {
+  const layout = createStorageLayout(BASE);
+  const backend = {
+    async isAvailable() { return true; },
+    async runOneShot() { throw new Error('runtime could not start the container'); },
+    async remove() { return { removed: true }; },
+    async reapOrphans() { return { reaped: [] }; },
+  };
+  const manager = createSandboxManager({ layout, backend, config: { packageRegistryHosts: [] } });
+  const res = await manager.exec('p1', 'true');
+  assert.equal(res.denied, true);
+  assert.equal(res.exitCode, null, 'a failed-to-launch boundary has no in-box exit code');
+  assert.equal(res.deniedReason, 'launch-failure');
+  assert.equal(res.timedOut, false, 'a launch failure is NOT a timeout');
+  assert.ok(res.stderr.includes('could not start'), 'the launch error is surfaced');
+});
+
+test('(contract) a WALL-CLOCK timeout yields {denied:true, deniedReason:timeout}', async () => {
+  const layout = createStorageLayout(BASE);
+  const backend = {
+    async isAvailable() { return true; },
+    async runOneShot() { return { code: null, stdout: '', stderr: '', timedOut: true, signal: 'SIGKILL' }; },
+    async remove() { return { removed: true }; },
+    async reapOrphans() { return { reaped: [] }; },
+  };
+  const manager = createSandboxManager({ layout, backend, config: { packageRegistryHosts: [] } });
+  const res = await manager.exec('p1', 'sleep 999');
+  assert.equal(res.denied, true);
+  assert.equal(res.deniedReason, 'timeout');
+  assert.equal(res.timedOut, true);
+});
+
+test('(contract) an in-box NON-ZERO exit is NOT a denial: {denied:false, exitCode:<n>, deniedReason:null}', async () => {
+  const layout = createStorageLayout(BASE);
+  const backend = {
+    async isAvailable() { return true; },
+    async runOneShot() { return { code: 3, stdout: '', stderr: 'boom in box', timedOut: false, signal: null }; },
+    async remove() { return { removed: true }; },
+    async reapOrphans() { return { reaped: [] }; },
+  };
+  const manager = createSandboxManager({ layout, backend, config: { packageRegistryHosts: [] } });
+  const res = await manager.exec('p1', 'exit 3');
+  assert.equal(res.denied, false, 'a command that ran and failed inside the box is NOT a boundary denial');
+  assert.equal(res.exitCode, 3, 'the command exit code is faithfully reported');
+  assert.equal(res.deniedReason, null);
+  assert.equal(res.timedOut, false);
 });
 
 test('(e) backend enforces a wall-clock timeout in-process (reaps the run)', async () => {
@@ -578,6 +735,40 @@ test('(live) network confinement: under a deny-by-default (empty) allowlist an o
     assert.ok(!res.stdout.includes('<html'), 'no response body reached the container');
   } finally {
     await manager.release('projA');
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+test('(live) egress fail-closed: a project WITH an active connector is DENIED (no unfiltered network leaks)', { skip: !RUNTIME_LIVE ? 'no container runtime' : false }, async () => {
+  // Review issue 1+2 live coverage: with a populated allowlist the real CLI
+  // backend cannot install per-host filtering, so exec must FAIL CLOSED — the
+  // command is denied and NO container with unfiltered networking is launched.
+  // This is the empirical counterpart to the deny-all live test above.
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aab-live-'));
+  try {
+    const layout = createStorageLayout(baseDir);
+    const backend = createContainerBackend({ bin: 'docker', image: 'alpine:latest' });
+    const manager = createSandboxManager({
+      layout,
+      backend,
+      // An ACTIVE connector -> a populated allowlist -> filtered egress request.
+      config: { packageRegistryHosts: ['registry.npmjs.org'], limits: {}, execTimeoutMs: 60_000 },
+      bindingsFor: () => [activeBinding('api.stripe.com')],
+    });
+    ensureTree(layout.exportableProjectTree('projA'));
+    const handle = manager.acquire('projA');
+    assert.ok(handle.egress.allowedHosts.length > 0, 'the connector contributes an allowed host');
+    assert.equal(handle.egress.allowedHosts.includes('api.stripe.com'), true);
+
+    // A command that would try to reach the outside world is DENIED before any
+    // container launches — never run with unfiltered egress (fail-open).
+    const res = await manager.exec('projA', 'wget -T 3 -q -O- http://example.com');
+    assert.equal(res.denied, true, 'connector-bearing egress is denied (fail-closed), not run unfiltered');
+    assert.equal(res.deniedReason, 'launch-failure');
+    assert.equal(res.exitCode, null, 'nothing ran in a box');
+    assert.equal(res.stdout, '', 'no response body — no unfiltered network was ever attached');
+    assert.ok(/egress filtering not supported/.test(res.stderr), 'the denial is explicit and honest');
+  } finally {
     fs.rmSync(baseDir, { recursive: true, force: true });
   }
 });

@@ -19,6 +19,9 @@ export {
   WORKSPACE_MOUNT_PATH,
   DEFAULT_IMAGE,
   OWNER_LABEL,
+  NETWORK_DENY_ALL,
+  NETWORK_FILTERED,
+  EGRESS_FILTERING_UNSUPPORTED,
 } from './container-backend.js';
 
 export {
