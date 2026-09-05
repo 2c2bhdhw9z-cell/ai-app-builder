@@ -518,6 +518,34 @@ export function createSnapshotStore({
     return commitSnapshot(projectId, projectTree, { trigger: 'explicit' });
   }
 
+  /**
+   * deleteSnapshots(projectId): irreversibly remove a Project's Snapshots (Task
+   * 12.3 / Req 24.3, retain-until-deletion). This drops BOTH halves of the
+   * storage split:
+   *   - the out-of-tree Snapshot REGISTRY (controlSnapshotRegistryPath), and
+   *   - the project's Git REPOSITORY (the .git dir at the exportable tree root
+   *     that holds every committed Snapshot).
+   * The exportable working-tree FILES themselves are the PersistenceStore's
+   * surface (deleteProjectTree); this store owns the .git repo + registry, so it
+   * removes exactly those. Idempotent: deleting snapshots for a project with
+   * none is success. Returns a structured summary.
+   */
+  function deleteSnapshots(projectId) {
+    requireString(model, 'projectId', projectId);
+
+    // 1) Remove the out-of-tree registry (proven outside every export tree).
+    const registryPath = registryPathFor(projectId);
+    const registryExisted = fs.existsSync(registryPath);
+    fs.rmSync(registryPath, { recursive: true, force: true });
+
+    // 2) Remove the project's Git repository (the .git dir at the tree root).
+    const gitDir = path.join(treeRootFor(projectId), '.git');
+    const repoExisted = fs.existsSync(gitDir);
+    fs.rmSync(gitDir, { recursive: true, force: true });
+
+    return { ok: true, projectId, registryRemoved: registryExisted, repoRemoved: repoExisted };
+  }
+
   return Object.freeze({
     ownerId,
     commitSnapshot,
@@ -527,5 +555,6 @@ export function createSnapshotStore({
     listSnapshots,
     latestSnapshot,
     onTurnComplete,
+    deleteSnapshots,
   });
 }

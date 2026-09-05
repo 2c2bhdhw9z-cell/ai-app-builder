@@ -27,6 +27,19 @@ Keeping these separate is deliberate: it is the anti-lock-in principle applied t
 project's own structure. plumby stays its own thing; this platform depends on it rather
 than absorbing it.
 
+## Data retention
+
+Retain-until-deletion (Req 24.5): a Project's persisted file state and its Snapshots are
+retained for as long as the Project exists. There is **no** silent expiry, TTL, or
+background reaper. Durable state is removed only when the user explicitly deletes the
+Project, or deletes their account (which cascades to every owned Project). The
+`RetentionService` (`src/ops/retention.js`) is the single choke point for those explicit
+deletions: `deleteProject` releases the Sandbox and deletes the project's files,
+Snapshots, and secrets; `deleteAccount` deletes-or-anonymizes every `ownerId`-keyed
+category (Projects, Skills, Project/Global memory, Connectors, Secrets). Secret values
+are stored encrypted at rest via envelope encryption (`src/secrets/envelope-codec.js`
+over the KMS seam in `src/secrets/kms.js`).
+
 ## Spec
 
 The full specification lives under `.kiro/specs/ai-app-builder/`:
