@@ -179,13 +179,136 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
   }
 
   /**
-   * exec() — implemented in FEAT-002 (classifier-independent containment). The
-   * method exists now to fix the stable acquire/exec/release interface.
+   * Normalize a caller-supplied command into a container command VECTOR.
+   *
+   * We deliberately do NOT let the host shell touch the string: a string
+   * command is handed to the CONTAINER's own shell (`sh -c <string>`) so it is
+   * interpreted INSIDE the boundary, never on the host. An array is passed
+   * through as an argv vector (exec form). Either way the command only ever runs
+   * inside the container — there is no host-side shell interpolation and thus no
+   * host command-injection surface.
+   *
+   * @param {string|string[]} command
+   * @returns {string[]} a container command vector
    */
-  async function exec(projectId, command) {
+  function toContainerCommand(command) {
+    if (Array.isArray(command)) {
+      const vec = requireArray('SandboxManager', 'command', command);
+      for (const [i, part] of vec.entries()) {
+        requireString('SandboxManager', `command[${i}]`, part);
+      }
+      return [...vec];
+    }
+    // A command must be a string OR an argv array; an EMPTY string is allowed
+    // (it is still run inside the box — a no-op there — and must stay confined),
+    // so we do not use requireString here (which rejects empty).
+    if (typeof command !== 'string') {
+      fail('SandboxManager', 'command must be a string or an array of strings');
+    }
+    // Interpret the string with the container's shell, inside the boundary.
+    return ['sh', '-c', command];
+  }
+
+  /**
+   * exec(projectId, command) — run a command INSIDE the project's
+   * Isolation_Boundary (spec subtasks 5.2/5.4, Req 8.2–8.6, Property 1).
+   *
+   * THE CONTRACT this method upholds:
+   *   - EVERY command runs inside that project's container: a one-shot
+   *     `docker run --rm` with (a) the container's own root filesystem, (b) ONLY
+   *     this project's tree bind-mounted at the fixed workspace path, (c) a
+   *     private PID namespace, (d) a private network namespace whose egress is
+   *     governed by the deny-by-default allowlist, and (e) an in-process
+   *     wall-clock timeout that kills + reaps the run.
+   *   - It NEVER consults plumby's classifier. There is no branch on
+   *     allow/confirm/refuse here — the boundary is NOT the gate. An `allow`
+   *     command and a `refuse` command are confined byte-for-byte identically;
+   *     containment is a property of the container, not of the verdict.
+   *   - A command that tries to reach another project's tree, the host, or a
+   *     denied network endpoint simply CANNOT: those paths/processes/hosts are
+   *     not present in the container, so the attempt fails inside the box and
+   *     the out-of-box target state is preserved unchanged. When the boundary
+   *     actively refuses (e.g. the run cannot even launch, or the wall-clock
+   *     limit fires), `denied` is set on the structured result.
+   *
+   * exec auto-acquires the boundary if the project was not explicitly acquired,
+   * so it is safe to call standalone; callers that manage the lifecycle should
+   * still release() in a finally.
+   *
+   * @param {string} projectId
+   * @param {string|string[]} command   a shell string (run by the CONTAINER's
+   *                                     shell) or an argv vector
+   * @param {object} [opts]
+   * @param {number} [opts.timeoutMs]    override the default wall-clock limit
+   * @param {AbortSignal} [opts.signal]
+   * @returns {Promise<{ stdout:string, stderr:string, exitCode:number|null, denied:boolean, timedOut:boolean, signal:string|null, projectId:string, network:string, workspacePath:string, mountSource:string, limitsApplied:boolean|null }>}
+   */
+  async function exec(projectId, command, opts = {}) {
     requireSafeProjectId(projectId);
-    void command;
-    throw new Error('SandboxManager.exec is implemented in FEAT-002');
+    // Ensure the boundary exists (idempotent). exec never inspects the command's
+    // classification — it only builds an isolated invocation for it.
+    const handle = acquire(projectId);
+    const entry = sandboxes.get(projectId);
+    const record = entry.record;
+
+    const containerCommand = toContainerCommand(command);
+    const timeoutMs =
+      typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0 ? opts.timeoutMs : defaultExecTimeoutMs;
+
+    let result;
+    try {
+      result = await backend.runOneShot({
+        name: record.name,
+        mountSource: record.mountSource,
+        command: containerCommand,
+        limits: record.limits,
+        network: record.network,
+        readOnlyMount: record.readOnlyMount,
+        timeoutMs,
+        signal: opts.signal,
+      });
+    } catch (err) {
+      // The boundary actively refused to run the command (could not launch the
+      // isolated invocation). Report denied; no work escaped the box.
+      return Object.freeze({
+        stdout: '',
+        stderr: String(err?.message ?? err),
+        exitCode: null,
+        denied: true,
+        timedOut: false,
+        signal: null,
+        projectId,
+        network: record.network,
+        workspacePath: handle.workspacePath,
+        mountSource: record.mountSource,
+        limitsApplied: record.limitsApplied,
+      });
+    }
+
+    // Record whether cgroup limits actually took effect (only known post-run).
+    if (typeof result.limitsApplied === 'boolean') {
+      record.limitsApplied = result.limitsApplied;
+    }
+
+    // `denied` marks a boundary-level refusal: the run could not launch at all,
+    // or the wall-clock limit fired (the boundary killed + reaped it). A normal
+    // non-zero exit from the command itself is NOT a denial — that is the
+    // command's own result, faithfully reported from inside the box.
+    const denied = result.timedOut === true;
+
+    return Object.freeze({
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? '',
+      exitCode: typeof result.code === 'number' ? result.code : null,
+      denied,
+      timedOut: result.timedOut === true,
+      signal: result.signal ?? null,
+      projectId,
+      network: record.network,
+      workspacePath: handle.workspacePath,
+      mountSource: record.mountSource,
+      limitsApplied: record.limitsApplied,
+    });
   }
 
   /**

@@ -13,6 +13,7 @@ export { createSandboxManager } from './sandbox-manager.js';
 
 export {
   createContainerBackend,
+  containerRuntimeAvailable,
   buildRunArgs,
   cgroupFlagsFor,
   WORKSPACE_MOUNT_PATH,

@@ -177,6 +177,39 @@ export function buildRunArgs(spec) {
 }
 
 /**
+ * Standalone capability probe: can a real container be LAUNCHED in the current
+ * environment? (subtask 5.2). Tests gate live-container assertions behind this
+ * so the suite stays green everywhere: where a runtime can actually run a
+ * throwaway container it returns true (as in this sandbox), and where it cannot
+ * (no runtime, no permission, CI without a daemon) it returns false and the
+ * live assertions are skipped cleanly via t.skip.
+ *
+ * This is stronger than a mere `version` check: it performs a one-shot
+ * `docker run --rm <image> true` so a present-but-unusable runtime is reported
+ * as unavailable. Never throws — a failure to launch is simply `false`.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.bin]      runtime binary (default 'docker')
+ * @param {string} [opts.image]    tiny image to smoke-launch (default 'alpine:latest')
+ * @param {number} [opts.timeoutMs]
+ * @param {Function} [opts.exec]   injectable CLI runner (tests)
+ * @returns {Promise<boolean>}
+ */
+export async function containerRuntimeAvailable({
+  bin = 'docker',
+  image = 'alpine:latest',
+  timeoutMs = 60_000,
+  exec = runCli,
+} = {}) {
+  try {
+    const res = await exec(bin, ['run', '--rm', image, 'true'], { timeoutMs });
+    return res.code === 0 && res.timedOut !== true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Create a container backend bound to a runtime CLI binary.
  *
  * @param {object} [opts]
@@ -298,10 +331,20 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
     return { reaped };
   }
 
+  /**
+   * Instance-scoped runtime probe: can this backend actually LAUNCH a
+   * container? Delegates to the module-level containerRuntimeAvailable() using
+   * this backend's bin/exec, so tests that inject a fake `exec` can drive it.
+   */
+  async function canLaunch({ image: probeImage = 'alpine:latest', timeoutMs = 60_000 } = {}) {
+    return containerRuntimeAvailable({ bin, image: probeImage, timeoutMs, exec });
+  }
+
   return Object.freeze({
     bin,
     image,
     isAvailable,
+    canLaunch,
     runOneShot,
     remove,
     reapOrphans,

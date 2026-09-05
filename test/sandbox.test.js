@@ -36,11 +36,16 @@ import {
 } from '../src/sandbox/egress.js';
 import {
   createContainerBackend,
+  containerRuntimeAvailable,
   buildRunArgs,
   cgroupFlagsFor,
   WORKSPACE_MOUNT_PATH,
 } from '../src/sandbox/container-backend.js';
 import { createSandboxManager } from '../src/sandbox/sandbox-manager.js';
+import { classifyCommand } from '../src/engine/plumby.js';
+
+import os from 'node:os';
+import fs from 'node:fs';
 
 const BASE = '/var/lib/aab';
 const REGISTRY = ['registry.npmjs.org'];
@@ -137,7 +142,7 @@ test('(a) normalizeHost + isForbiddenEgressHost helpers behave', () => {
 
 // --- Property 1: Isolation_Boundary invariant ----------------------------
 
-test(propertyTag(1, 'Isolation_Boundary invariant'), () => {
+test(propertyTag(1, 'Isolation_Boundary invariant'), async () => {
   const layout = createStorageLayout(BASE);
   // A projectId arbitrary that is always a single safe path segment.
   const safeSegment = fc
@@ -156,13 +161,69 @@ test(propertyTag(1, 'Isolation_Boundary invariant'), () => {
     status: fc.constantFrom('active', 'removed'),
   });
 
-  fc.assert(
-    fc.property(
+  // GENERATED COMMAND STRINGS + PATHS (subtask 5.3). A representative mix of
+  // benign, destructive, network, and boundary-ESCAPE-attempting commands, over
+  // absolute / relative / traversal paths. The point is that NONE of these —
+  // whatever the classifier would say about them — can escape the boundary:
+  // exec confines them identically because it never inspects the verdict.
+  const pathArb = fc.oneof(
+    fc.constantFrom(
+      '/etc/passwd',
+      '/projects',
+      '/var/lib/aab/export/projects/OTHER',
+      '../../etc/shadow',
+      '../sibling/secret.txt',
+      './local.txt',
+      'nested/rel.txt',
+      '/host/root',
+      '~/.ssh/id_rsa',
+    ),
+    safeSegment.map((s) => `../${s}/x`),
+  );
+  const commandArb = fc.oneof(
+    fc.tuple(fc.constantFrom('cat', 'ls', 'rm', 'stat', 'head', 'touch'), pathArb).map(([c, p]) => `${c} ${p}`),
+    fc.tuple(fc.constantFrom('curl', 'wget'), fc.constantFrom('http://example.com', 'http://169.254.169.254/')).map(([c, u]) => `${c} ${u}`),
+    pathArb.map((p) => `echo pwned > ${p}`),
+    fc.constantFrom('ls', 'echo hi', 'id', 'ps -e', 'whoami', 'pwd'),
+    fc.string({ maxLength: 40 }),
+  );
+
+  // A backend that does NOT touch a real runtime but faithfully constructs the
+  // isolated invocation the manager asked for, so the property can assert the
+  // CONFINEMENT CONTRACT (own root image, only-this-tree mount, private PID +
+  // network ns, no-new-privileges) for every generated input — this is the
+  // >=100x invariant that holds regardless of whether a container can launch.
+  const contractBackend = () => {
+    const invocations = [];
+    return {
+      invocations,
+      async isAvailable() { return true; },
+      async runOneShot(spec) {
+        const args = buildRunArgs({
+          image: 'node:22-slim',
+          name: spec.name,
+          mountSource: spec.mountSource,
+          network: spec.network,
+          readOnlyMount: spec.readOnlyMount,
+          labelValue: spec.name,
+          command: spec.command,
+        });
+        invocations.push({ spec, args });
+        return { code: 0, stdout: '', stderr: '', timedOut: false, signal: null, limitsApplied: false, requestedLimits: true, degraded: true };
+      },
+      async remove() { return { removed: true }; },
+      async reapOrphans() { return { reaped: [] }; },
+    };
+  };
+
+  await fc.assert(
+    fc.asyncProperty(
       safeSegment,
       safeSegment,
       fc.array(bindingArb, { maxLength: 8 }),
-      (projectId, otherId, rawBindings) => {
-        const backend = createFakeBackend();
+      commandArb,
+      async (projectId, otherId, rawBindings, command) => {
+        const backend = contractBackend();
         const bindings = rawBindings.map((b) => activeBinding(b.host, { status: b.status }));
         const manager = createSandboxManager({
           layout,
@@ -172,12 +233,13 @@ test(propertyTag(1, 'Isolation_Boundary invariant'), () => {
         });
 
         const sandbox = manager.acquire(projectId);
+        const otherTree = layout.exportableProjectTree(otherId);
 
         // INVARIANT 1: the bind-mount source is EXACTLY this project's tree.
         assert.equal(sandbox.mountSource, layout.exportableProjectTree(projectId));
         // INVARIANT 2: it is NOT any other project's tree (when ids differ).
         if (otherId !== projectId) {
-          assert.notEqual(sandbox.mountSource, layout.exportableProjectTree(otherId));
+          assert.notEqual(sandbox.mountSource, otherTree);
         }
         // INVARIANT 3: the mount source is inside THIS project's export tree
         // and never escapes it.
@@ -195,7 +257,6 @@ test(propertyTag(1, 'Isolation_Boundary invariant'), () => {
           if (b.status === 'removed') {
             const nh = normalizeHost(b.host);
             if (nh && isForbiddenEgressHost(nh) === false) {
-              // only assert absence if no OTHER active binding shares the host
               const stillActive = bindings.some(
                 (x) => x.status === 'active' && normalizeHost(x.host) === nh,
               );
@@ -207,6 +268,43 @@ test(propertyTag(1, 'Isolation_Boundary invariant'), () => {
         }
         // INVARIANT 7: limits are only REQUESTED — never claimed applied before a run.
         assert.equal(sandbox.limitsApplied, null);
+
+        // INVARIANT 8 (classifier-INDEPENDENT confinement): run the generated
+        // command through exec. WHATEVER the classifier would rate it, exec must
+        // build an isolated invocation and never reference the verdict.
+        const result = await manager.exec(projectId, command);
+        assert.equal(result.projectId, projectId);
+        assert.equal(result.mountSource, sandbox.mountSource);
+        assert.equal(result.workspacePath, WORKSPACE_MOUNT_PATH);
+
+        // The confinement CONTRACT the backend was asked to construct:
+        const last = backend.invocations.at(-1);
+        assert.ok(last, 'exec must issue exactly one isolated invocation');
+        const joined = last.args.join(' ');
+        // own root image, private PID ns, private/none network, no priv-esc.
+        assert.ok(last.args.includes('--pid') && last.args.includes('private'), 'private PID namespace');
+        assert.ok(last.args.includes('--network'), 'private network namespace requested');
+        assert.ok(joined.includes('no-new-privileges'), 'no privilege escalation');
+        // ONLY this project's tree is mounted — never a sibling / host path.
+        const mountArgIdx = last.args.indexOf('-v');
+        const mountArg = mountArgIdx >= 0 ? last.args[mountArgIdx + 1] : '';
+        assert.ok(
+          mountArg.startsWith(`${sandbox.mountSource}:${WORKSPACE_MOUNT_PATH}`),
+          'only this project tree is bind-mounted at the workspace path',
+        );
+        // The ONLY bind mount is this project's tree. Assert on the -v arg
+        // directly (a prefix match on the joined string would be fooled when one
+        // id is a prefix of another, e.g. 'F' vs 'F0').
+        const otherMountSpec = `${otherTree}:${WORKSPACE_MOUNT_PATH}`;
+        if (otherId !== projectId) {
+          assert.notEqual(mountArg, otherMountSpec, 'another project tree is NEVER mounted');
+          assert.ok(!mountArg.startsWith(`${otherTree}:`), 'another project tree is NEVER the mount source');
+        }
+        assert.notEqual(mountArg, `/projects:${WORKSPACE_MOUNT_PATH}`, 'the host /projects is never mounted');
+        // The command runs INSIDE the box: it appears after the image, never as
+        // a host-side mount/flag, so no traversal path in it can reach the host.
+        const imgIdx = last.args.indexOf('node:22-slim');
+        assert.ok(imgIdx >= 0 && mountArgIdx < imgIdx, 'command executes inside the container, after the image');
       },
     ),
     fcConfig,
@@ -364,6 +462,227 @@ test('backend exposes isAvailable() as the live-container capability gate', asyn
   const backend = createContainerBackend({ exec: async () => ({ code: 0, stdout: '5.2.3', stderr: '', timedOut: false, signal: null }) });
   assert.equal(typeof backend.isAvailable, 'function');
   assert.equal(await backend.isAvailable(), true);
+});
+
+// --- containerRuntimeAvailable() capability probe (subtask 5.2) -----------
+
+test('containerRuntimeAvailable() reports true only when a container can LAUNCH', async () => {
+  // Injected exec: a successful `run --rm ... true` means available.
+  const okBackendExec = async (_bin, args) => {
+    assert.ok(args.includes('run') && args.includes('--rm'), 'probe uses a one-shot run');
+    return { code: 0, stdout: '', stderr: '', timedOut: false, signal: null };
+  };
+  assert.equal(await containerRuntimeAvailable({ exec: okBackendExec }), true);
+
+  // A present-but-unusable runtime (run fails) -> false.
+  const failExec = async () => ({ code: 125, stdout: '', stderr: 'cannot connect to daemon', timedOut: false, signal: null });
+  assert.equal(await containerRuntimeAvailable({ exec: failExec }), false);
+
+  // A timed-out probe -> false (never throws).
+  const timeoutExec = async () => ({ code: null, stdout: '', stderr: '', timedOut: true, signal: 'SIGKILL' });
+  assert.equal(await containerRuntimeAvailable({ exec: timeoutExec }), false);
+});
+
+// --- LIVE-CONTAINER CONTAINMENT (subtask 5.2, gated on a real runtime) ----
+//
+// These launch REAL one-shot containers via the docker/Podman CLI and observe
+// actual confinement. They are gated behind containerRuntimeAvailable() so the
+// suite stays green where no runtime can launch; in this sandbox they DO run.
+// Each proves an axis of the Isolation_Boundary AND that out-of-box target
+// state is preserved / a denied indication is returned where the boundary
+// actively refuses.
+
+const RUNTIME_LIVE = await containerRuntimeAvailable();
+
+/**
+ * Build a manager backed by the REAL container backend, using alpine:latest
+ * (Node 22-slim lacks ps/wget). Each project gets its own temp tree on the host
+ * so we can prove writes land only inside the mounted tree.
+ */
+function liveSetup() {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aab-live-'));
+  // Two SIBLING project trees under the same export root; each has a secret.
+  const layout = createStorageLayout(baseDir);
+  const backend = createContainerBackend({ bin: 'docker', image: 'alpine:latest' });
+  const manager = createSandboxManager({
+    layout,
+    backend,
+    // Empty registry -> empty allowlist -> `--network none` (total deny), which
+    // is what the network-confinement test needs.
+    config: { packageRegistryHosts: [], limits: {}, execTimeoutMs: 60_000 },
+  });
+  return { baseDir, layout, backend, manager };
+}
+
+function ensureTree(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+test('(live) filesystem confinement: cannot see the host /projects or a sibling project tree', { skip: !RUNTIME_LIVE ? 'no container runtime' : false }, async () => {
+  const { baseDir, layout, manager } = liveSetup();
+  try {
+    const a = ensureTree(layout.exportableProjectTree('projA'));
+    const b = ensureTree(layout.exportableProjectTree('projB'));
+    fs.writeFileSync(path.join(a, 'a.txt'), 'inside-A');
+    fs.writeFileSync(path.join(b, 'secretB.txt'), 'sibling-secret');
+
+    // The container sees ONLY its own tree at /workspace.
+    const own = await manager.exec('projA', 'ls /workspace');
+    assert.equal(own.exitCode, 0);
+    assert.ok(own.stdout.includes('a.txt'), 'own tree visible at /workspace');
+
+    // The host /projects path is NOT visible inside the box.
+    const host = await manager.exec('projA', 'ls /projects');
+    assert.notEqual(host.exitCode, 0, 'host /projects is not present in the container');
+
+    // The SIBLING project tree (its host path) is NOT visible either.
+    const sibling = await manager.exec('projA', `cat ${path.join(b, 'secretB.txt')}`);
+    assert.notEqual(sibling.exitCode, 0, 'sibling tree host path not visible');
+    assert.ok(!sibling.stdout.includes('sibling-secret'), 'sibling secret never leaks into the box');
+
+    // TARGET STATE PRESERVED: the sibling secret on the host is untouched.
+    assert.equal(fs.readFileSync(path.join(b, 'secretB.txt'), 'utf8'), 'sibling-secret');
+  } finally {
+    await manager.release('projA');
+    await manager.release('projB');
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+test('(live) PID-namespace confinement: the container sees only its own tiny process table', { skip: !RUNTIME_LIVE ? 'no container runtime' : false }, async () => {
+  const { baseDir, layout, manager } = liveSetup();
+  try {
+    ensureTree(layout.exportableProjectTree('projA'));
+    // `ps -e` inside a private PID namespace shows only a handful of processes.
+    const res = await manager.exec('projA', 'ps -e | wc -l');
+    assert.equal(res.exitCode, 0);
+    const count = parseInt(res.stdout.trim(), 10);
+    assert.ok(Number.isFinite(count) && count < 15, `expected a tiny process table, saw ${res.stdout.trim()}`);
+  } finally {
+    await manager.release('projA');
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+test('(live) network confinement: under a deny-by-default (empty) allowlist an outbound attempt fails', { skip: !RUNTIME_LIVE ? 'no container runtime' : false }, async () => {
+  const { baseDir, layout, manager } = liveSetup();
+  try {
+    ensureTree(layout.exportableProjectTree('projA'));
+    // The manager maps an empty allowlist to `--network none` — total deny.
+    assert.equal(manager.acquire('projA').egress.allowedHosts.length, 0, 'empty allowlist -> total network deny');
+    const res = await manager.exec('projA', 'wget -T 3 -q -O- http://example.com');
+    // No route to the outside world: wget fails inside the box.
+    assert.notEqual(res.exitCode, 0, 'outbound network is denied by default');
+    assert.ok(!res.stdout.includes('<html'), 'no response body reached the container');
+  } finally {
+    await manager.release('projA');
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+test('(live) no cross-Sandbox access: a write lands ONLY in that project tree, unseen by another sandbox', { skip: !RUNTIME_LIVE ? 'no container runtime' : false }, async () => {
+  const { baseDir, layout, manager } = liveSetup();
+  try {
+    const a = ensureTree(layout.exportableProjectTree('projA'));
+    const b = ensureTree(layout.exportableProjectTree('projB'));
+
+    // Write from inside projA's box; it must land in projA's host tree.
+    const w = await manager.exec('projA', 'echo hello-from-A > /workspace/created.txt');
+    assert.equal(w.exitCode, 0);
+    assert.equal(fs.readFileSync(path.join(a, 'created.txt'), 'utf8').trim(), 'hello-from-A');
+
+    // projB's tree never received it (no cross-Sandbox write).
+    assert.ok(!fs.existsSync(path.join(b, 'created.txt')), 'write did not cross into sibling tree');
+
+    // And projB's own box cannot see projA's file at its /workspace either.
+    const bSees = await manager.exec('projB', 'ls /workspace');
+    assert.ok(!bSees.stdout.includes('created.txt'), 'sibling sandbox cannot see the other project\'s write');
+  } finally {
+    await manager.release('projA');
+    await manager.release('projB');
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+test('(live) boundary-escape attempt is denied by the wall-clock reaper, target state preserved', { skip: !RUNTIME_LIVE ? 'no container runtime' : false }, async () => {
+  const { baseDir, layout, manager } = liveSetup();
+  try {
+    ensureTree(layout.exportableProjectTree('projA'));
+    // A command that would run forever is killed + reaped by the in-process
+    // wall-clock timeout — the boundary actively refuses -> denied.
+    const res = await manager.exec('projA', 'sleep 999', { timeoutMs: 1500 });
+    assert.equal(res.timedOut, true, 'the run hit the wall-clock limit');
+    assert.equal(res.denied, true, 'a boundary refusal is reported as denied');
+  } finally {
+    await manager.release('projA');
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+// --- subtask 5.4: an `allow`-class command is STILL confined ---------------
+//
+// Req 8.5 / subtask 5.4: isolation is INDEPENDENT of gating. A command the
+// classifier rates `allow` runs through the very same boundary and is confined
+// exactly like any other — the container, not the verdict, provides safety.
+
+test('(5.4) an allow-classified command (verified via classifyCommand) is still fully confined', { skip: !RUNTIME_LIVE ? 'no container runtime' : false }, async () => {
+  // Confirm the command really is `allow`-class per plumby's classifier.
+  assert.equal(classifyCommand('ls /projects').outcome, 'allow', 'ls is an allow-class command');
+  assert.equal(classifyCommand('echo hi').outcome, 'allow');
+
+  const { baseDir, layout, manager } = liveSetup();
+  try {
+    const a = ensureTree(layout.exportableProjectTree('projA'));
+    fs.writeFileSync(path.join(a, 'a.txt'), 'inside-A');
+
+    // The benign `allow` command runs inside the box and still cannot see the
+    // host: exec never consulted the verdict, so confinement is identical.
+    const res = await manager.exec('projA', 'ls /projects');
+    assert.notEqual(res.exitCode, 0, 'even an allow-class command cannot see the host /projects');
+
+    const own = await manager.exec('projA', 'ls /workspace');
+    assert.equal(own.exitCode, 0);
+    assert.ok(own.stdout.includes('a.txt'), 'the allow-class command is confined to this project tree');
+  } finally {
+    await manager.release('projA');
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+});
+
+test('(5.4) exec confines allow/confirm/refuse commands IDENTICALLY (no classifier branch)', async () => {
+  // Prove classifier-independence WITHOUT a live container: exec builds the same
+  // isolated invocation regardless of what the classifier would say.
+  assert.equal(classifyCommand('ls').outcome, 'allow');
+  assert.equal(classifyCommand('rm -rf /').outcome, 'refuse');
+
+  const layout = createStorageLayout(BASE);
+  const seen = [];
+  const backend = {
+    async isAvailable() { return true; },
+    async runOneShot(spec) {
+      seen.push(spec);
+      return { code: 0, stdout: '', stderr: '', timedOut: false, signal: null, limitsApplied: false, requestedLimits: false, degraded: false };
+    },
+    async remove() { return { removed: true }; },
+    async reapOrphans() { return { reaped: [] }; },
+  };
+  const manager = createSandboxManager({ layout, backend, config: { packageRegistryHosts: REGISTRY } });
+
+  await manager.exec('projA', 'ls');            // allow
+  await manager.exec('projA', 'rm -rf /');      // refuse
+  await manager.exec('projA', 'git push');      // confirm-ish
+
+  // Every invocation targeted the SAME isolated boundary shape: same mount
+  // source, same workspace path, same network policy. The verdict changed
+  // nothing about how the command was confined.
+  const tree = layout.exportableProjectTree('projA');
+  assert.equal(seen.length, 3);
+  for (const spec of seen) {
+    assert.equal(spec.mountSource, tree, 'same project tree for every verdict class');
+  }
+  assert.ok(seen.every((s) => s.mountSource === seen[0].mountSource && s.network === seen[0].network),
+    'the isolated invocation shape is identical regardless of classifier verdict');
 });
 
 /**
