@@ -245,14 +245,133 @@ test('auto-flush (debounce timer path) failure is surfaced via onError and retai
   }
 });
 
-test('persist rejects non-string (Buffer) contents to keep the utf8 round-trip honest', () => {
+test('persist rejects contents that are neither a string nor a Buffer', () => {
   const { base, layout } = tempLayout();
   try {
     const store = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
     assert.throws(
-      () => store.persist(PROJECT, { 'bin.dat': Buffer.from([0xff, 0xfe, 0x00]) }),
-      /must be a string/,
+      () => store.persist(PROJECT, { 'bad.dat': 42 }),
+      /must be a string or Buffer/,
     );
+    assert.throws(
+      () => store.persist(PROJECT, { 'bad.dat': { nested: 'object' } }),
+      /must be a string or Buffer/,
+    );
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// --- Part A: lossless BINARY file support ---------------------------------
+
+/** Representative binary byte sequences (PDFs, screenshots, videos, etc.). */
+const PDF_HEADER = Buffer.from('%PDF-1.7\n%\xE2\xE3\xCF\xD3\n', 'latin1');
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const ALL_BYTES = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
+
+test('PersistenceStore round-trips arbitrary binary bytes as a byte-identical Buffer', () => {
+  const { base, layout } = tempLayout();
+  try {
+    const store = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    for (const [name, bytes] of [
+      ['doc.pdf', PDF_HEADER],
+      ['shot.png', PNG_SIGNATURE],
+      ['all.bin', ALL_BYTES],
+    ]) {
+      const res = store.persist(PROJECT, { [name]: bytes });
+      assert.equal(res.ok, true);
+      const back = store.readPersistedTree(PROJECT)[name];
+      assert.ok(Buffer.isBuffer(back), `${name} must read back as a Buffer`);
+      assert.ok(back.equals(bytes), `${name} bytes must be byte-identical`);
+    }
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('SnapshotStore commit+restore round-trips arbitrary binary bytes byte-identically', () => {
+  const { base, layout } = tempLayout();
+  try {
+    const store = createSnapshotStore({ layout, ownerId: OWNER });
+    for (const [name, bytes] of [
+      ['doc.pdf', PDF_HEADER],
+      ['shot.png', PNG_SIGNATURE],
+      ['all.bin', ALL_BYTES],
+    ]) {
+      const committed = store.commitSnapshot(PROJECT, { [name]: bytes }, { trigger: 'explicit' });
+      assert.equal(committed.ok, true);
+      const restored = store.restore(PROJECT, committed.snapshotId);
+      assert.equal(restored.ok, true);
+      const back = restored.projectTree[name];
+      assert.ok(Buffer.isBuffer(back), `${name} must restore as a Buffer`);
+      assert.ok(back.equals(bytes), `${name} bytes must be byte-identical`);
+    }
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('a mixed text+binary tree round-trips: text as String, binary as Buffer (both stores)', () => {
+  const { base, layout } = tempLayout();
+  try {
+    const tree = {
+      'README.md': '# hello\nwith üñïçode\n',
+      'src/app.js': 'export const x = 1;\n',
+      'assets/logo.png': PNG_SIGNATURE,
+      'data/all.bin': ALL_BYTES,
+    };
+
+    // PersistenceStore path.
+    const persistence = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    assert.equal(persistence.persist(PROJECT, tree).ok, true);
+    const pBack = persistence.readPersistedTree(PROJECT);
+    assert.equal(pBack['README.md'], tree['README.md']);
+    assert.equal(pBack['src/app.js'], tree['src/app.js']);
+    assert.equal(typeof pBack['README.md'], 'string');
+    assert.ok(Buffer.isBuffer(pBack['assets/logo.png']));
+    assert.ok(pBack['assets/logo.png'].equals(PNG_SIGNATURE));
+    assert.ok(Buffer.isBuffer(pBack['data/all.bin']));
+    assert.ok(pBack['data/all.bin'].equals(ALL_BYTES));
+
+    // SnapshotStore path.
+    const snapshots = createSnapshotStore({ layout, ownerId: OWNER });
+    const committed = snapshots.commitSnapshot(PROJECT, tree, { trigger: 'explicit' });
+    assert.equal(committed.ok, true);
+    const sBack = snapshots.restore(PROJECT, committed.snapshotId).projectTree;
+    assert.equal(sBack['README.md'], tree['README.md']);
+    assert.equal(typeof sBack['src/app.js'], 'string');
+    assert.ok(Buffer.isBuffer(sBack['assets/logo.png']));
+    assert.ok(sBack['assets/logo.png'].equals(PNG_SIGNATURE));
+    assert.ok(Buffer.isBuffer(sBack['data/all.bin']));
+    assert.ok(sBack['data/all.bin'].equals(ALL_BYTES));
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('a Buffer whose bytes are valid utf8 round-trips (read back as an equal String)', () => {
+  const { base, layout } = tempLayout();
+  try {
+    // A Buffer holding valid-utf8 text. Bytes are preserved; on read-back the
+    // text-vs-binary decision returns a String (documented behavior, lossless
+    // because the bytes are byte-for-byte identical to the utf8 encoding).
+    const text = 'hello valid utf8 üñïçode\n';
+    const buf = Buffer.from(text, 'utf8');
+
+    const persistence = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    assert.equal(persistence.persist(PROJECT, { 'note.txt': buf }).ok, true);
+    const pBack = persistence.readPersistedTree(PROJECT)['note.txt'];
+    assert.equal(typeof pBack, 'string');
+    assert.equal(pBack, text);
+    assert.ok(Buffer.from(pBack, 'utf8').equals(buf), 'bytes are preserved even though read back as a String');
+
+    const snapshots = createSnapshotStore({ layout, ownerId: OWNER });
+    const committed = snapshots.commitSnapshot(PROJECT, { 'note.txt': buf }, { trigger: 'explicit' });
+    assert.equal(committed.ok, true);
+    const sBack = snapshots.restore(PROJECT, committed.snapshotId).projectTree['note.txt'];
+    assert.equal(typeof sBack, 'string');
+    assert.equal(sBack, text);
+    assert.ok(Buffer.from(sBack, 'utf8').equals(buf));
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

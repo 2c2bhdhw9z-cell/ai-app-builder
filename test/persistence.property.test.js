@@ -55,17 +55,34 @@ const relPath = fc
   .map((p) => (p.endsWith('.git') ? `${p}x` : p));
 
 /**
- * File contents covering tricky bytes: unicode, embedded newlines, and trailing
- * whitespace, plus empty files. Kept short so 100+ iterations stay fast. We keep
- * contents free of a trailing '\n'-only ambiguity by generating exact bytes.
+ * TEXT file contents covering tricky bytes: unicode, embedded newlines, and
+ * trailing whitespace, plus empty files. Kept short so 100+ iterations stay
+ * fast. We keep contents free of a trailing '\n'-only ambiguity by generating
+ * exact bytes.
  */
-const contents = fc.oneof(
+const textContents = fc.oneof(
   fc.constant(''), // empty file
   fc.constant('trailing spaces   '),
   fc.constant('líne1\nlíne2\n\tindented\n'),
   fc.constant('emoji 🚀 and üñïçodé'),
   fc.string({ minLength: 0, maxLength: 40 }),
 );
+
+/**
+ * BINARY file contents (Part A): arbitrary byte buffers, including non-utf8
+ * sequences and embedded 0x00 NUL bytes. fc.uint8Array is mapped to a Buffer so
+ * it flows through the stores as binary and survives byte-exact.
+ */
+const binaryContents = fc
+  .uint8Array({ minLength: 0, maxLength: 48 })
+  .map((u8) => Buffer.from(u8));
+
+/**
+ * A tree entry's contents is EITHER text (a String) OR binary (a Buffer). We
+ * mix both kinds in the same generated tree so round-trips are exercised over
+ * text and binary together.
+ */
+const contents = fc.oneof(textContents, binaryContents);
 
 /**
  * A non-empty project tree: a map { relPath: contents }. fc.dictionary with a
@@ -76,14 +93,46 @@ const projectTreeArb = fc
   .filter((tree) => Object.keys(tree).length >= 1)
   // Guard against a generated key that normalizes to something reserved/empty.
   .filter((tree) => Object.keys(tree).every((k) => k.length > 0 && !k.split('/').includes('.git')))
+  // Reject trees where one path is a directory-prefix of another (e.g. "a" and
+  // "a/a"): a single name cannot be both a file and a directory on disk, so
+  // such a map is not a materializable file tree. This is independent of
+  // text-vs-binary content; we exclude it so the round-trip is well-defined.
+  .filter((tree) => {
+    const keys = Object.keys(tree);
+    return !keys.some((a) =>
+      keys.some((b) => a !== b && b.startsWith(`${a}/`)),
+    );
+  })
   // fc.dictionary yields a null-prototype object; normalize to a plain { }
-  // object of utf8 strings so it matches the shape the stores read back and so
-  // node:assert/strict deepEqual (which also compares prototypes) is meaningful.
+  // object so node:assert/strict deepEqual (which also compares prototypes) is
+  // meaningful. Strings are coerced with String(); Buffers are preserved AS
+  // Buffers so binary values reach the store and survive the deep-equal
+  // comparison (deepEqual compares Buffers byte-wise, which is what we want).
   .map((tree) => {
     const plain = {};
-    for (const [k, v] of Object.entries(tree)) plain[k] = String(v);
+    for (const [k, v] of Object.entries(tree)) plain[k] = Buffer.isBuffer(v) ? v : String(v);
     return plain;
   });
+
+/**
+ * The tree the stores read back, given a written tree: text entries come back
+ * as Strings and binary entries come back as Buffers, EXCEPT a Buffer whose
+ * bytes are valid utf8 reads back as the equal String (bytes are still
+ * preserved). This mirrors decodeTreeEntry so we can assert on CONTENT.
+ */
+function expectedReadBack(tree) {
+  const expected = {};
+  for (const [k, v] of Object.entries(tree)) {
+    if (Buffer.isBuffer(v)) {
+      // decodeTreeEntry returns a String iff the bytes are valid, lossless utf8.
+      const asString = v.toString('utf8');
+      expected[k] = Buffer.from(asString, 'utf8').equals(v) ? asString : v;
+    } else {
+      expected[k] = String(v);
+    }
+  }
+  return expected;
+}
 
 /** Allocate a fresh hermetic layout for one property iteration. */
 function freshLayout(prefix) {
@@ -128,8 +177,11 @@ test(propertyTag(4, 'Resumability restores prior state'), () => {
         assert.equal(flushed.durable, true);
         assert.equal(store.hasPending(PROJECT), false);
 
-        // restore(persist(state)) == state: the read-back tree equals the original.
-        assert.deepEqual(store.readPersistedTree(PROJECT), tree);
+        // restore(persist(state)) == state: the read-back tree equals the
+        // original tree, with text entries as Strings and binary entries as
+        // Buffers (deepEqual compares Buffers byte-wise).
+        const expected = expectedReadBack(tree);
+        assert.deepEqual(store.readPersistedTree(PROJECT), expected);
 
         // The resume surface (Req 19.5/19.6): with no snapshot, resume restores
         // the most recent persisted file state — same tree.
@@ -137,7 +189,7 @@ test(propertyTag(4, 'Resumability restores prior state'), () => {
         const resumed = snapshots.resume(PROJECT);
         assert.equal(resumed.ok, true);
         assert.equal(resumed.source, 'persisted');
-        assert.deepEqual(resumed.projectTree, tree);
+        assert.deepEqual(resumed.projectTree, expected);
       } finally {
         fs.rmSync(base, { recursive: true, force: true });
       }
@@ -174,12 +226,9 @@ test(propertyTag(6, 'Snapshot idempotence'), () => {
         assert.deepEqual(r2.projectTree, r1.projectTree);
 
         // And the restored content matches the committed tree (normalized to the
-        // utf8 read-back the store produces), confirming the restore is faithful.
-        const expected = {};
-        for (const [k, v] of Object.entries(tree)) {
-          expected[k] = Buffer.isBuffer(v) ? v.toString('utf8') : String(v);
-        }
-        assert.deepEqual(r1.projectTree, expected);
+        // text-or-binary read-back the store produces), confirming the restore
+        // is faithful: text as String, binary as Buffer (byte-exact).
+        assert.deepEqual(r1.projectTree, expectedReadBack(tree));
       } finally {
         fs.rmSync(base, { recursive: true, force: true });
       }

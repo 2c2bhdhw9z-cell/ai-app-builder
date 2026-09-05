@@ -3,7 +3,11 @@
  *
  * A PersistenceStore durably writes a Project's file state (a plain map
  * { relPath: contents }) to disk, and reads the most recent persisted state
- * back. It is the "files on disk in the Project's repository" surface of
+ * back. Contents may be a utf8 STRING (text file) or a Buffer (binary file:
+ * PDFs, screenshots, videos, etc.): strings persist as utf8 and read back as
+ * strings, Buffers persist raw and read back as Buffers, so either round-trips
+ * LOSSLESSLY (bytes in == bytes out), including non-utf8 and embedded NUL bytes.
+ * It is the "files on disk in the Project's repository" surface of
  * Req 19.9: the persisted files live INSIDE the exportable project tree
  * (layout.exportableProjectTree(projectId)) — that tree IS the project's
  * repository and is what an export produces. Snapshot metadata never lands
@@ -33,6 +37,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { requireString, fail } from '../model/validate.js';
+import { normalizeContents, decodeTreeEntry } from './tree-codec.js';
 
 /** The idle-persistence budget ceiling from Req 19.1: within 2 seconds. */
 export const MAX_DEBOUNCE_MS = 2000;
@@ -43,9 +48,10 @@ function defaultNow() {
 }
 
 /**
- * Validate that a projectTree is a plain { relPath: string } map with safe,
- * in-tree relative paths (no absolute paths, no traversal). Returns normalized
- * entries [[relPath, contents], ...].
+ * Validate that a projectTree is a plain { relPath: contents } map with safe,
+ * in-tree relative paths (no absolute paths, no traversal). Contents may be a
+ * utf8 STRING (text file) or a Buffer/Uint8Array (binary file), normalized to
+ * [[relPath, string | Buffer], ...]. Any other content type is rejected.
  */
 function normalizeTree(model, projectTree) {
   if (projectTree === null || typeof projectTree !== 'object' || Array.isArray(projectTree)) {
@@ -63,14 +69,17 @@ function normalizeTree(model, projectTree) {
     if (norm === '..' || norm.startsWith(`..${path.sep}`) || norm.split(/[\\/]/).includes('..')) {
       fail(model, `projectTree path must not escape the project tree, got ${JSON.stringify(rel)}`);
     }
-    // Contract: file contents are TEXT (utf8 strings). The read-back paths
-    // (readPersistedTree) decode as utf8, so a Buffer of non-utf8 bytes would
-    // not round-trip byte-exact. Rather than silently corrupt non-utf8 input we
-    // reject non-strings, keeping the persist->read contract honest (text-only).
-    if (typeof contents !== 'string') {
-      fail(model, `projectTree[${JSON.stringify(rel)}] must be a string (file contents are utf8 text)`);
+    // Contract: file contents are a utf8 STRING (text) OR a Buffer/Uint8Array
+    // (binary). A string persists as utf8 and reads back as a String; a Buffer
+    // persists raw and reads back as a Buffer (readPersistedTree decides
+    // text-vs-binary via decodeTreeEntry), so both round-trip losslessly.
+    // Genuinely invalid content types (numbers, plain objects, null) are
+    // rejected so the persist->read contract stays honest.
+    const normalized = normalizeContents(contents);
+    if (!normalized.ok) {
+      fail(model, `projectTree[${JSON.stringify(rel)}] must be a string or Buffer (file contents are utf8 text or binary bytes)`);
     }
-    entries.push([norm, contents]);
+    entries.push([norm, normalized.value]);
   }
   return entries;
 }
@@ -153,9 +162,10 @@ function pruneStale(treeRoot, dir, keep) {
  * @param {string} [args.ownerId]       owning account id; defaults to 'default'
  * @param {() => number} [args.now]     injectable clock (ms) for deterministic tests
  * @param {number} [args.debounceMs]    idle debounce budget (<= 2000); default 2000
- * @param {(treeRoot: string, entries: [string, string][]) => void} [args.writeTree]
+ * @param {(treeRoot: string, entries: [string, string | Buffer][]) => void} [args.writeTree]
  *        injectable atomic tree writer (default materializes files on disk);
- *        entries carry utf8-string contents (the store rejects non-string input)
+ *        entries carry string (utf8 text) OR Buffer (binary) contents — the
+ *        store rejects any other content type
  * @param {(fn: () => void, ms: number) => any} [args.setTimer]  injectable scheduler (default setTimeout)
  * @param {(handle: any) => void} [args.clearTimer]              injectable canceller (default clearTimeout)
  * @param {(projectId: string, error: object) => void} [args.onError]
@@ -316,7 +326,9 @@ export function createPersistenceStore({
 
   /**
    * readPersistedTree(projectId): load the most recent persisted file state back
-   * as a { relPath: contents(utf8) } map (Req 19.6, Property 4). Returns {} when
+   * as a { relPath: contents } map (Req 19.6, Property 4), where each entry is a
+   * utf8 String for text files and a Buffer for binary files (decodeTreeEntry
+   * decides per file, so bytes round-trip losslessly either way). Returns {} when
    * nothing has been persisted yet. Never reads the project's Git repo (.git).
    */
   function readPersistedTree(projectId) {
@@ -338,7 +350,10 @@ export function createPersistenceStore({
           walk(full);
         } else if (ent.isFile()) {
           const rel = path.relative(root, full).split(path.sep).join('/');
-          tree[rel] = fs.readFileSync(full, 'utf8');
+          // Read RAW bytes and decide text-vs-binary: text returns a String
+          // (byte-for-byte identical to what was written), binary returns the
+          // raw Buffer, so both round-trip losslessly.
+          tree[rel] = decodeTreeEntry(fs.readFileSync(full));
         }
       }
     };
