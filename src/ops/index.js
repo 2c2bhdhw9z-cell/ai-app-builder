@@ -8,7 +8,12 @@
  * their exports here (AuditLog, observability).
  *
  * The centralized secret-redaction filter (createRedactor) is the single filter
- * every audit / metrics / error log path routes through (Req 24.4).
+ * every audit / metrics / error log path routes through (Req 24.4). The
+ * composition root (composePlatformOps) is the production wiring that builds ONE
+ * such redactor seeded from the live secret set and hands it, plus a wired
+ * AuditLog and Observability, to the CommandGuard / RetentionService / SecretStore
+ * choke points — so redaction is an ACTIVE control rather than an inert
+ * test-only construction.
  *
  * The RetentionService (createRetentionService) performs Project and
  * User_Account deletion (Req 24.2-24.5) with retain-until-deletion semantics:
@@ -51,3 +56,5 @@ export {
   createObservability,
   OPERATIONAL_SUBSYSTEMS,
 } from './observability.js';
+
+export { composePlatformOps } from './compose.js';

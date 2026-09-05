@@ -198,11 +198,82 @@ test('deleteAccount iterates ALL ownerId-keyed categories, leaving none behind, 
   assert.equal(f.owned.Connectors.has(OWNER), false, 'no Connectors remain');
   assert.equal(f.owned.Secrets.has(OWNER), false, 'no Secrets remain');
 
-  // Exactly one ACCOUNT_DELETED event, naming all categories.
+  // Exactly one ACCOUNT_DELETED event, carrying the REAL per-category outcome
+  // (every category deleted here) plus the canonical list for reference.
   const evts = audit.ofType(AUDIT_EVENTS.ACCOUNT_DELETED);
   assert.equal(evts.length, 1);
   assert.equal(evts[0].accountId, OWNER);
-  assert.deepEqual(evts[0].categories, OWNER_KEYED_CATEGORIES);
+  assert.deepEqual(evts[0].categoryList, OWNER_KEYED_CATEGORIES);
+  const allDeleted = Object.fromEntries(OWNER_KEYED_CATEGORIES.map((c) => [c, 'deleted']));
+  assert.deepEqual(evts[0].categories, allDeleted);
+});
+
+test('ACCOUNT_DELETED audit event records the REAL per-category outcome (deleted vs skipped)', async () => {
+  // Optional stores omitted: Skills / Memory / Connectors are skipped.
+  const f = makeFakes({ projectIds: [] });
+  const audit = createCollectorSink();
+  const svc = createRetentionService({
+    persistenceStore: f.persistenceStore,
+    snapshotStore: f.snapshotStore,
+    sandboxManager: f.sandboxManager,
+    secretStore: f.secretStore,
+    projectRegistry: f.projectRegistry,
+    auditSink: audit,
+    now: () => '2026-01-01T00:00:00.000Z',
+  });
+
+  await svc.deleteAccount({ id: OWNER });
+
+  const evt = audit.ofType(AUDIT_EVENTS.ACCOUNT_DELETED)[0];
+  // The audit trail must NOT overstate completeness: skipped categories are
+  // recorded as 'skipped', deleted ones as 'deleted'. This is the assertion
+  // that flips if the event reverts to emitting the static category list.
+  assert.deepEqual(evt.categories, {
+    Projects: 'deleted',
+    Skills: 'skipped',
+    Project_Memory: 'skipped',
+    Global_Memory: 'skipped',
+    Connectors: 'skipped',
+    Secrets: 'deleted',
+  });
+});
+
+test('strict mode (requireAllCategories) FAILS when an ownerId-keyed store is absent — no fail-open', async () => {
+  const f = makeFakes({ projectIds: [] });
+  const audit = createCollectorSink();
+  const svc = createRetentionService({
+    persistenceStore: f.persistenceStore,
+    snapshotStore: f.snapshotStore,
+    sandboxManager: f.sandboxManager,
+    secretStore: f.secretStore,
+    projectRegistry: f.projectRegistry,
+    // Skills/Memory/Connectors deliberately NOT injected.
+    requireAllCategories: true,
+    auditSink: audit,
+  });
+
+  await assert.rejects(() => svc.deleteAccount({ id: OWNER }), /strict mode/);
+  // Fail-closed: it does not confirm and emits NO ACCOUNT_DELETED event.
+  assert.equal(audit.ofType(AUDIT_EVENTS.ACCOUNT_DELETED).length, 0);
+});
+
+test('strict mode (requireAllCategories) CONFIRMS when every ownerId-keyed store is present', async () => {
+  const f = makeFakes({ projectIds: ['p1'] });
+  const svc = createRetentionService({
+    persistenceStore: f.persistenceStore,
+    snapshotStore: f.snapshotStore,
+    sandboxManager: f.sandboxManager,
+    secretStore: f.secretStore,
+    projectRegistry: f.projectRegistry,
+    skillStore: f.skillStore,
+    memoryStore: f.memoryStore,
+    connectorStore: f.connectorStore,
+    requireAllCategories: true,
+  });
+
+  const res = await svc.deleteAccount({ id: OWNER });
+  assert.equal(res.ok, true);
+  assert.equal(res.confirmed, true);
 });
 
 test('deleteAccount records optional categories with no injected store as skipped (still named)', async () => {

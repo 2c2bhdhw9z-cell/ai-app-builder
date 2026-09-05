@@ -88,6 +88,15 @@ function accountIdOf(userAccount) {
  * @param {object|Function} [args.auditSink]  audit sink (function or { record }).
  * @param {object} [args.redactor]        centralized redactor (src/ops/redaction.js);
  *        every emitted audit record is passed through redactor.redact first.
+ * @param {boolean} [args.requireAllCategories=false]  the FAIL-OPEN posture control
+ *        (Req 24.4). By DEFAULT (false) deleteAccount is LENIENT: an optional
+ *        ownerId-keyed category (Skills / Memory / Connectors) whose store was
+ *        not injected is recorded as `skipped` and the deletion still confirms —
+ *        an explicit choice for deployments that do not run those subsystems.
+ *        When set to TRUE (strict mode), deleteAccount FAILS (throws) if ANY
+ *        ownerId-keyed category store is absent, so a "delete everything I own"
+ *        request never reports success while a subsystem was forgotten at wiring
+ *        time. Choose strict for GDPR-style guarantees.
  * @param {()=>string} [args.now]         injectable ISO-timestamp clock.
  * @returns {object} frozen RetentionService
  */
@@ -103,6 +112,7 @@ export function createRetentionService(args = {}) {
     skillStore,
     auditSink,
     redactor,
+    requireAllCategories = false,
     now = () => new Date().toISOString(),
   } = args;
 
@@ -179,9 +189,21 @@ export function createRetentionService(args = {}) {
   /**
    * deleteAccount(userAccount): delete-or-irreversibly-anonymize EVERY
    * ownerId-keyed resource category, then emit ACCOUNT_DELETED and confirm. The
-   * `categories` map records, per OWNER_KEYED_CATEGORIES entry, what happened
-   * (deleted vs skipped-because-no-seam), so the completeness test can assert no
-   * category was silently dropped.
+   * returned `categories` map records, per OWNER_KEYED_CATEGORIES entry, what
+   * happened (deleted vs skipped-because-no-seam), so the completeness test can
+   * assert no category was silently dropped.
+   *
+   * The emitted ACCOUNT_DELETED audit event carries the REAL per-category
+   * outcome map ({ Projects:'deleted', Skills:'skipped', ... }) — NOT the static
+   * category list — so the audit trail never overstates completeness when a
+   * lenient deletion skipped an un-wired category.
+   *
+   * FAIL-OPEN vs STRICT (requireAllCategories): by default a category whose
+   * store was not injected is recorded `skipped` and the deletion still confirms
+   * (an explicit lenient choice for deployments not running that subsystem). In
+   * strict mode deleteAccount THROWS if any ownerId-keyed category store is
+   * absent, so a GDPR-style "delete everything I own" never confirms success
+   * while data in a forgotten subsystem remains.
    */
   async function deleteAccount(userAccount) {
     const accountId = accountIdOf(userAccount);
@@ -219,11 +241,38 @@ export function createRetentionService(args = {}) {
       }
     }
 
+    // STRICT MODE (requireAllCategories): fail LOUDLY — never confirm — when any
+    // ownerId-keyed category's store was absent, so a "delete everything I own"
+    // request cannot report success while a subsystem was forgotten at wiring
+    // time. The lenient default (below) is the explicit choice for deployments
+    // that do not run every optional subsystem.
+    if (requireAllCategories) {
+      const skipped = OWNER_KEYED_CATEGORIES.filter((cat) => categories[cat] && categories[cat].handled !== true);
+      if (skipped.length > 0) {
+        throw new Error(
+          `deleteAccount: strict mode (requireAllCategories) requires every ownerId-keyed category store to be present; missing: ${skipped.join(', ')}`,
+        );
+      }
+    }
+
+    // Build the REAL per-category handled/skipped outcome for the audit trail —
+    // NOT the static OWNER_KEYED_CATEGORIES list. The audit record must reflect
+    // what actually happened (deleted vs skipped) so it never overstates
+    // completeness when a lenient deletion skipped an un-wired category.
+    const categoryOutcomes = {};
+    for (const cat of OWNER_KEYED_CATEGORIES) {
+      const entry = categories[cat] ?? {};
+      categoryOutcomes[cat] = entry.handled === true ? 'deleted' : 'skipped';
+    }
+
     audit({
       type: AUDIT_EVENTS.ACCOUNT_DELETED,
       at: now(),
       accountId,
-      categories: OWNER_KEYED_CATEGORIES,
+      // Per-category REAL outcome (deleted|skipped). `categoryList` keeps the
+      // canonical enumeration available for consumers that want the full set.
+      categories: categoryOutcomes,
+      categoryList: OWNER_KEYED_CATEGORIES,
     });
 
     return {

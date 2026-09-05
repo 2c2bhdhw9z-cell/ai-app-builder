@@ -103,7 +103,7 @@ const ACCESS_DENIED = { error: 'access denied' };
  * @param {object} opts.authService   the AuthService gate (src/auth). Required:
  *        provides tryVerifySession(token) and authorize(account, action,
  *        resource, context) — the single authn + authz choke point.
- * @param {(args: { projectId: string, cwd: string, onEvent: Function, commandGuard?: object, onConfirmRequest: Function }) => { agent: object }} [opts.agentFactory]
+ * @param {(args: { projectId: string, accountId: string, cwd: string, onEvent: Function, commandGuard?: object, onConfirmRequest: Function }) => { agent: object }} [opts.agentFactory]
  *        builds the Builder_Agent for a Project Session. Injectable so tests
  *        drive a scripted agent; the default builds a plumby agent through the
  *        boundary with cwd = the Project tree. `onConfirmRequest` is the session's
@@ -339,7 +339,10 @@ export function createBuilderServer(opts = {}) {
     // Command execution flows through the injected CommandGuard, which the
     // caller wires with this session's onConfirmRequest seam (see the factory
     // call site), so a confirm-class command reaches this server's POST /confirm
-    // rather than the plumby loop's own confirm hook.
+    // rather than the plumby loop's own confirm hook. The session's `accountId`
+    // is also handed to this factory (ignored here) so a guard-wiring factory
+    // can bind it into guard.run(pid, cmd, { accountId }) and make
+    // CONFIRM_CLASS_OP audit entries attributable rather than account-null.
     const agent = createAgent({
       cwd,
       system: buildSystemPrompt({ cwd }),
@@ -544,6 +547,12 @@ export function createBuilderServer(opts = {}) {
       const cwd = projectCwd(projectId);
       const built = buildAgent({
         projectId,
+        // The authenticated accountId for THIS session, threaded so a real
+        // composition can bind it into the CommandGuard's run() opts and make
+        // CONFIRM_CLASS_OP audit entries attributable to a User_Account rather
+        // than account-null (Req 25.1). The default factory ignores it; a
+        // guard-wiring factory passes it as guard.run(pid, cmd, { accountId }).
+        accountId: session.accountId,
         cwd,
         onEvent: session.onEvent,
         commandGuard,
