@@ -21,7 +21,8 @@
  *   (d) a turn-completion indicator frame (turn_done) is emitted at turn end
  *       (Req 4.5);
  *   (e) an over-cap tool_result (content longer than RESULT_PREVIEW_CHARS) is
- *       TRUNCATED with a truncated flag + fullLength (Req 4.6);
+ *       TRUNCATED with a truncated flag + fullLength AND a human-readable
+ *       truncation notice stating output was omitted (Req 4.6);
  *   (f) a BINARY write_file surfaces a 'binary file (N bytes)' indicator rather
  *       than a corrupting text line-diff (the FEAT-002 binary guard, end to end).
  *
@@ -338,6 +339,15 @@ test('an over-cap tool_result is truncated with a truncated flag and fullLength 
     assert.ok(
       result.fullLength > RESULT_PREVIEW_CHARS,
       'fullLength reports the true size beyond the cap',
+    );
+    // Req 4.6: the frame carries a human-readable truncation NOTICE stating
+    // output was omitted, with the shown/total counts (not just the flags).
+    assert.equal(typeof result.notice, 'string', 'over-cap result carries a truncation notice string');
+    assert.ok(/truncat/i.test(result.notice), 'notice states the output was truncated');
+    const omitted = result.fullLength - result.content.length;
+    assert.ok(
+      result.notice.includes(String(result.fullLength)) && result.notice.includes(String(omitted)),
+      'notice reports the omitted character count and the true full length',
     );
   } finally {
     await close();

@@ -30,6 +30,13 @@
  *
  * A normal text write_file / edit_file is untouched: it flows straight through
  * toViewEvent and renders the real diff exactly as before.
+ *
+ * One other additive rule (Req 4.6): toViewEvent clips an over-cap tool_result
+ * to RESULT_PREVIEW_CHARS and sets truncated:true + fullLength, but attaches no
+ * human-readable notice for tool OUTPUT (only diffs get a ready-to-render
+ * notice). This layer composes a `notice` string from the shown/total counts so
+ * the surface can state that output was omitted, leaving the existing
+ * truncated/fullLength/content fields exactly as plumby set them.
  */
 
 import { toViewEvent } from '../engine/plumby.js';
@@ -92,7 +99,23 @@ export function toActivityFrame(event, options = {}) {
     }
   }
 
-  return toViewEvent(event, options);
+  const frame = toViewEvent(event, options);
+
+  // Req 4.6: an over-cap tool_result must be surfaced "with a truncation notice
+  // indicating output was omitted". toViewEvent clips the preview and sets
+  // truncated:true + fullLength, but — unlike the diff paths, which carry a
+  // ready-to-render truncationNotice/tooLargeNotice string — it attaches NO
+  // human-readable notice for tool OUTPUT. So this layer composes one from the
+  // shown/total character counts, additively (truncated/fullLength/content are
+  // left exactly as plumby set them). Non-truncated results are untouched.
+  if (frame && frame.type === 'tool_result' && frame.truncated === true) {
+    const shown = typeof frame.content === 'string' ? frame.content.length : 0;
+    const total = Number.isFinite(frame.fullLength) ? frame.fullLength : shown;
+    const omitted = Math.max(total - shown, 0);
+    frame.notice = `[truncated: ${shown} of ${total} characters shown; ${omitted} omitted]`;
+  }
+
+  return frame;
 }
 
 /**
