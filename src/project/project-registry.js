@@ -125,17 +125,29 @@ export function createProjectRegistry({ layout, now = () => new Date().toISOStri
         }
         if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
           // TOCTOU guard (H2): between deciding this lock is stale and removing
-          // it, another writer may have stolen+re-created it with a FRESH mtime.
-          // Re-stat immediately before rmSync and only steal if the lock still
-          // matches the stale identity we saw (mtimeMs unchanged); otherwise the
-          // lock is now live and must not be deleted out from under its holder.
+          // it, another writer may have stolen+re-created it. Re-stat immediately
+          // before rmSync and only steal if the lock still carries the SAME
+          // identity we sized up. Identity = (mtimeMs AND inode). mtimeMs alone
+          // is insufficient: its resolution is filesystem-dependent (can be ~1s),
+          // so a steal+recreate within the same tick could alias to an identical
+          // mtime and let a live lock be stolen. Pairing it with the directory's
+          // inode (stat.ino) distinguishes a recreated directory even when the
+          // mtime coincides. When BOTH stats lack a meaningful inode (ino falsy —
+          // filesystems without inode semantics), fall back to the mtime-only
+          // comparison rather than making the check stricter than the platform
+          // can support. If either component differs, the lock was re-created and
+          // is now live: do NOT steal — back off and re-attempt the mkdir.
           let confirm;
           try {
             confirm = fs.statSync(lockPath);
           } catch {
             continue; // vanished between decision and re-stat — just re-attempt.
           }
-          if (confirm.mtimeMs !== stat.mtimeMs) {
+          const inodesMeaningful = Boolean(stat.ino) || Boolean(confirm.ino);
+          const identityChanged =
+            confirm.mtimeMs !== stat.mtimeMs ||
+            (inodesMeaningful && confirm.ino !== stat.ino);
+          if (identityChanged) {
             // A different writer re-created the lock; it is no longer the stale
             // one we sized up. Do NOT steal — back off and re-attempt the mkdir.
             busyWait();

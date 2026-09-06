@@ -335,6 +335,22 @@ export function createQuotaManager(args = {}) {
       const perAccountMax = quotaConfig.maxConcurrentSandboxesPerAccount;
       if (typeof perAccountMax === 'number') {
         const accountCurrent = currentConcurrentSandboxesForAccount(accountId);
+        if (accountCurrent === null) {
+          // Fail-open by design (the limit stays a no-op), but a set-but-
+          // unenforced ceiling must be OBSERVABLE: emit a single operational
+          // signal so operators can see the configured per-account limit is not
+          // being attributed (no count seam). Does NOT change the return value.
+          emitOperational({
+            type: AUDIT_EVENTS.OPERATIONAL_ERROR,
+            at: nowMs,
+            kind: 'quota-unattributable',
+            accountId,
+            resource,
+            max: perAccountMax,
+            reason:
+              'per-account concurrent-Sandbox limit configured but usage is unattributable (no count seam)',
+          });
+        }
         if (typeof accountCurrent === 'number' && accountCurrent >= perAccountMax) {
           const message =
             `Resource_Quota exceeded: max concurrent Sandboxes per account ` +

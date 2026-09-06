@@ -257,3 +257,73 @@ test('H2: a lock freshly re-created by another writer (new mtime) is NOT wrongly
 
   cleanup(w);
 });
+
+test('H2 (mtime granularity): a lock re-created within the same tick (SAME mtime, DIFFERENT inode) is NOT stolen', () => {
+  // Coarse filesystem mtime resolution (can be ~1s) means a steal+recreate that
+  // completes inside the same clock tick could alias to an IDENTICAL mtime, so a
+  // mtime-only identity check would treat a live lock as the stale one and steal
+  // it. The identity check therefore ALSO compares the directory inode: even
+  // when mtimeMs coincides, a changed `ino` proves the directory was re-created
+  // and the steal must be refused.
+  //
+  // We drive this at the seam: the FIRST stat returns { mtimeMs: stale, ino: X }
+  // (the stale decision). Every SUBSEQUENT stat returns the SAME stale mtimeMs
+  // but a DIFFERENT inode (Y !== X), simulating a same-tick recreate by another
+  // writer. The registry must detect the inode change and SKIP rmSync.
+  const w = makeWiring();
+  const lock = ownerLockPath(w.layout);
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  fs.mkdirSync(lock, { recursive: true });
+
+  const realStat = fs.statSync;
+  const realRm = fs.rmSync;
+  const staleMtime = Date.now() - 10 * 60_000; // 10 min old => decided stale.
+  let statCalls = 0;
+  let rmOfLock = 0;
+  let removedByTest = false;
+
+  fs.statSync = (p, ...rest) => {
+    if (p === lock) {
+      statCalls += 1;
+      // The mtimeMs is ALWAYS the same stale value (a coarse-mtime, same-tick
+      // recreate), so the mtime component of the identity check never diverges.
+      // The inode, however, changes on EVERY call: within a single steal attempt
+      // the driving stat and the pre-rmSync confirm re-stat see DIFFERENT inodes,
+      // as if a competing writer re-created the directory in the window. The
+      // inode component must therefore refuse every steal. Using a fresh inode
+      // per call keeps every (stat, confirm) pair mismatched.
+      return { mtimeMs: staleMtime, ino: 100 + statCalls };
+    }
+    return realStat(p, ...rest);
+  };
+  fs.rmSync = (p, ...rest) => {
+    if (p === lock) {
+      rmOfLock += 1;
+    }
+    return realRm(p, ...rest);
+  };
+
+  try {
+    assert.throws(
+      () => w.registry.register(projectInput('proj-h2-ino')),
+      /could not acquire registry lock/,
+    );
+  } finally {
+    fs.statSync = realStat;
+    fs.rmSync = realRm;
+    if (fs.existsSync(lock)) {
+      removedByTest = true;
+      realRm(lock, { recursive: true, force: true });
+    }
+  }
+
+  assert.ok(statCalls >= 2, 're-stat before rmSync happened (identity re-check)');
+  assert.equal(
+    rmOfLock,
+    0,
+    'same-mtime-but-different-inode recreate was NOT stolen (inode identity refused the steal)',
+  );
+  assert.ok(removedByTest, 'the live lock survived until the test cleaned it up');
+
+  cleanup(w);
+});
