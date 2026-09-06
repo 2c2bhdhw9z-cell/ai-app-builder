@@ -45,6 +45,26 @@ export { createProjectRegistry } from './project-registry.js';
 
 export { createDevServer } from './dev-server.js';
 
+// The PreviewController (Task 18.1/18.2, Req 3, 15.2-15.3, 16.4-16.5): the
+// first-class, lifecycle-managed Preview surface. It LAYERS ON the Dev_Server
+// seam (createDevServer above) — publish-on-commit web semantics (the served
+// preview always reflects the most-recent successfully-built COMMITTED Snapshot,
+// decision (d) / Property 3), Dev_Server lifecycle (preview-loading, 60s
+// startup-timeout + restart offer, unexpected-exit preservation, restart cap of
+// 3), mobile/Expo preview (connection URL + scannable QR payload within 60s), and
+// the multi-target selector (default web with an explicit indication). It is an
+// OFFLINE SEAM: it launches nothing real and measures every wall-clock bound
+// against an injected clock (see the module header).
+export {
+  createPreviewController,
+  PUBLISH_SLO_MS,
+  STARTUP_TIMEOUT_MS,
+  PREVIEW_AVAILABLE_MS,
+  MOBILE_REACHABLE_MS,
+  RESTART_CAP,
+  DEFAULT_TARGET,
+} from './preview-controller.js';
+
 // The iterative-refinement router (Task 16.1, Req 2.1-2.7): routes a follow-up
 // turn to edit ONLY files within the existing Project via plumby's edit_file
 // exact-string replacement, renders the change as a <=2s diff, and surfaces the
