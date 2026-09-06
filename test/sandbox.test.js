@@ -148,10 +148,16 @@ test('(a) normalizeHost + isForbiddenEgressHost helpers behave', () => {
 test(propertyTag(1, 'Isolation_Boundary invariant'), async () => {
   const layout = createStorageLayout(BASE);
   // A projectId arbitrary that is always a single safe path segment.
+  // Reserved object keys are no longer valid ids (audit L7): the storage layout
+  // rejects '__proto__' / 'constructor' / 'prototype' so they cannot poison a
+  // plain-object index, so the id generator must not emit them either.
+  const RESERVED_ID_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
   const safeSegment = fc
     .string({ minLength: 1, maxLength: 24 })
     .map((s) => s.replace(/[^a-zA-Z0-9._-]/g, ''))
-    .filter((s) => s.length > 0 && s !== '.' && s !== '..' && !s.includes('..'));
+    .filter(
+      (s) => s.length > 0 && s !== '.' && s !== '..' && !s.includes('..') && !RESERVED_ID_KEYS.has(s),
+    );
 
   // An arbitrary endpoint host that may be safe OR a lateral/host target.
   const hostArb = fc.oneof(

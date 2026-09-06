@@ -228,7 +228,17 @@ export function createProjectRegistry({ layout, now = () => new Date().toISOStri
       throw err;
     }
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    // Copy into a NULL-PROTOTYPE map (L7): a projectId of '__proto__' /
+    // 'constructor' / 'prototype' would otherwise index through Object.prototype
+    // (truthy, non-string), turning a client-supplied id into a thrown TypeError
+    // downstream instead of a clean miss, and indexPut('__proto__') would assign
+    // through the inherited setter and drop the entry. A null-proto object plus
+    // Object.hasOwn lookups make those keys behave as ordinary (absent) ids.
+    const index = Object.create(null);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      for (const key of Object.keys(parsed)) index[key] = parsed[key];
+    }
+    return index;
   }
 
   /** Persist the index atomically (temp file + rename). */

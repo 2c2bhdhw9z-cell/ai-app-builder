@@ -103,21 +103,34 @@ class StorageLayout {
    */
   controlProjectRegistryPath(ownerId) {
     requireId('ownerId', ownerId);
-    return path.join(this.controlRoot, REGISTRY_DIR, ownerId, 'projects.json');
+    // L9: prove-by-construction that a control-plane path never lands inside an
+    // exportable project tree, rather than relying on the split holding only
+    // structurally. Self-applying the invariant here makes it impossible for a
+    // control path builder to return an in-tree location undetected.
+    return this.assertOutsideExportTrees(
+      path.join(this.controlRoot, REGISTRY_DIR, ownerId, 'projects.json'),
+      'controlProjectRegistryPath',
+    );
   }
 
   /** ShareLink storage for an owner (control-plane only, Req 26). */
   controlShareLinkPath(ownerId, token) {
     requireId('ownerId', ownerId);
     requireId('token', token);
-    return path.join(this.controlRoot, SHARE_LINKS_DIR, ownerId, `${token}.json`);
+    return this.assertOutsideExportTrees(
+      path.join(this.controlRoot, SHARE_LINKS_DIR, ownerId, `${token}.json`),
+      'controlShareLinkPath',
+    );
   }
 
   /** ConnectorBinding storage for an owner's project (secret NAMES only). */
   controlConnectorBindingPath(ownerId, projectId) {
     requireId('ownerId', ownerId);
     requireId('projectId', projectId);
-    return path.join(this.controlRoot, BINDINGS_DIR, ownerId, `${projectId}.json`);
+    return this.assertOutsideExportTrees(
+      path.join(this.controlRoot, BINDINGS_DIR, ownerId, `${projectId}.json`),
+      'controlConnectorBindingPath',
+    );
   }
 
   /**
@@ -128,12 +141,9 @@ class StorageLayout {
     requireId('ownerId', ownerId);
     requireId('projectId', projectId);
     requireId('secretName', secretName);
-    return path.join(
-      this.controlRoot,
-      SECRETS_DIR,
-      ownerId,
-      projectId,
-      `${secretName}.enc`,
+    return this.assertOutsideExportTrees(
+      path.join(this.controlRoot, SECRETS_DIR, ownerId, projectId, `${secretName}.enc`),
+      'controlSecretPath',
     );
   }
 
@@ -150,7 +160,10 @@ class StorageLayout {
   controlSnapshotRegistryPath(ownerId, projectId) {
     requireId('ownerId', ownerId);
     requireId('projectId', projectId);
-    return path.join(this.controlRoot, SNAPSHOTS_DIR, ownerId, `${projectId}.json`);
+    return this.assertOutsideExportTrees(
+      path.join(this.controlRoot, SNAPSHOTS_DIR, ownerId, `${projectId}.json`),
+      'controlSnapshotRegistryPath',
+    );
   }
 
   // --- INVARIANT HELPERS --------------------------------------------------
@@ -186,12 +199,38 @@ function isInside(root, candidate) {
   return !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
+/** Ids that would poison a plain-object index via the prototype chain (L7). */
+const DANGEROUS_ID_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 function requireId(field, value) {
   if (typeof value !== 'string' || value.trim() === '') {
     throw new TypeError(`storage layout: ${field} must be a non-empty string`);
   }
-  // A path-segment id must not smuggle separators or traversal.
-  if (value.includes('/') || value.includes('\\') || value === '.' || value === '..' || value.includes('..')) {
+  // A NUL byte (L8): passes the separator checks but makes fs throw
+  // ERR_INVALID_ARG_VALUE deep in a store (a leaked 500). Reject it here.
+  if (value.includes('\0')) {
+    throw new TypeError(`storage layout: ${field} must not contain a NUL byte`);
+  }
+  // Prototype-pollution keys (L7): a projectId of '__proto__' etc. would index
+  // through Object.prototype in a plain-object map (truthy, non-string), so a
+  // client-supplied id turned into a thrown TypeError / dropped write instead of
+  // a clean miss. Reject them as ids outright.
+  if (DANGEROUS_ID_KEYS.has(value)) {
+    throw new TypeError(`storage layout: ${field} must not be a reserved object key, got ${JSON.stringify(value)}`);
+  }
+  // A path-segment id must not smuggle separators or traversal. We reject a
+  // literal '.'/'..' segment and any actual traversal component, but do NOT
+  // reject a harmless '..' SUBSTRING inside a normal name like 'my..app' (L8):
+  // split on the path separators and check for a '..' component instead.
+  if (value.includes('/') || value.includes('\\')) {
     throw new TypeError(`storage layout: ${field} must be a single safe path segment, got ${JSON.stringify(value)}`);
+  }
+  if (value === '.' || value === '..') {
+    throw new TypeError(`storage layout: ${field} must be a single safe path segment, got ${JSON.stringify(value)}`);
+  }
+  // Windows drive/reserved token (L8): 'C:' would not stay under the root on
+  // win32. Reject a colon anywhere (never valid in our ids).
+  if (value.includes(':')) {
+    throw new TypeError(`storage layout: ${field} must not contain a drive/colon token, got ${JSON.stringify(value)}`);
   }
 }

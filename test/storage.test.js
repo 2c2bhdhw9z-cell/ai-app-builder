@@ -103,3 +103,36 @@ test('id path-segment validation rejects traversal and separators', () => {
   assert.throws(() => layout.controlSecretPath(OWNER, PROJECT, '../../etc/passwd'), /single safe path segment/);
   assert.throws(() => layout.controlSecretPath('', PROJECT, 'X'), /non-empty string/);
 });
+
+test('L7: prototype-pollution keys are rejected as ids', () => {
+  const layout = createStorageLayout(BASE);
+  for (const bad of ['__proto__', 'constructor', 'prototype']) {
+    assert.throws(() => layout.exportableProjectTree(bad), /reserved object key/, `${bad} rejected`);
+  }
+});
+
+test('L8: a NUL byte and a Windows drive/colon token are rejected; a harmless ".." substring is allowed', () => {
+  const layout = createStorageLayout(BASE);
+  // NUL byte: passed the separator checks pre-fix, then made fs throw deep.
+  assert.throws(() => layout.exportableProjectTree('a\u0000b'), /NUL byte/);
+  // Windows drive token.
+  assert.throws(() => layout.exportableProjectTree('C:'), /drive\/colon token/);
+  // A harmless '..' SUBSTRING inside a normal name is NOT a traversal and must
+  // be accepted (pre-fix it was over-rejected).
+  assert.doesNotThrow(() => layout.exportableProjectTree('my..app'));
+  const p = layout.exportableProjectTree('my..app');
+  assert.ok(p.endsWith(`${path.sep}my..app`), 'the id is used verbatim as one segment');
+  // A literal '..' segment is still rejected.
+  assert.throws(() => layout.exportableProjectTree('..'), /single safe path segment/);
+});
+
+test('L9: every control path builder self-applies the out-of-tree invariant', () => {
+  const layout = createStorageLayout(BASE);
+  // All control-plane builders resolve OUTSIDE every exportable project tree by
+  // construction (they call assertOutsideExportTrees internally now).
+  assert.equal(layout.isInsideExportTree(layout.controlProjectRegistryPath(OWNER)), false);
+  assert.equal(layout.isInsideExportTree(layout.controlShareLinkPath(OWNER, 'tok')), false);
+  assert.equal(layout.isInsideExportTree(layout.controlConnectorBindingPath(OWNER, PROJECT)), false);
+  assert.equal(layout.isInsideExportTree(layout.controlSecretPath(OWNER, PROJECT, 'API_KEY')), false);
+  assert.equal(layout.isInsideExportTree(layout.controlSnapshotRegistryPath(OWNER, PROJECT)), false);
+});
