@@ -51,6 +51,7 @@ export function createAuthService(opts = {}) {
   const sessions = createSessionManager({
     signingKey,
     ttlMs: opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS,
+    maxLifetimeMs: opts.sessionMaxLifetimeMs,
     now,
     auditSink: audit,
   });
@@ -113,9 +114,18 @@ export function createAuthService(opts = {}) {
       return sessions.rotate(token);
     },
 
-    /** Revoke a session by id (logout). */
-    revokeSession(sessionId) {
-      sessions.revoke(sessionId);
+    /**
+     * Revoke a session by id (logout). When `accountId` is supplied it is an
+     * ownership check — a session is only revoked if it belongs to that account
+     * (audit H18). Returns true if a session was revoked.
+     */
+    revokeSession(sessionId, accountId) {
+      return sessions.revoke(sessionId, accountId);
+    },
+
+    /** Reap expired server-side sessions (audit H18). Returns the count. */
+    reapExpiredSessions() {
+      return sessions.reapExpired();
     },
 
     /** The single owner-or-grant authorization check (Req 7.3, 7.4). */

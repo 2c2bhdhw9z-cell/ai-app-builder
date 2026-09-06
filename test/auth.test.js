@@ -400,6 +400,77 @@ test('(e) session issuance and rotation are audited as security events', async (
   assert.ok(audit.ofType(AUDIT_EVENTS.AUTHZ_DECISION).length >= 1);
 });
 
+// --- (H18) session lifetime cap, reuse detection, revoke ownership, reaping --
+
+test('(H18) rotation cannot extend a session past its absolute lifetime cap', () => {
+  const clock = fakeClock();
+  // ttl 1000ms (rolling), but absolute cap 5000ms from issue.
+  const mgr = createSessionManager({
+    signingKey: 'k', ttlMs: 1000, maxLifetimeMs: 5000, now: clock.now,
+  });
+  let s = mgr.issue({ id: 'u1' });
+
+  // Rotate every 900ms; pre-fix the rolling ttl let this verify forever.
+  for (let i = 0; i < 4; i += 1) {
+    clock.advance(900);
+    s = mgr.rotate(s.token); // still within the 5000ms cap
+    assert.equal(mgr.verify(s.token).accountId, 'u1');
+  }
+
+  // Advance past the absolute cap (issued at 0, cap at 5000; now ~3600 + 1500).
+  clock.advance(1500); // total ~5100ms
+  assert.throws(() => mgr.verify(s.token), /invalid session/, 'a token past the absolute cap is rejected');
+  assert.throws(() => mgr.rotate(s.token), /invalid session/, 'rotation past the cap is refused');
+});
+
+test('(H18) a replayed STALE-rotation token kills the whole session family', () => {
+  const clock = fakeClock();
+  const audit = createCollectorSink();
+  const mgr = createSessionManager({ signingKey: 'k', ttlMs: 100000, now: clock.now, auditSink: audit });
+  const s0 = mgr.issue({ id: 'u1' });
+  const s1 = mgr.rotate(s0.token); // s0 is now stale (rot 0 < current 1)
+
+  // The current token verifies.
+  assert.equal(mgr.verify(s1.token).accountId, 'u1');
+
+  // Presenting the STALE token (valid signature, rot < current) is reuse: it
+  // must kill the family and emit a high-severity event — NOT merely reject.
+  assert.throws(() => mgr.verify(s0.token), /invalid session/);
+  const reuse = audit.ofType(AUDIT_EVENTS.SESSION_REUSE_DETECTED);
+  assert.equal(reuse.length, 1, 'reuse is detected and audited');
+  assert.equal(reuse[0].severity, 'high');
+
+  // The newest token is now dead too (the family was revoked).
+  assert.throws(() => mgr.verify(s1.token), /invalid session/, 'the live token is killed after reuse');
+});
+
+test('(H18) revoke enforces ownership and audits SESSION_REVOKED', () => {
+  const clock = fakeClock();
+  const audit = createCollectorSink();
+  const mgr = createSessionManager({ signingKey: 'k', now: clock.now, auditSink: audit });
+  const s = mgr.issue({ id: 'u1' });
+
+  // A different account cannot revoke this session.
+  assert.equal(mgr.revoke(s.sessionId, 'attacker'), false, 'ownership mismatch refuses revoke');
+  assert.equal(mgr.verify(s.token).accountId, 'u1', 'the session survives a foreign revoke attempt');
+
+  // The owner can, and it is audited.
+  assert.equal(mgr.revoke(s.sessionId, 'u1'), true);
+  assert.equal(audit.ofType(AUDIT_EVENTS.SESSION_REVOKED).length, 1);
+  assert.throws(() => mgr.verify(s.token), /invalid session/);
+});
+
+test('(H18) reapExpired removes sessions past their absolute lifetime', () => {
+  const clock = fakeClock();
+  const mgr = createSessionManager({ signingKey: 'k', ttlMs: 1000, maxLifetimeMs: 2000, now: clock.now });
+  mgr.issue({ id: 'u1' });
+  mgr.issue({ id: 'u2' });
+  assert.equal(mgr.reapExpired(), 0, 'nothing to reap yet');
+  clock.advance(3000); // both past the 2000ms cap
+  assert.equal(mgr.reapExpired(), 2, 'both expired sessions are reaped');
+  assert.equal(mgr.reapExpired(), 0, 'idempotent after reaping');
+});
+
 // --- (f) no password stored on User_Account ----------------------------------
 
 test('(f) the platform stores no password field; only authIdentity is recorded', async () => {

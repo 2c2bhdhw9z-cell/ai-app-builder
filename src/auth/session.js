@@ -25,6 +25,16 @@ import { AUDIT_EVENTS, toAuditSink } from './audit.js';
 /** Documented session lifetime — ~24 hours. */
 export const DEFAULT_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Absolute session lifetime cap (audit H18). A rolling ttl that resets on every
+ * rotate() lets a stolen token be renewed forever, so the documented ~24h
+ * lifetime was never actually enforced. We carry an immutable session start and
+ * refuse to rotate/decode past `sessionStart + MAX_SESSION_LIFETIME`. Default
+ * 24h so a session's total life equals the documented lifetime regardless of how
+ * often it rotates; overridable for tests.
+ */
+export const MAX_SESSION_LIFETIME_MS = 24 * 60 * 60 * 1000;
+
 /** Base64url encode a Buffer/string with no padding. */
 function b64url(input) {
   return Buffer.from(input).toString('base64url');
@@ -60,21 +70,32 @@ export function createSessionManager(opts = {}) {
     throw new TypeError('createSessionManager: signingKey must be a non-empty string or Buffer');
   }
   const ttlMs = opts.ttlMs ?? DEFAULT_SESSION_TTL_MS;
+  const maxLifetimeMs = opts.maxLifetimeMs ?? MAX_SESSION_LIFETIME_MS;
   const now = typeof opts.now === 'function' ? opts.now : () => Date.now();
   const audit = toAuditSink(opts.auditSink);
 
-  // Server-side session table: sessionId -> { accountId, rotation }. Only the
-  // CURRENT rotation for a session is valid; any prior token is invalidated.
+  // Server-side session table: sessionId -> { accountId, rotation, sessionStart,
+  // absExp }. Only the CURRENT rotation for a session is valid; any prior token
+  // is invalidated. sessionStart/absExp are immutable across rotations and cap
+  // the session's total lifetime (audit H18).
   const sessions = new Map();
 
-  /** Build + sign a token for (sessionId, accountId, rotation) at time `iat`. */
-  function mint(sessionId, accountId, rotation, iat) {
+  /**
+   * Build + sign a token for (sessionId, accountId, rotation) at time `iat`.
+   * `sessionStart`/`absExp` are the session's IMMUTABLE start and absolute
+   * expiry, carried in the payload so a decode can enforce the cap even if the
+   * server-side entry is gone. The per-token `exp` is min(iat+ttl, absExp) so a
+   * rotation near the cap cannot extend life past it.
+   */
+  function mint(sessionId, accountId, rotation, iat, sessionStart, absExp) {
     const payload = {
       sid: sessionId,
       accountId,
       rot: rotation,
       iat,
-      exp: iat + ttlMs,
+      exp: Math.min(iat + ttlMs, absExp),
+      sst: sessionStart,
+      aexp: absExp,
     };
     const payloadB64 = b64url(JSON.stringify(payload));
     const sig = sign(signingKey, payloadB64);
@@ -93,8 +114,10 @@ export function createSessionManager(opts = {}) {
       const iat = now();
       const sessionId = crypto.randomUUID();
       const rotation = 0;
-      sessions.set(sessionId, { accountId, rotation });
-      const { token, payload } = mint(sessionId, accountId, rotation, iat);
+      const sessionStart = iat;
+      const absExp = sessionStart + maxLifetimeMs;
+      sessions.set(sessionId, { accountId, rotation, sessionStart, absExp });
+      const { token, payload } = mint(sessionId, accountId, rotation, iat, sessionStart, absExp);
       audit({ type: AUDIT_EVENTS.SESSION_ISSUED, at: iat, accountId, sessionId });
       return {
         token,
@@ -152,9 +175,52 @@ export function createSessionManager(opts = {}) {
         fail('bad-payload');
       }
       const current = sessions.get(payload.sid);
+      // REUSE DETECTION (audit H18): a token with a VALID signature but a STALE
+      // rotation (rot < current) is the canonical signal that a token was
+      // copied — the legitimate client already rotated past it. Do not merely
+      // reject the stale token and leave the newest one alive (whoever holds it
+      // may be the attacker): kill the WHOLE session family and emit a
+      // high-severity event so the theft is actioned, not just observed.
+      if (
+        current &&
+        current.accountId === payload.accountId &&
+        typeof payload.rot === 'number' &&
+        payload.rot < current.rotation
+      ) {
+        sessions.delete(payload.sid);
+        audit({
+          type: AUDIT_EVENTS.SESSION_REUSE_DETECTED,
+          at: now(),
+          severity: 'high',
+          accountId: payload.accountId,
+          sessionId: payload.sid,
+          presentedRotation: payload.rot,
+          currentRotation: current.rotation,
+        });
+        throw new Error('invalid session');
+      }
       if (!current || current.rotation !== payload.rot || current.accountId !== payload.accountId) {
         // Rotated-out (stale) token, unknown session, or account mismatch.
         fail('rotated-or-unknown', { sessionId: payload.sid });
+      }
+      // ABSOLUTE LIFETIME CAP (audit H18): refuse any token past the session's
+      // immutable absolute expiry, regardless of how many times it rotated. Use
+      // both the payload's aexp and the server entry's absExp (defense in depth);
+      // the more restrictive wins.
+      const absExp = Math.min(
+        typeof payload.aexp === 'number' ? payload.aexp : Infinity,
+        current && typeof current.absExp === 'number' ? current.absExp : Infinity,
+      );
+      if (now() >= absExp) {
+        sessions.delete(payload.sid);
+        audit({
+          type: AUDIT_EVENTS.SESSION_EXPIRED,
+          at: now(),
+          accountId: payload.accountId,
+          sessionId: payload.sid,
+          reason: 'absolute-lifetime',
+        });
+        throw new Error('invalid session');
       }
       if (now() >= payload.exp) {
         audit({
@@ -171,6 +237,8 @@ export function createSessionManager(opts = {}) {
         rotation: payload.rot,
         issuedAt: payload.iat,
         expiresAt: payload.exp,
+        sessionStart: payload.sst,
+        absoluteExpiresAt: absExp,
       };
     },
 
@@ -180,12 +248,18 @@ export function createSessionManager(opts = {}) {
      * Session. The old token will no longer verify.
      */
     rotate(token) {
+      // decode() enforces the absolute cap and reuse detection, so a session
+      // past its lifetime (or a replayed stale token) can never be rotated.
       const claims = this.decode(token);
       const entry = sessions.get(claims.sessionId);
       const rotation = entry.rotation + 1;
       const iat = now();
-      sessions.set(claims.sessionId, { accountId: claims.accountId, rotation });
-      const { token: newToken, payload } = mint(claims.sessionId, claims.accountId, rotation, iat);
+      // The session start and absolute expiry are IMMUTABLE across rotations —
+      // this is what makes the ~24h lifetime actually bounded (audit H18).
+      const sessionStart = entry.sessionStart;
+      const absExp = entry.absExp;
+      sessions.set(claims.sessionId, { accountId: claims.accountId, rotation, sessionStart, absExp });
+      const { token: newToken, payload } = mint(claims.sessionId, claims.accountId, rotation, iat, sessionStart, absExp);
       audit({
         type: AUDIT_EVENTS.SESSION_ROTATED,
         at: iat,
@@ -202,9 +276,52 @@ export function createSessionManager(opts = {}) {
       };
     },
 
-    /** Explicitly revoke a session (e.g. logout). Idempotent. */
-    revoke(sessionId) {
+    /**
+     * Explicitly revoke a session (e.g. logout). Idempotent. When `accountId` is
+     * supplied it is an OWNERSHIP check: a session is only revoked if it belongs
+     * to that account (audit H18), so one account cannot revoke another's
+     * session. Emits a SESSION_REVOKED audit event when a session was actually
+     * removed. Returns true if a session was revoked, false otherwise.
+     */
+    revoke(sessionId, accountId) {
+      const entry = sessions.get(sessionId);
+      if (!entry) return false;
+      if (accountId !== undefined && entry.accountId !== accountId) {
+        // Ownership mismatch: refuse to revoke another account's session.
+        audit({
+          type: AUDIT_EVENTS.SESSION_REJECTED,
+          at: now(),
+          reason: 'revoke-ownership-mismatch',
+          sessionId,
+        });
+        return false;
+      }
       sessions.delete(sessionId);
+      audit({
+        type: AUDIT_EVENTS.SESSION_REVOKED,
+        at: now(),
+        accountId: entry.accountId,
+        sessionId,
+      });
+      return true;
+    },
+
+    /**
+     * Reap expired sessions from the server-side table (audit H18: the map was
+     * never cleaned, so expired sessions accumulated for the process lifetime).
+     * Removes any session past its absolute expiry. Returns the count reaped.
+     * Safe to call on a timer or opportunistically.
+     */
+    reapExpired() {
+      const t = now();
+      let reaped = 0;
+      for (const [sid, entry] of sessions) {
+        if (typeof entry.absExp === 'number' && t >= entry.absExp) {
+          sessions.delete(sid);
+          reaped += 1;
+        }
+      }
+      return reaped;
     },
   };
 }
