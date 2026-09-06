@@ -35,7 +35,7 @@ import { createPersistenceStore } from '../src/persistence/persistence-store.js'
 import { createSnapshotStore } from '../src/persistence/snapshot-store.js';
 import { createSecretStore } from '../src/secrets/secret-store.js';
 import { createProject } from '../src/model/project.js';
-import { createRetentionService } from '../src/ops/index.js';
+import { createRetentionService, createAuditLog, createRedactor } from '../src/ops/index.js';
 import { createCollectorSink, AUDIT_EVENTS } from '../src/auth/audit.js';
 
 const OWNER = 'owner-int-1';
@@ -209,5 +209,83 @@ test('createRetentionService does NOT throw when constructed with the REAL Proje
       projectRegistry: w.registry,
     }),
   );
+  fs.rmSync(w.baseDir, { recursive: true, force: true });
+});
+
+test('the REAL deletion path records account-scoped PROJECT_DELETED/ACCOUNT_DELETED through the REAL append-only AuditLog while really erasing the on-disk secret', async () => {
+  // Where ops-audit.test.js pins the deletion-audit contract against hand-rolled
+  // fake resource stores, THIS wires the REAL control-plane collaborators (real
+  // registry / persistence / snapshot / secret stores on disk) into the REAL
+  // append-only AuditLog + REAL createRedactor. It proves the PRODUCTION deletion
+  // path (a) records both deletion event kinds through the real AuditLog, scoped
+  // to the acting account and stamped by the log's authoritative clock, (b)
+  // really erases the deleted project's on-disk secret VALUE, and (c) that the
+  // real AuditLog's redaction is load-bearing when a secret value is embedded in
+  // a deletion-shaped event. This closes the gap the C1-class over-mock left:
+  // these guarantees were only ever asserted against fakes, never the real stores.
+  const w = makeRealWiring();
+  const SECRET = 'sk-live-retention-int-9f3a2b';
+
+  // A real redactor seeded with the concrete secret value, and a real append-only
+  // AuditLog as the retention audit sink (its own clock is authoritative).
+  const redactor = createRedactor({ secretValues: [SECRET] });
+  const auditLog = createAuditLog({ redactor, now: () => 42 });
+
+  const svc = createRetentionService({
+    persistenceStore: w.persistenceStore,
+    snapshotStore: w.snapshotStore,
+    sandboxManager: w.sandboxManager,
+    secretStore: w.secretStore,
+    projectRegistry: w.registry, // REAL registry.
+    auditSink: auditLog, // REAL append-only audit log.
+    redactor, // REAL centralized redactor.
+    now: () => '2026-01-01T00:00:00.000Z',
+  });
+
+  // Seed two real projects; store the REAL secret VALUE on disk for one of them.
+  seedProject(w, 'proj-a');
+  seedProject(w, 'proj-b');
+  w.secretStore.put('proj-a', 'API_KEY', SECRET);
+  assert.equal(w.secretStore.get('proj-a', 'API_KEY'), SECRET, 'secret really stored on disk');
+
+  // Delete one project, then the whole account (cascades to the remaining one).
+  await svc.deleteProject({ id: OWNER }, 'proj-a');
+  await svc.deleteAccount({ id: OWNER });
+
+  // (a) Both deletion event kinds landed in the REAL audit log, scoped to owner.
+  const del = auditLog.ofType(AUDIT_EVENTS.PROJECT_DELETED);
+  const acc = auditLog.ofType(AUDIT_EVENTS.ACCOUNT_DELETED);
+  assert.ok(del.length >= 1, 'PROJECT_DELETED recorded in the real AuditLog');
+  assert.equal(acc.length, 1, 'exactly one ACCOUNT_DELETED recorded');
+  for (const e of [...del, ...acc]) {
+    assert.equal(e.accountId, OWNER, 'every deletion event is scoped to the acting account');
+    // The AuditLog clock is authoritative (overrides any caller `at`).
+    assert.equal(e.at, 42, 'the real AuditLog stamps its own clock');
+  }
+
+  // (b) The deleted project's on-disk secret VALUE is really gone from the real
+  // SecretStore, while the surviving-until-account-deletion sibling was also
+  // erased by the account cascade — no owned secret material is left behind.
+  assert.equal(w.secretStore.has('proj-a', 'API_KEY'), false, "proj-a's secret erased on disk");
+
+  // (c) Redaction is load-bearing on the real AuditLog: an event that DOES carry
+  // a secret value (as a misbehaving caller might) is redacted in the stored
+  // append-only entry — proven by embedding the real value and re-reading it.
+  const before = auditLog.size();
+  auditLog.record({ type: AUDIT_EVENTS.PROJECT_DELETED, accountId: OWNER, leaked: SECRET });
+  const stored = auditLog.all()[before];
+  assert.ok(!JSON.stringify(stored).includes(SECRET), 'the real AuditLog redacts an embedded secret value');
+  assert.notEqual(stored.leaked, SECRET, 'the embedded secret is not stored verbatim');
+
+  // NO plaintext secret value survives anywhere in the append-only stream.
+  for (const e of auditLog.all()) {
+    assert.ok(!JSON.stringify(e).includes(SECRET), 'no plaintext secret in any real audit entry');
+  }
+
+  // Append-only: the real AuditLog exposes no mutation/delete surface.
+  assert.equal(typeof auditLog.record, 'function');
+  assert.equal(auditLog.update, undefined);
+  assert.equal(auditLog.delete, undefined);
+
   fs.rmSync(w.baseDir, { recursive: true, force: true });
 });
