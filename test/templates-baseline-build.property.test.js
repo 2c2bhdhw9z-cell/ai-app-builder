@@ -15,7 +15,11 @@
  * THE PROPERTY: for ALL Templates (EVERY Target_Category) and a bounded
  * generator of Project inputs, instantiating the Template into a hermetic dir
  * and running plumby's real verify yields `verdict: PASS` before any
- * refinement. Every Target_Category is exercised at >=100 iterations: this file
+ * refinement. Each iteration threads its generated input INTO the materialized
+ * tree (a per-Project manifest `name`/`description`), so the >=100 runs verify
+ * genuinely DISTINCT trees rather than re-verifying one fixed fixture — while
+ * the baseline `scripts.test` is left untouched so verify stays PASS. Every
+ * Target_Category is exercised at >=100 iterations: this file
  * runs an OUTER loop over the closed Target_Category enum, and for each category
  * runs fc.assert(..., fcConfig) with fcConfig.numRuns=100 — so each of the four
  * Templates gets >=100 iterations (>=400 verify runs total per suite run).
@@ -67,7 +71,7 @@ import { fcConfig, propertyTag } from './support/fc.js';
 import { runCase, DEFAULT_EVAL_MAX_ITERATIONS } from '../eval/runner.js';
 import { createScriptedProvider, verifyTool } from '../src/engine/plumby.js';
 import { createTemplateProvider } from '../src/project/templates.js';
-import { Target_Category } from '../src/model/enums.js';
+import { Target, Target_Category } from '../src/model/enums.js';
 
 /**
  * A bounded generator for the create inputs of a `template` Project. The
@@ -83,6 +87,43 @@ function templateCreateArb() {
       .filter((s) => s.trim().length > 0),
     description: fc.string({ minLength: 0, maxLength: 24 }),
   });
+}
+
+/**
+ * Derive a valid npm package name from a generated Project id. npm names must be
+ * lowercase, may not start with a dot/underscore, and allow only a restricted
+ * charset; the generator's alphabet is already `[a-p0-9-]`, so we only need to
+ * strip leading/trailing/collapsed hyphens and guarantee a non-empty result.
+ * This keeps the per-iteration name a LEGAL manifest name so `plumby verify`
+ * (which parses package.json) stays green.
+ */
+function packageNameFromId(id) {
+  const cleaned = String(id)
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return cleaned.length > 0 ? `app-${cleaned}` : 'app';
+}
+
+/**
+ * Thread the generated Project input INTO the real Template tree so each
+ * iteration materializes a genuinely DISTINCT tree (addresses review issue #2:
+ * the id/description must actually vary the materialized tree, not just the
+ * temp-dir suffix). We rewrite ONLY the manifest `name` (a per-Project value)
+ * on a fresh shallow copy of the tree — the baseline `scripts.test` and the
+ * scaffolded source are unchanged, so `plumby verify` still yields
+ * `verdict: PASS`. Returns { tree, name } where `name` is the applied manifest
+ * name (so the caller can assert the variation actually landed).
+ */
+function applyInputToTree(tree, input) {
+  const name = packageNameFromId(input.id);
+  const pkg = JSON.parse(tree['package.json']);
+  pkg.name = name;
+  // Carry the short description onto the manifest too, so BOTH generated fields
+  // affect the materialized bytes rather than being ignored.
+  if (input.description.length > 0) pkg.description = input.description;
+  return { tree: { ...tree, 'package.json': `${JSON.stringify(pkg, null, 2)}\n` }, name };
 }
 
 /**
@@ -137,8 +178,16 @@ for (const category of Target_Category) {
         // Resolve the REAL Template tree for the category under test. This is
         // the exact { relPath: contents } map the 'template' Project_Origin
         // would seed the Project with — including its dependency manifest.
-        const tree = provider.forCategory(category);
-        assert.equal(typeof tree['package.json'], 'string', 'Template ships a dependency manifest');
+        const base = provider.forCategory(category);
+        assert.equal(typeof base['package.json'], 'string', 'Template ships a dependency manifest');
+
+        // Thread the generated Project input into the tree so THIS iteration
+        // materializes a genuinely distinct tree (a per-Project manifest name +
+        // description), not the same fixture repeated. The baseline scripts.test
+        // is untouched, so plumby verify must still PASS.
+        const { tree, name } = applyInputToTree(base, input);
+        assert.notEqual(name.length, 0, 'derived manifest name must be non-empty');
+        assert.equal(JSON.parse(tree['package.json']).name, name, 'input varied the materialized manifest');
 
         // Run it through the hermetic toolchain harness: setup materializes ONLY
         // the real Template tree into the isolated temp dir, the real agent loop
@@ -229,4 +278,21 @@ test('Property 7 mutation sensitivity: a broken baseline scripts.test flips plum
 // A tiny guard so the exact enum the property ranges over cannot silently drift.
 test('Property 7 support: the closed Target_Category enum is exactly the four Templates', () => {
   assert.deepEqual([...Target_Category], ['web', 'full-stack-web', 'mobile', 'multi-target']);
+});
+
+// Cheap in-scope guard (addresses review issue #4): the single-shape
+// templateTargets entries are hardcoded literals, not derived from the Target
+// enum, so a Target rename could silently desync them. Assert every category's
+// templateTargets are a SUBSET of the closed Target enum — a rename then trips
+// this immediately instead of shipping a desynced map.
+test('Property 7 support: every templateTargets entry is a subset of the closed Target enum', () => {
+  const provider = createTemplateProvider();
+  const targetSet = new Set(Target);
+  for (const category of Target_Category) {
+    const targets = provider.templateTargets(category);
+    assert.ok(targets.length > 0, `${category} scaffolds at least one Target`);
+    for (const t of targets) {
+      assert.ok(targetSet.has(t), `${category} target ${JSON.stringify(t)} is a valid Target`);
+    }
+  }
 });
