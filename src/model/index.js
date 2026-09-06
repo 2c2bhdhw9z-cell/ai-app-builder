@@ -9,7 +9,8 @@
  *
  * The 14 models: User_Account, Authorization, Project, Target, Snapshot,
  * Connector, ConnectorBinding, Secret, Skill, MemoryEntry, MemoryStoreMeta,
- * DeploymentArtifact, ShareLink, VerifyResult.
+ * DeploymentArtifact, ShareLink, VerifyResult. Plus Database_Service (Req 9.2)
+ * — the per-Project database record for full-stack Projects.
  */
 
 // Closed enums + predicates.
@@ -62,3 +63,12 @@ export {
   VERIFY_VERDICTS,
   SHARE_LINK_ACCESS,
 } from './deployment.js';
+
+// Database_Service (Req 9.2, 9.3, 9.4, 9.5) — the per-Project database record
+// for full-stack (`full-stack-web` / `multi-target`) Projects.
+export {
+  createDatabaseService,
+  isValidDatabaseServiceStatus,
+  DATABASE_SERVICE_STATUS,
+  DATABASE_SERVICE_ENGINES,
+} from './database-service.js';

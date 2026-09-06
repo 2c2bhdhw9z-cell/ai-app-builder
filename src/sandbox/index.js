@@ -14,6 +14,13 @@ export { createSandboxManager } from './sandbox-manager.js';
 export { createPackageManager, DEFAULT_INSTALL_TIMEOUT_MS } from './package-manager.js';
 
 export {
+  createDatabaseProvisioner,
+  createBackendScaffolder,
+  guardBackendSecrets,
+  DEFAULT_DB_PROVISION_TIMEOUT_MS,
+} from './database-service.js';
+
+export {
   createCommandGuard,
   truncateStream,
   DEFAULT_TRUNCATE_LIMIT_BYTES,
