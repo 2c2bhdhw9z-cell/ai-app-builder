@@ -23,3 +23,36 @@ export { createProjectOrigin, TEMPLATE_POPULATE_SLO_MS } from './project-origins
 export { createProjectRegistry } from './project-registry.js';
 
 export { createDevServer } from './dev-server.js';
+
+// The REAL Template library (Task 15.1) + the baseline-build/instantiation SLO
+// check. `createTemplateProvider` is the production `templateProvider` the
+// Task-14 'template' Project_Origin consumes via `forCategory`.
+export {
+  createTemplateProvider,
+  instantiateTemplate,
+  BASELINE_BUILD_SLO_MS,
+} from './templates.js';
+
+import { createProjectOrigin as createProjectOriginImpl } from './project-origins.js';
+import { createTemplateProvider as createTemplateProviderImpl } from './templates.js';
+
+/**
+ * Production assembly of the ProjectOrigin with the REAL Template provider wired
+ * in, so a 'template' Project_Origin instantiates the real Task-15 Templates.
+ *
+ * This is strictly ADDITIVE: it does NOT change the DI shape of
+ * createProjectOrigin (it just supplies the real `templateProvider` when a
+ * caller does not inject their own). The Task-14 tests inject their own fixture
+ * provider through createProjectOrigin directly, so they are unaffected. A
+ * production caller composes the ProjectOrigin here to get the real Template set.
+ *
+ * @param {object} [args] the same args createProjectOrigin accepts. Any explicit
+ *        `templateProvider` wins; otherwise the real createTemplateProvider() is used.
+ * @returns {object} a frozen ProjectOrigin wired with the real Template provider
+ */
+export function createProjectOriginWithTemplates(args = {}) {
+  return createProjectOriginImpl({
+    ...args,
+    templateProvider: args.templateProvider ?? createTemplateProviderImpl(),
+  });
+}
