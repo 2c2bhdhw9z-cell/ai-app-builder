@@ -124,11 +124,31 @@ export function createProjectRegistry({ layout, now = () => new Date().toISOStri
           continue; // lock vanished between mkdir and stat — retry immediately.
         }
         if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+          // TOCTOU guard (H2): between deciding this lock is stale and removing
+          // it, another writer may have stolen+re-created it with a FRESH mtime.
+          // Re-stat immediately before rmSync and only steal if the lock still
+          // matches the stale identity we saw (mtimeMs unchanged); otherwise the
+          // lock is now live and must not be deleted out from under its holder.
+          let confirm;
+          try {
+            confirm = fs.statSync(lockPath);
+          } catch {
+            continue; // vanished between decision and re-stat — just re-attempt.
+          }
+          if (confirm.mtimeMs !== stat.mtimeMs) {
+            // A different writer re-created the lock; it is no longer the stale
+            // one we sized up. Do NOT steal — back off and re-attempt the mkdir.
+            busyWait();
+            continue;
+          }
           try {
             fs.rmSync(lockPath, { recursive: true, force: true });
           } catch {
             /* another writer won the steal — retry */
           }
+          // Loop back to re-attempt the atomic mkdirSync: only the writer whose
+          // mkdir wins actually holds the lock, so two concurrent stealers can
+          // never both proceed.
           continue;
         }
         // Brief synchronous spin-wait (no timers; keeps the read-modify-write
