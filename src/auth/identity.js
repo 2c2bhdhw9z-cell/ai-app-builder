@@ -15,6 +15,11 @@
  *
  * Accounts are looked up/created by authIdentity via an injectable account
  * store (default: in-memory). No password field is ever set on the account.
+ *
+ * The account store contract is ASYNC (audit H17): findByAuthIdentity and save
+ * may return a value OR a Promise, and authenticate() awaits both. A real
+ * persistence layer returns Promises; the in-memory default returns
+ * synchronously (await of a non-Promise is a no-op).
  */
 
 import crypto from 'node:crypto';
@@ -46,10 +51,10 @@ export function toAuthIdentity(claims) {
 export function createInMemoryAccountStore() {
   const byIdentity = new Map();
   return {
-    findByAuthIdentity(authIdentity) {
+    async findByAuthIdentity(authIdentity) {
       return byIdentity.get(authIdentity) ?? null;
     },
-    save(account) {
+    async save(account) {
       byIdentity.set(account.authIdentity, account);
       return account;
     },
@@ -112,14 +117,27 @@ export function createIdentityManager(opts = {}) {
 
     // Look up an existing account for this delegated identity, or create one.
     // NOTE: only authIdentity is recorded; there is NO password field, ever.
-    let account = accountStore.findByAuthIdentity(authIdentity);
+    //
+    // The account store contract is ASYNC (audit H17): a real persistence layer
+    // returns a Promise, and a pending Promise is truthy, so `!account` would be
+    // false and NO account would be created — the caller would then receive a
+    // Promise where a User_Account is required and scopeSession would throw.
+    // Await both calls, and verify the record we got back actually matches the
+    // identity we looked up (a mis-implemented store must not silently bind the
+    // wrong account).
+    let account = await accountStore.findByAuthIdentity(authIdentity);
     if (!account) {
       account = createUserAccount({
         id: crypto.randomUUID(),
         authIdentity,
         createdAt: new Date(now()).toISOString(),
       });
-      accountStore.save(account);
+      account = (await accountStore.save(account)) ?? account;
+    }
+    if (!account || typeof account !== 'object' || account.authIdentity !== authIdentity) {
+      // The store returned nothing usable, or a record for a DIFFERENT identity.
+      // Fail closed rather than binding a session to a mismatched account.
+      return { denied: true, reason: 'account-store-error' };
     }
     return { account };
   }

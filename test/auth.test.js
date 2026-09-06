@@ -421,6 +421,69 @@ test('(f) re-authenticating the same identity returns the same account (no new s
   assert.equal(first.account.authIdentity, second.account.authIdentity);
 });
 
+// --- (H17) the account store seam is treated as ASYNC ------------------------
+
+/**
+ * An account store whose methods return PROMISES, like a real persistence
+ * layer. Pre-fix, identity.authenticate did not await findByAuthIdentity/save,
+ * so `!account` was false for the truthy pending Promise, NO account was
+ * created, and the caller got a Promise where a User_Account was required —
+ * scopeSession then threw. This asserts the async seam works end-to-end.
+ */
+function asyncAccountStore() {
+  const byIdentity = new Map();
+  return {
+    saveCalls: 0,
+    async findByAuthIdentity(authIdentity) {
+      await Promise.resolve();
+      return byIdentity.get(authIdentity) ?? null;
+    },
+    async save(account) {
+      this.saveCalls += 1;
+      await Promise.resolve();
+      byIdentity.set(account.authIdentity, account);
+      return account;
+    },
+    all() {
+      return [...byIdentity.values()];
+    },
+  };
+}
+
+test('(H17) an ASYNC account store yields a real User_Account, not a Promise', async () => {
+  const store = asyncAccountStore();
+  const { service } = makeService({ accountStore: store });
+
+  const first = await service.authenticate({ idToken: 'gh-token-A' });
+  assert.equal(first.denied, undefined, 'authentication succeeds against an async store');
+  assert.equal(typeof first.account, 'object');
+  assert.equal(first.account.authIdentity, 'github:gh|A');
+  // The returned account is a real record: scopeSession must not throw.
+  const session = service.scopeSession(first.account);
+  assert.equal(session.accountId, first.account.id);
+  assert.equal(store.saveCalls, 1, 'a new identity created exactly one account');
+
+  // Re-authenticating the same identity finds the existing account (no new save).
+  const second = await service.authenticate({ idToken: 'gh-token-A' });
+  assert.equal(second.account.id, first.account.id);
+  assert.equal(store.saveCalls, 1, 'an existing identity is found, not re-created');
+});
+
+test('(H17) a store returning a MISMATCHED identity fails closed', async () => {
+  const bad = {
+    async findByAuthIdentity() {
+      // Returns a record for a DIFFERENT identity than the one requested.
+      return { id: 'evil', authIdentity: 'github:someone-else', createdAt: NOW };
+    },
+    async save(a) { return a; },
+    all() { return []; },
+  };
+  const { service } = makeService({ accountStore: bad });
+  const res = await service.authenticate({ idToken: 'gh-token-A' });
+  assert.equal(res.denied, true, 'a mismatched account record must not bind a session');
+  assert.equal(res.account, undefined);
+});
+
 // --- OUT OF SCOPE note --------------------------------------------------------
 // Property tests for the Isolation_Boundary (Property 1) and secret
 // non-leakage (Property 8) belong to LATER tasks (task 5 runtime isolation,
