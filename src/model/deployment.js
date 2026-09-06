@@ -10,6 +10,7 @@ import {
   requireBoolean,
   requireEnum,
   requireOneOf,
+  requireIsoDate,
 } from './validate.js';
 
 /** Legal verdicts from plumby verify (Req 20.1). */
@@ -47,8 +48,11 @@ export function createShareLink(input = {}) {
     token: requireString(model, 'token', input.token),
     projectId: requireString(model, 'projectId', input.projectId),
     access: requireOneOf(model, 'access', input.access ?? 'read-only', SHARE_LINK_ACCESS),
-    createdAt: requireString(model, 'createdAt', input.createdAt),
-    expiresAt: requireString(model, 'expiresAt', input.expiresAt),
+    // Dates MUST be parseable ISO-8601 (audit H8): a ShareLink's expiresAt is
+    // fed straight into authorize()'s Date.parse, so an unparseable value would
+    // become a permanent, non-expiring grant. Normalize to canonical ISO here.
+    createdAt: requireIsoDate(model, 'createdAt', input.createdAt),
+    expiresAt: requireIsoDate(model, 'expiresAt', input.expiresAt),
     revoked: requireBoolean(model, 'revoked', input.revoked ?? false),
   };
 }

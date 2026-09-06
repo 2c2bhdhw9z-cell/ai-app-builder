@@ -229,6 +229,67 @@ test('(c) resolveAccess: an expired Share_Link grants no access', async () => {
   );
 });
 
+// --- (c) authorize fail-open regressions (audit H7, H8) ----------------------
+
+test('(c/H7) a grant with no projectId does NOT match a resource with no id (fail closed)', async () => {
+  const { service } = makeService();
+  const { account: userB } = await service.authenticate({ idToken: 'goog-token-B' });
+
+  // A grant-shaped object with NO projectId, and a resource with NO id/ownerId.
+  // Pre-fix, `undefined !== undefined` is false, so the targeting check passed
+  // and this returned Allowed/granted. The fix requires both sides to be
+  // non-empty strings, so this must be denied.
+  const looseGrant = { access: 'read-only', revoked: false, expiresAt: '2099-01-01T00:00:00.000Z' };
+  const resourceNoId = { description: 'no id, no ownerId' };
+  const decision = service.resolveAccess(userB, { resource: resourceNoId, grants: [looseGrant] });
+  assert.equal(decision.decision, 'AccessDenied', 'a projectId-less grant must not match an id-less resource');
+  assert.equal(decision.relation, 'none');
+});
+
+test('(c/H7) a grant with a projectId does not match a DIFFERENT resource id', async () => {
+  const { service } = makeService();
+  const { account: userA } = await service.authenticate({ idToken: 'gh-token-A' });
+  const { account: userB } = await service.authenticate({ idToken: 'goog-token-B' });
+
+  const projectOfA = projectOwnedBy(userA.id, 'p-real');
+  const grantForOther = {
+    access: 'read-only', revoked: false, projectId: 'p-other', expiresAt: '2099-01-01T00:00:00.000Z',
+  };
+  const decision = service.resolveAccess(userB, { resource: projectOfA, grants: [grantForOther] });
+  assert.equal(decision.decision, 'AccessDenied');
+});
+
+test('(c/H8) a grant with an UNPARSEABLE expiresAt is denied (fail closed)', async () => {
+  const { service, clock } = makeService();
+  const { account: userA } = await service.authenticate({ idToken: 'gh-token-A' });
+  const { account: userB } = await service.authenticate({ idToken: 'goog-token-B' });
+
+  const projectOfA = projectOwnedBy(userA.id, 'p-badexp');
+  // A grant naming the right project but with an expiry Date.parse cannot read.
+  // Pre-fix, Number.isFinite(NaN) is false so the expiry branch was skipped and
+  // the grant was PERMANENT. The fix fails closed on any unparseable expiry.
+  for (const bad of ['never', 'not-a-date', '2024-13-45', '']) {
+    const grant = { access: 'read-only', revoked: false, projectId: 'p-badexp', expiresAt: bad };
+    const decision = service.resolveAccess(userB, { resource: projectOfA, grants: [grant] });
+    assert.equal(decision.decision, 'AccessDenied', `expiresAt ${JSON.stringify(bad)} must not grant access`);
+  }
+
+  // Sanity: a valid future ISO expiry on the same project still grants (control).
+  clock.advance(0);
+  const good = { access: 'read-only', revoked: false, projectId: 'p-badexp', expiresAt: '2099-01-01T00:00:00.000Z' };
+  assert.equal(service.resolveAccess(userB, { resource: projectOfA, grants: [good] }).relation, 'granted');
+});
+
+test('(H8) createShareLink rejects an unparseable expiresAt at the model edge', () => {
+  assert.throws(
+    () => createShareLink({
+      token: 't', projectId: 'p1', access: 'read-only',
+      createdAt: '2024-01-01T00:00:00.000Z', expiresAt: 'never', revoked: false,
+    }),
+    /expiresAt must be a parseable ISO-8601 date/,
+  );
+});
+
 // --- (d) session scoping isolates users --------------------------------------
 
 test('(d) a session bound to user A cannot enumerate user B resources', async () => {
