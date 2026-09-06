@@ -74,14 +74,18 @@ function makeFakes({ projectIds = ['p1', 'p2'] } = {}) {
       return { ok: true, ownerId: accountId };
     },
   };
+  // Fake registry mirroring the REAL ProjectRegistry API: listForOwner(ownerId)
+  // returns full Project RECORDS ([{ id, ownerId }]) and unregister(projectId,
+  // ownerId) removes by projectId-FIRST, returning a boolean.
   const projectRegistry = {
-    listProjectIds(ownerId) {
-      return [...(owned.Projects.get(ownerId) ?? [])];
+    listForOwner(ownerId) {
+      return [...(owned.Projects.get(ownerId) ?? [])].map((id) => ({ id, ownerId }));
     },
-    remove(ownerId, projectId) {
+    unregister(projectId, ownerId) {
       const list = owned.Projects.get(ownerId) ?? [];
-      owned.Projects.set(ownerId, list.filter((id) => id !== projectId));
-      return { ok: true, ownerId, projectId, removed: true };
+      const next = list.filter((id) => id !== projectId);
+      owned.Projects.set(ownerId, next);
+      return next.length !== list.length;
     },
   };
   const skillStore = {
@@ -147,7 +151,7 @@ test('deleteProject releases sandbox + deletes files/snapshots/secrets + drops r
   assert.deepEqual(f.calls.projectSecrets, ['p1']);
 
   // Registry entry removed.
-  assert.deepEqual(f.projectRegistry.listProjectIds(OWNER), ['p2']);
+  assert.deepEqual(f.projectRegistry.listForOwner(OWNER).map((r) => r.id), ['p2']);
 
   // A single redacted PROJECT_DELETED event, scoped to the acting account.
   const evts = audit.ofType(AUDIT_EVENTS.PROJECT_DELETED);

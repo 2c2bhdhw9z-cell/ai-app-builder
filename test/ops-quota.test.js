@@ -122,6 +122,151 @@ test('checkQuota allows concurrent sandboxes below the ceiling', () => {
   assert.deepEqual(qm.checkQuota(ACCOUNT, 'p-new', QUOTA_RESOURCES.CONCURRENT_SANDBOXES), { ok: true });
 });
 
+test('with no per-account config, checkQuota(concurrentSandboxes) behaves identically (regression guard: no per-account rejection, no scope field)', () => {
+  const audit = createCollectorSink();
+  // Global ceiling has room (1 < 3), and no per-account limit is configured.
+  const sandboxManager = { activeProjectIds: () => ['p1'] };
+  const qm = createQuotaManager({
+    config: { quota: { maxConcurrentSandboxes: 3 } },
+    // A per-account seam is present, but with no limit VALUE it must stay a no-op.
+    accountConcurrencyCount: () => 99,
+    sandboxManager,
+    auditSink: audit,
+  });
+
+  assert.deepEqual(
+    qm.checkQuota(ACCOUNT, 'p-new', QUOTA_RESOURCES.CONCURRENT_SANDBOXES),
+    { ok: true },
+    'no per-account limit set => allowed, byte-identical { ok: true }',
+  );
+  assert.equal(audit.ofType(AUDIT_EVENTS.QUOTA_EXCEEDED).length, 0, 'no quota event emitted');
+});
+
+test('checkQuota per-account concurrent-Sandbox ceiling rejects an account at/over its limit EVEN WHEN the global ceiling has room, with scope "account"', () => {
+  const audit = createCollectorSink();
+  // Global count is 2 of 100 (plenty of room), but acct-1 alone holds 3 of 3.
+  const perAccount = { 'acct-1': 3, 'acct-2': 0 };
+  const qm = createQuotaManager({
+    config: { quota: { maxConcurrentSandboxes: 100, maxConcurrentSandboxesPerAccount: 3 } },
+    concurrencyCount: () => 3,
+    accountConcurrencyCount: (accountId) => perAccount[accountId] ?? 0,
+    auditSink: audit,
+  });
+
+  const rejected = qm.checkQuota(ACCOUNT, 'p-new', QUOTA_RESOURCES.CONCURRENT_SANDBOXES);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.limit, 'Resource_Quota');
+  assert.equal(rejected.resource, 'concurrentSandboxes');
+  assert.equal(rejected.scope, 'account', 'account-scope rejection');
+  assert.equal(rejected.max, 3);
+  assert.equal(rejected.current, 3);
+  assert.match(rejected.message, /per account/);
+
+  const events = audit.ofType(AUDIT_EVENTS.QUOTA_EXCEEDED);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].scope, 'account', 'audit event distinguishes account scope');
+  assert.equal(events[0].resource, 'concurrentSandboxes');
+});
+
+test('per-account ceiling is anti-starvation: a DIFFERENT account under its own limit is still allowed while the first is throttled', () => {
+  const perAccount = { 'acct-1': 3, 'acct-2': 1 };
+  const qm = createQuotaManager({
+    config: { quota: { maxConcurrentSandboxes: 100, maxConcurrentSandboxesPerAccount: 3 } },
+    accountConcurrencyCount: (accountId) => perAccount[accountId] ?? 0,
+  });
+
+  // acct-1 is at its per-account ceiling => throttled.
+  assert.equal(
+    qm.checkQuota({ id: 'acct-1' }, 'p-a', QUOTA_RESOURCES.CONCURRENT_SANDBOXES).ok,
+    false,
+    'acct-1 over its per-account limit',
+  );
+  // acct-2 is under its own ceiling => still allowed (not starved by acct-1).
+  assert.deepEqual(
+    qm.checkQuota({ id: 'acct-2' }, 'p-b', QUOTA_RESOURCES.CONCURRENT_SANDBOXES),
+    { ok: true },
+    'acct-2 independent per-account budget',
+  );
+});
+
+test('per-account ceiling via sandboxManager.activeProjectIdsForOwner seam; is a no-op when usage is unattributable', () => {
+  // (1) Attributable via the SandboxManager owner seam: acct-1 holds 2 of 2.
+  const withOwnerSeam = createQuotaManager({
+    config: { quota: { maxConcurrentSandboxes: 100, maxConcurrentSandboxesPerAccount: 2 } },
+    sandboxManager: {
+      activeProjectIds: () => ['p1', 'p2'],
+      activeProjectIdsForOwner: (accountId) => (accountId === 'acct-1' ? ['p1', 'p2'] : []),
+    },
+  });
+  assert.equal(
+    withOwnerSeam.checkQuota(ACCOUNT, 'p-new', QUOTA_RESOURCES.CONCURRENT_SANDBOXES).ok,
+    false,
+    'owner seam attributes acct-1 at its ceiling',
+  );
+
+  // (2) No per-account seam at all: cannot attribute => strict no-op (allowed),
+  // even with a per-account limit configured.
+  const noSeam = createQuotaManager({
+    config: { quota: { maxConcurrentSandboxes: 100, maxConcurrentSandboxesPerAccount: 1 } },
+    sandboxManager: { activeProjectIds: () => ['p1', 'p2', 'p3'] },
+  });
+  assert.deepEqual(
+    noSeam.checkQuota(ACCOUNT, 'p-new', QUOTA_RESOURCES.CONCURRENT_SANDBOXES),
+    { ok: true },
+    'unattributable per-account usage => no-op (unlimited)',
+  );
+});
+
+test('checkQuota emits ONE operational signal when a per-account limit is CONFIGURED but usage is UNATTRIBUTABLE (fail-open, but observable), still returning { ok:true }', () => {
+  const operational = createCollectorSink();
+  // A per-account limit VALUE is set, but there is NO attribution seam at all
+  // (no accountConcurrencyCount, no activeProjectIdsForOwner) => unattributable.
+  const qm = createQuotaManager({
+    config: { quota: { maxConcurrentSandboxes: 100, maxConcurrentSandboxesPerAccount: 2 } },
+    sandboxManager: { activeProjectIds: () => ['p1', 'p2', 'p3'] },
+    operationalSink: operational,
+  });
+
+  // Fail-open by design: the limit stays a no-op and the request is allowed.
+  assert.deepEqual(
+    qm.checkQuota(ACCOUNT, 'p-new', QUOTA_RESOURCES.CONCURRENT_SANDBOXES),
+    { ok: true },
+    'unattributable per-account usage => { ok:true } (return value unchanged, fail-open)',
+  );
+
+  // ...but exactly ONE operational signal makes the set-but-unenforced limit
+  // observable to operators.
+  const signals = operational.ofType(AUDIT_EVENTS.OPERATIONAL_ERROR);
+  assert.equal(signals.length, 1, 'exactly one unattributable operational signal per occurrence');
+  assert.equal(signals[0].kind, 'quota-unattributable');
+  assert.equal(signals[0].accountId, 'acct-1');
+  assert.equal(signals[0].resource, 'concurrentSandboxes');
+  assert.equal(signals[0].max, 2);
+  assert.match(signals[0].reason, /unattributable/);
+  assert.match(signals[0].reason, /no count seam/);
+});
+
+test('checkQuota emits NO unattributable operational signal when NO per-account limit is configured (regression guard for the global-only path)', () => {
+  const operational = createCollectorSink();
+  // No per-account limit VALUE (default null) — even though attribution is
+  // impossible, the per-account branch must not engage or signal.
+  const qm = createQuotaManager({
+    config: { quota: { maxConcurrentSandboxes: 100 } },
+    sandboxManager: { activeProjectIds: () => ['p1'] },
+    operationalSink: operational,
+  });
+
+  assert.deepEqual(
+    qm.checkQuota(ACCOUNT, 'p-new', QUOTA_RESOURCES.CONCURRENT_SANDBOXES),
+    { ok: true },
+  );
+  assert.equal(
+    operational.ofType(AUDIT_EVENTS.OPERATIONAL_ERROR).length,
+    0,
+    'no per-account limit set => no operational signal (global-only path unchanged)',
+  );
+});
+
 test('checkQuota rejects over-maxTotalProjects via the injected projectCounter, naming the Resource_Quota', () => {
   const audit = createCollectorSink();
   const qm = createQuotaManager({
