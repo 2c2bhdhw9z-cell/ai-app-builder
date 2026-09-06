@@ -18,6 +18,8 @@
 
 export { createProjectManager, MAX_DESCRIPTION_CHARS } from './project-manager.js';
 
+export { createProjectOrigin, TEMPLATE_POPULATE_SLO_MS } from './project-origins.js';
+
 export { createProjectRegistry } from './project-registry.js';
 
 export { createDevServer } from './dev-server.js';

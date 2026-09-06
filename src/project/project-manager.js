@@ -18,6 +18,15 @@
  *                                    Sandbox -> return handles + a measured
  *                                    beginsCreationMs from the injected clock.
  *
+ *   populateOrigin(args)           — materialize a Project's ORIGIN starting tree
+ *                                    (Task 14, Req 6.1-6.3/6.8/6.9): run the
+ *                                    injected ProjectOrigin.populate for the
+ *                                    origin, persist the resulting tree into the
+ *                                    Project's exportable tree, and roll back the
+ *                                    Sandbox + registry on failure. ALL four
+ *                                    origins converge here and then onto the SAME
+ *                                    runGeneration pipeline (no forked lifecycle).
+ *
  *   runGeneration(args)            — the generation -> verify -> Dev_Server-start
  *                                    / editable-on-fail pipeline (Req 1.3, 1.7).
  *
@@ -71,6 +80,13 @@ const DEFAULT_MODEL = 'claude-sonnet';
  *        totalProjects Resource_Quota is enforced (rate limiting is the gate's job)
  * @param {object} [args.authService]   OPTIONAL AuthService (reserved; the gate authorizes)
  * @param {object} [args.snapshotStore] OPTIONAL SnapshotStore; onTurnComplete reused on PASS
+ * @param {object} [args.projectOrigin] OPTIONAL ProjectOrigin (src/project/project-origins.js)
+ *        with populate({...}); when injected, populateOrigin materializes the
+ *        origin's starting tree. Its ABSENCE keeps existing (no-origin) behavior
+ *        unchanged — origin population is strictly additive (FEAT-002).
+ * @param {object} [args.persistenceStore] OPTIONAL PersistenceStore; when injected
+ *        with a projectOrigin, populateOrigin persists the origin tree durably
+ *        (persist + flush) into layout.exportableProjectTree(projectId).
  * @param {object} args.devServer       the Dev_Server seam (start/stop) — see dev-server.js
  * @param {Function} args.agentFactory  builds the Builder_Agent for a turn (plumby via engine boundary)
  * @param {Function} args.verify        the verify seam; returns plumby-verify TEXT
@@ -87,6 +103,8 @@ export function createProjectManager({
   quotaManager,
   authService,
   snapshotStore,
+  projectOrigin,
+  persistenceStore,
   devServer,
   agentFactory,
   verify,
@@ -143,9 +161,11 @@ export function createProjectManager({
       };
     }
 
-    // Project_Origin: must be a member of the closed enum. NOTE (scope): origin
-    // is only VALIDATED here; populating a project from an origin
-    // (blank/template/github-import/fork) is Task 14, not this feature.
+    // Project_Origin: must be a member of the closed enum. Origin POPULATION
+    // (producing the origin's starting tree for blank/template/github-import/
+    // fork) is implemented in the ProjectOrigin module and driven by
+    // populateOrigin below (Task 14); this edge check only rejects an origin
+    // outside the closed enum before any Project is created.
     if (!isValidProjectOrigin(origin)) {
       return {
         ok: false,
@@ -302,6 +322,124 @@ export function createProjectManager({
   }
 
   /**
+   * populateOrigin({ project, sandbox, ref }) — materialize a created Project's
+   * ORIGIN starting tree (Task 14, Req 6.1-6.3, 6.8, 6.9). This runs AFTER
+   * createProject has returned (so the 10s "begins creation" measurement stays
+   * honest — origin population is a SEPARATE, origin-specific bound, e.g. the
+   * Template 30s SLO of Req 5.2), and BEFORE runGeneration. All four origins
+   * converge here and then onto the SAME runGeneration pipeline — the lifecycle
+   * is never forked per origin (Req 6.9).
+   *
+   * Order:
+   *   1. Ask the injected ProjectOrigin to populate the origin's initial tree
+   *      (blank/template now; github-import/fork in FEAT-003). populate performs
+   *      NO agent generation — it only produces the starting { relPath: contents }.
+   *   2. On a populate failure AFTER the Sandbox was acquired, ROLL BACK exactly
+   *      as the SANDBOX_ACQUIRE_FAILED path does: reap the Sandbox
+   *      (sandboxManager.release) and unregister the Project, so a failed create
+   *      leaves NO partial Project and NO orphaned Sandbox.
+   *   3. On success, materialize the tree into the Project's exportable tree via
+   *      the injected PersistenceStore (persist + flush so it is durable) and
+   *      return the populated tree + the origin's measured populateMs.
+   *
+   * REQUIREMENTS: an origin collaborator must be injected. It is OPTIONAL on the
+   * manager (existing no-origin flows are unaffected); calling populateOrigin
+   * without one is a structured ORIGIN_UNAVAILABLE rejection, not a throw.
+   *
+   * @param {object} args
+   * @param {object} args.project  the created Project record (from createProject)
+   * @param {object} [args.sandbox] the acquired Sandbox handle
+   * @param {string} [args.ref]     origin ref (import url / fork source id)
+   * @param {object} [args.userAccount] the REQUESTING account, threaded through
+   *        to the ProjectOrigin for github-import / fork authorization (Req 6.4,
+   *        6.7). Absent for origins that need no authorization (blank/template).
+   * @param {Array<object>} [args.grants]  optional Share_Link grants for authorization
+   * @param {object} [args.repoResource]   github-import repo record { id, ownerId }
+   *        the repo authorization is resolved against (threaded to the ProjectOrigin)
+   * @param {(progress:object)=>void} [args.onProgress]  large-repo import progress sink
+   * @param {AbortSignal} [args.signal]     optional abort signal for the import clone
+   * @returns {Promise<{ ok:true, project, projectTree, populateMs, origin }
+   *          | { ok:false, code, message, failedArtifact? }>}
+   */
+  async function populateOrigin({ project, sandbox, ref, userAccount, grants, repoResource, onProgress, signal } = {}) {
+    if (!project || typeof project.id !== 'string') {
+      return { ok: false, code: 'PROJECT_REQUIRED', message: 'a project record is required' };
+    }
+    if (!projectOrigin || typeof projectOrigin.populate !== 'function') {
+      return { ok: false, code: 'ORIGIN_UNAVAILABLE', message: 'no projectOrigin was injected' };
+    }
+
+    const populated = await projectOrigin.populate({
+      project,
+      sandbox,
+      origin: project.origin,
+      targetCategory: project.targetCategory,
+      ref: ref ?? project.originRef,
+      userAccount,
+      grants,
+      repoResource,
+      onProgress,
+      signal,
+    });
+
+    // On any populate failure AFTER acquire, roll back the Sandbox + registry so
+    // a failed create leaves no partial Project and no orphaned Sandbox (mirrors
+    // the SANDBOX_ACQUIRE_FAILED rollback).
+    if (!populated || populated.ok === false) {
+      rollbackAfterAcquire(project.id, project.ownerId);
+      return {
+        ok: false,
+        code: populated?.code ?? 'ORIGIN_POPULATION_FAILED',
+        message: populated?.message ?? 'origin population failed',
+        ...(populated?.failedArtifact !== undefined ? { failedArtifact: populated.failedArtifact } : {}),
+      };
+    }
+
+    // Materialize the origin's starting tree into the Project's exportable tree,
+    // durably (persist + flush). If the persistence write itself fails, roll back
+    // as well so no orphaned Sandbox / partial Project survives.
+    if (persistenceStore && typeof persistenceStore.persist === 'function') {
+      persistenceStore.persist(project.id, populated.projectTree);
+      const flushed = typeof persistenceStore.flush === 'function'
+        ? persistenceStore.flush(project.id)
+        : { ok: true };
+      if (flushed && flushed.ok === false) {
+        rollbackAfterAcquire(project.id, project.ownerId);
+        return {
+          ok: false,
+          code: 'ORIGIN_PERSIST_FAILED',
+          message: `failed to persist origin tree for project ${project.id}: ${flushed.error?.message ?? 'persistence failure'}`,
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      project,
+      projectTree: populated.projectTree,
+      populateMs: populated.populateMs,
+      origin: populated.origin,
+    };
+  }
+
+  /**
+   * Compensating action for a failure AFTER the Sandbox was acquired: reap the
+   * Sandbox (release is idempotent + orphan-reaping, safe in a finally) and roll
+   * back the registry entry. Best-effort — neither step must mask the original
+   * error. Mirrors the createProject SANDBOX_ACQUIRE_FAILED rollback.
+   */
+  function rollbackAfterAcquire(projectId, ownerId) {
+    if (sandboxManager && typeof sandboxManager.release === 'function') {
+      try {
+        sandboxManager.release(projectId);
+      } catch {
+        /* best-effort sandbox reap */
+      }
+    }
+    rollbackRegistration(projectId, ownerId);
+  }
+
+  /**
    * Normalize a verify seam result into a VerifyResult record (createVerifyResult,
    * VERIFY_VERDICTS). The plumby verify contract is TEXT beginning with
    * 'verdict: PASS' or 'verdict: FAIL'; we parse that. A caller may instead pass
@@ -438,6 +576,7 @@ export function createProjectManager({
   return Object.freeze({
     validateCreateInput,
     createProject,
+    populateOrigin,
     runGeneration,
     normalizeVerifyResult,
     MAX_DESCRIPTION_CHARS,
