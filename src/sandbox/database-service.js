@@ -468,6 +468,329 @@ export function createBackendScaffolder({
   });
 }
 
+/** The 120s schema-migration wall-clock ceiling (Req 9.4). */
+export const DEFAULT_MIGRATION_TIMEOUT_MS = 120_000;
+
+/**
+ * The default migration command a caller may rely on when none is supplied.
+ * `db-migrate` is generic and is classified `db-migration` -> confirm by the
+ * REAL plumby classifier (its generic `migrate`/`db:migrate` subcommand rule).
+ * A caller normally supplies the concrete tool command (e.g. `npx prisma
+ * migrate deploy`, `rake db:migrate`), which the SAME classifier gates.
+ */
+function defaultMigrationCommand() {
+  return 'db-migrate';
+}
+
+/**
+ * Extract the applied schema version from a migration's output. Best-effort:
+ * looks for a `version:` / `applied version` / `migrated to` marker, else falls
+ * back to the caller-declared version. Never throws — a missing version yields
+ * null and the caller reports what it can.
+ */
+function parseAppliedVersion(stdout, declaredVersion) {
+  if (typeof declaredVersion === 'string' && declaredVersion.trim() !== '') {
+    return declaredVersion.trim();
+  }
+  const text = String(stdout ?? '');
+  const patterns = [
+    /applied[_\s-]*version[:=\s]+([\w.\-+]+)/i,
+    /migrated\s+to[:=\s]+([\w.\-+]+)/i,
+    /\bversion[:=\s]+([\w.\-+]+)/i,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/**
+ * THE SCHEMA MIGRATOR — confirm-gated database migrations (spec Task 20.2,
+ * Req 9.4, 9.5).
+ *
+ * When the Builder_Agent generates or changes a schema, the migration is applied
+ * to the Project's Database_Service ONLY through the confirm-gated command path
+ * and within a 120s ceiling, reporting the applied version on success; on any
+ * failure/timeout/denial the cause is reported and the PRIOR schema is left in
+ * effect with NO partial changes. Like the provisioner, this is a thin COMPOSING
+ * layer over EXISTING seams (mirroring src/sandbox/package-manager.js):
+ *
+ *   - THE CONFIRM GATE: every migration command is routed through the injected
+ *     CommandGuard (src/sandbox/command-guard.js). The guard runs plumby's PURE
+ *     classifier (via the plumby boundary at src/engine/plumby.js), which
+ *     ALREADY tags migrations as `db-migration` -> confirm (rails/rake
+ *     db:migrate, alembic, prisma migrate, knex/sequelize/typeorm,
+ *     flyway/liquibase, and a generic `migrate`/`db:migrate`). The guard emits a
+ *     confirm_request and awaits consent; denied consent yields outcome:'confirm',
+ *     executed:false. This module reimplements NO classification and adds NO new
+ *     classifier — there is no path here that reaches the boundary without going
+ *     through the guard (Req 9.4).
+ *
+ *   - TWO DISTINCT TIMEOUTS: the guard's own CONSENT ceiling defaults to 60s
+ *     (DEFAULT_CONFIRM_TIMEOUT_MS). Req 9.4's 120s bound is the MIGRATION
+ *     wall-clock ceiling — a SEPARATE timeout enforced HERE via the injected
+ *     clock (`now`) and threaded as `timeoutMs` to the guard/boundary (whose
+ *     reaper yields deniedReason:'timeout'/timedOut:true). The two are never
+ *     conflated.
+ *
+ *   - NO PARTIAL SCHEMA CHANGE ON NON-SUCCESS (Req 9.5): the prior schema
+ *     version is SNAPSHOTTED before the migration runs; on confirm-denied,
+ *     failure, timeout, or refuse the schemaVersion is left untouched (the DB
+ *     seam applied nothing / the migration tool's own transaction rolled back)
+ *     and the returned record carries the PRIOR version — mirroring
+ *     package-manager.js restoreManifest.
+ *
+ * CONTRACTS (never throw on a handled path — REPORT it):
+ *   migrate():
+ *     success       -> { ok:true, appliedVersion, durationMs, database } after
+ *                      consent granted + exit 0 within 120s.
+ *     confirm-denied-> { ok:false, code:'MIGRATION_CONFIRM_DENIED', ... } prior
+ *                      schema in effect, schemaVersion untouched.
+ *     failed        -> { ok:false, code:'MIGRATION_FAILED', ... } prior schema intact.
+ *     timeout       -> { ok:false, code:'MIGRATION_TIMEOUT', ... } prior schema intact.
+ *     refuse/failed-closed -> { ok:false, code:'MIGRATION_REFUSED', ... } never applied.
+ *
+ * @param {object} args
+ * @param {object} args.commandGuard  a CommandGuard (src/sandbox/command-guard.js) with run()
+ * @param {() => number} [args.now]   injectable clock (ms) for durationMs (default Date.now)
+ * @param {number} [args.migrationTimeoutMs=120000]  the 120s wall-clock ceiling threaded to the guard/boundary
+ * @param {(args:{tool?:string,version?:string,projectId:string})=>string} [args.migrationCommand]  migration-command builder
+ * @param {Function|{record:Function}} [args.observability]  OPTIONAL observability sink
+ * @param {Function|{record:Function}} [args.audit]          OPTIONAL audit sink
+ * @returns {object} migrator (frozen)
+ */
+export function createSchemaMigrator({
+  commandGuard,
+  now = Date.now,
+  migrationTimeoutMs = DEFAULT_MIGRATION_TIMEOUT_MS,
+  migrationCommand = defaultMigrationCommand,
+  observability,
+  audit,
+} = {}) {
+  if (!commandGuard || typeof commandGuard.run !== 'function') {
+    fail('SchemaMigrator', 'commandGuard with run(projectId, command, opts) is required');
+  }
+  if (typeof now !== 'function') {
+    fail('SchemaMigrator', 'now must be a function returning milliseconds');
+  }
+  if (
+    typeof migrationTimeoutMs !== 'number' ||
+    !Number.isFinite(migrationTimeoutMs) ||
+    migrationTimeoutMs <= 0
+  ) {
+    fail('SchemaMigrator', 'migrationTimeoutMs must be a positive number');
+  }
+  if (typeof migrationCommand !== 'function') {
+    fail('SchemaMigrator', 'migrationCommand must be a function');
+  }
+
+  const emitObservability = toRecordSink(observability);
+  const emitAudit = toRecordSink(audit);
+
+  /**
+   * migrate — apply a schema migration to the Database_Service through the
+   * confirm-gated command path within the 120s ceiling (Req 9.4, 9.5).
+   *
+   * @param {object} params
+   * @param {string} params.projectId
+   * @param {object} params.database          the Database_Service record to migrate (from the provisioner)
+   * @param {string|string[]} [params.command]  explicit migration command (overrides the builder)
+   * @param {string} [params.tool]            a tool name for the default command builder
+   * @param {string} [params.version]         the declared target schema version (used when output has none)
+   * @param {(req:object)=>(Promise<boolean>|boolean)} [params.onConfirmRequest]  consent seam for the confirm gate
+   * @param {AbortSignal} [params.signal]
+   * @param {boolean} [params.subAgent]       route as a read-only sub-agent command (guard policy)
+   * @returns {Promise<object>} a frozen structured result
+   */
+  async function migrate(params = {}) {
+    const { projectId, database, command, tool, version, onConfirmRequest, signal, subAgent } = params;
+    requireString('SchemaMigrator', 'projectId', projectId);
+    if (!database || typeof database !== 'object') {
+      fail('SchemaMigrator', 'database (a Database_Service record) is required');
+    }
+
+    // SNAPSHOT the prior schema version so any non-success leaves it untouched
+    // (Req 9.5 "prior schema in effect, no partial changes"). The record is
+    // re-created through the REAL model so the returned value is always a valid
+    // Database_Service, never a mutated caller object.
+    const priorVersion =
+      typeof database.schemaVersion === 'string' ? database.schemaVersion : null;
+    const priorRecord = createDatabaseService({ ...database, schemaVersion: priorVersion ?? undefined });
+
+    const migrateCommand =
+      command !== undefined ? command : migrationCommand({ tool, version, projectId });
+
+    // ROUTE through the CommandGuard — the SINGLE point that runs plumby's
+    // classifier and, on a granted confirm, runs the migration INSIDE the
+    // boundary. The 120s MIGRATION ceiling is threaded as timeoutMs (distinct
+    // from the guard's 60s CONSENT ceiling) so the boundary's wall-clock reaper
+    // (deniedReason 'timeout') can fire.
+    const startedAt = now();
+    let guardResult;
+    try {
+      guardResult = await commandGuard.run(projectId, migrateCommand, {
+        timeoutMs: migrationTimeoutMs,
+        signal,
+        subAgent,
+        onConfirmRequest,
+      });
+    } catch (err) {
+      // A thrown guard is unexpected; treat as a non-success leaving the prior
+      // schema in effect.
+      return failMigration({
+        priorRecord,
+        code: 'MIGRATION_FAILED',
+        durationMs: now() - startedAt,
+        projectId,
+        message: `migration threw: ${err?.message ?? String(err)}`,
+      });
+    }
+    const durationMs = Math.max(0, now() - startedAt);
+
+    const outcome = guardResult?.outcome ?? 'refuse';
+    const category = guardResult?.category ?? null;
+    const classifyReason = guardResult?.classifyReason ?? guardResult?.reason ?? null;
+    const executed = guardResult?.executed === true;
+
+    // REFUSE / fail-closed: the classifier refused (or could not classify within
+    // 10s). NEVER apply the migration. Prior schema in effect (Req 9.5).
+    if (!executed && outcome === 'refuse') {
+      return failMigration({
+        priorRecord,
+        code: 'MIGRATION_REFUSED',
+        durationMs,
+        projectId,
+        outcome,
+        category,
+        reason: classifyReason,
+        message: `migration command refused by the classifier (${
+          classifyReason ?? 'could not classify'
+        }); prior schema left in effect`,
+      });
+    }
+
+    // CONFIRM-DENIED: the classifier tagged it `confirm` (db-migration) but
+    // consent was denied — the command did NOT execute. Prior schema in effect,
+    // schemaVersion untouched, the DB seam applied nothing (Req 9.5).
+    if (!executed) {
+      return failMigration({
+        priorRecord,
+        code: 'MIGRATION_CONFIRM_DENIED',
+        durationMs,
+        projectId,
+        outcome,
+        category,
+        reason: classifyReason,
+        message: `schema migration requires confirmation and consent was denied${
+          classifyReason ? ` (${classifyReason})` : ''
+        }; prior schema left in effect with no partial changes`,
+      });
+    }
+
+    // The command executed inside the boundary. Read its output + status.
+    const stdout = guardResult?.stdout ?? '';
+    const stderr = guardResult?.stderr ?? '';
+    const exitCode = typeof guardResult?.exitCode === 'number' ? guardResult.exitCode : null;
+    const timedOut = guardResult?.timedOut === true || guardResult?.deniedReason === 'timeout';
+
+    // TIMEOUT: the boundary's wall-clock reaper fired at the 120s ceiling (or the
+    // injected clock shows the run went over budget). Prior schema intact (Req 9.5).
+    const overBudget = durationMs > migrationTimeoutMs;
+    if (timedOut || overBudget) {
+      return failMigration({
+        priorRecord,
+        code: 'MIGRATION_TIMEOUT',
+        durationMs,
+        projectId,
+        exitCode,
+        stdout,
+        stderr,
+        message: `schema migration exceeded the ${migrationTimeoutMs}ms ceiling; run killed, prior schema left in effect with no partial changes`,
+      });
+    }
+
+    // FAILURE: executed but non-zero exit — the migration tool's OWN failure.
+    // A well-behaved migration tool runs each step transactionally, so a failed
+    // run leaves the prior schema intact; we report the cause and keep the prior
+    // version (Req 9.5).
+    if (exitCode !== 0) {
+      return failMigration({
+        priorRecord,
+        code: 'MIGRATION_FAILED',
+        durationMs,
+        projectId,
+        exitCode,
+        stdout,
+        stderr,
+        message: `schema migration failed (exit ${exitCode}); prior schema left in effect with no partial changes`,
+      });
+    }
+
+    // SUCCESS: consent granted + exit 0 within 120s. Capture the applied version
+    // and update the Database_Service.schemaVersion (Req 9.4).
+    const appliedVersion = parseAppliedVersion(stdout, version);
+    const migrated = createDatabaseService({
+      ...priorRecord,
+      schemaVersion: appliedVersion ?? priorVersion ?? undefined,
+    });
+    emitAudit({ type: 'db.migrate.succeeded', projectId, id: migrated.id, appliedVersion, durationMs });
+    emitObservability({ type: 'db.migrate', projectId, ok: true, code: 'MIGRATED', durationMs });
+    return Object.freeze({
+      ok: true,
+      appliedVersion,
+      durationMs,
+      exitCode: 0,
+      stdout,
+      stderr,
+      database: Object.freeze(migrated),
+      message: `schema migration applied${appliedVersion ? ` (version ${appliedVersion})` : ''}`,
+    });
+  }
+
+  /**
+   * Report a migration NON-SUCCESS: the prior schema is left in effect (Req 9.5).
+   * The returned record carries the PRIOR schemaVersion untouched — no partial
+   * change — mirroring package-manager.js restore-on-failure.
+   */
+  function failMigration({
+    priorRecord,
+    code,
+    durationMs,
+    projectId,
+    outcome,
+    category,
+    reason,
+    exitCode,
+    stdout,
+    stderr,
+    message,
+  }) {
+    emitAudit({ type: 'db.migrate.failed', projectId, id: priorRecord?.id ?? null, code });
+    emitObservability({ type: 'db.migrate', projectId, ok: false, code, durationMs });
+    return Object.freeze({
+      ok: false,
+      code,
+      durationMs,
+      outcome: outcome ?? null,
+      category: category ?? null,
+      reason: reason ?? null,
+      exitCode: exitCode ?? null,
+      stdout: stdout ?? '',
+      stderr: stderr ?? '',
+      // The prior schema is in effect: the version is UNCHANGED (no partial change).
+      priorSchemaVersion: priorRecord?.schemaVersion ?? null,
+      database: Object.freeze(priorRecord),
+      message,
+    });
+  }
+
+  return Object.freeze({
+    migrate,
+    migrationTimeoutMs,
+  });
+}
+
 /**
  * Prepare generated backend/DB source so no committed file contains a literal
  * Secret value (Req 9.7 / Property 8). A thin, explicit wrapper over

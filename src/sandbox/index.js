@@ -16,8 +16,10 @@ export { createPackageManager, DEFAULT_INSTALL_TIMEOUT_MS } from './package-mana
 export {
   createDatabaseProvisioner,
   createBackendScaffolder,
+  createSchemaMigrator,
   guardBackendSecrets,
   DEFAULT_DB_PROVISION_TIMEOUT_MS,
+  DEFAULT_MIGRATION_TIMEOUT_MS,
 } from './database-service.js';
 
 export {
