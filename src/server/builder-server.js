@@ -97,6 +97,95 @@ export function securityHeaders() {
 const ACCESS_DENIED = { error: 'access denied' };
 
 /**
+ * Project a served-preview handle (from previewController.servedPreview) onto a
+ * SAFE, broadcastable preview_status frame (Req 3.1-3.7, Req 4.4). PURE, so the
+ * exact shape is unit-testable and cannot drift between the /preview response,
+ * the /events reconnection frame, and the /preview/restart broadcast.
+ *
+ * The served-preview status vocabulary ('none'|'served'|'committed'|
+ * 'showing-prior'|'no-preview') is mapped onto the client-facing lifecycle
+ * vocabulary ('loading'|'ready'|'error'|'showing_prior'). A 'committed' status
+ * (snapshot published but no Dev_Server running yet, so no live url) maps to
+ * 'loading' — it is honestly not-yet-ready rather than 'ready'. Only SAFE fields
+ * cross the wire:
+ * status, snapshotId, url, and a redacted single-line cause SUMMARY — never a
+ * raw build cause or secret, consistent with the observability error-frame
+ * pattern that broadcasts only a generic userMessage.
+ *
+ * @param {{ snapshotId:string|null, url:string|null, status:string,
+ *           showingPrior:boolean, buildError:string|null }} served
+ * @returns {{ type:'preview_status', status:string, snapshotId?:string,
+ *            url?:string, showingPrior?:boolean, cause?:string }}
+ */
+export function previewStatusFrame(served = {}) {
+  const status =
+    served.status === 'served'
+      ? 'ready'
+      : served.status === 'showing-prior'
+        ? 'showing_prior'
+        : served.status === 'no-preview'
+          ? 'error'
+          : 'loading';
+
+  const frame = { type: 'preview_status', status };
+  if (typeof served.snapshotId === 'string') frame.snapshotId = served.snapshotId;
+  if (typeof served.url === 'string') frame.url = served.url;
+  if (served.showingPrior === true) frame.showingPrior = true;
+  // A build error surfaces ONLY as a bounded, single-line safe summary — never
+  // the raw cause. This keeps a failed-build cause from leaking secrets/stack.
+  if (typeof served.buildError === 'string' && served.buildError.trim() !== '') {
+    frame.cause = safePreviewCause(served.buildError);
+  }
+  return frame;
+}
+
+/**
+ * Reduce an arbitrary preview cause string to a bounded, single-line SAFE
+ * summary suitable for broadcasting. Collapses whitespace/newlines and caps the
+ * length so a raw multi-line cause (which could carry a stack or secret) never
+ * reaches a client frame verbatim — mirrors the observability redaction spirit.
+ */
+export function safePreviewCause(cause) {
+  const oneLine = String(cause).replace(/\s+/g, ' ').trim();
+  return oneLine.length > 200 ? `${oneLine.slice(0, 197)}...` : oneLine;
+}
+
+/**
+ * Project a PreviewController.restart(...) result onto a SAFE broadcastable
+ * lifecycle frame. A successful restart becomes a 'ready' preview_status; a
+ * persistent failure (the 3-attempt cap, code PERSISTENT_FAILURE) becomes a
+ * 'persistent_failure' status with restartOffered:false; any other failed
+ * attempt becomes an 'error' status carrying restartOffered and a safe cause
+ * summary. Never leaks a raw cause.
+ *
+ * @param {object} result  the previewController.restart(...) result
+ * @returns {{ type:'preview_status', status:string, url?:string,
+ *            attempt?:number, attempts?:number, restartOffered?:boolean, cause?:string }}
+ */
+export function restartStatusFrame(result = {}) {
+  if (result.ok === true) {
+    const frame = { type: 'preview_status', status: 'ready', restartOffered: false };
+    if (typeof result.url === 'string') frame.url = result.url;
+    if (typeof result.attempt === 'number') frame.attempt = result.attempt;
+    return frame;
+  }
+  if (result.code === 'PERSISTENT_FAILURE') {
+    const frame = { type: 'preview_status', status: 'persistent_failure', restartOffered: false };
+    if (typeof result.attempts === 'number') frame.attempts = result.attempts;
+    if (typeof result.message === 'string') frame.cause = safePreviewCause(result.message);
+    return frame;
+  }
+  const frame = {
+    type: 'preview_status',
+    status: 'error',
+    restartOffered: result.restartOffered === true,
+  };
+  if (typeof result.attempt === 'number') frame.attempt = result.attempt;
+  if (typeof result.message === 'string') frame.cause = safePreviewCause(result.message);
+  return frame;
+}
+
+/**
  * Create the Builder Server.
  *
  * @param {object} opts
@@ -146,6 +235,21 @@ const ACCESS_DENIED = { error: 'access denied' };
  *        behaves exactly as before and the /events, /message, /confirm routes are
  *        unchanged. (When a ProjectRegistry's resolver is wired as projectResolver
  *        above, that satisfies the open "real projectResolver" review finding.)
+ * @param {object} [opts.previewController]  an OPTIONAL PreviewController
+ *        (src/project/preview-controller.js). When present, two STRICTLY
+ *        ADDITIVE routes are enabled — GET /preview (the current served Preview
+ *        handle for an authenticated+authorized session) and POST /preview/restart
+ *        (restart the Dev_Server, capped at 3 attempts before a persistent
+ *        failure) — and the Preview lifecycle status is broadcast on the SAME
+ *        per-session SSE stream as the Activity_Stream, so a client can render the
+ *        reasoning feed and the running-preview status side by side (Req 4.4,
+ *        Req 3.1-3.7). A (re)connecting /events client also receives the CURRENT
+ *        preview_status frame among its reconnection frames. Only SAFE summaries
+ *        (status, snapshotId, url, a redacted cause string) ever reach a broadcast
+ *        frame — never a raw cause or secret, mirroring the observability
+ *        error-frame pattern. With NO previewController injected, the /preview and
+ *        /preview/restart routes are NOT routed and every existing route/behavior
+ *        is byte-identical (backward compatible).
  * @param {number} [opts.confirmTimeoutMs=60000]  fail-closed confirm ceiling.
  * @param {() => number} [opts.now]       injectable clock.
  * @returns {object} frozen server handle.
@@ -161,6 +265,7 @@ export function createBuilderServer(opts = {}) {
     quotaManager,
     projectManager,
     observability,
+    previewController,
     confirmTimeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS,
     now = () => Date.now(),
   } = opts;
@@ -243,6 +348,27 @@ export function createBuilderServer(opts = {}) {
     session.onEvent = (event) => {
       const view = activityStream.toFrame(event);
       if (view) session.broadcast(view);
+    };
+
+    /**
+     * Broadcast a Preview lifecycle status on THIS session's SSE stream — the
+     * SAME stream the Activity_Stream flows on, so the reasoning feed and the
+     * running-preview status are presented CONCURRENTLY (Req 4.4). The argument
+     * is either a served-preview handle (projected onto a SAFE preview_status
+     * frame) or an already-projected typed frame (e.g. a preview_mobile frame).
+     * Only SAFE summaries reach the wire — never a raw cause/secret. This is the
+     * per-session hook the PreviewController's status changes flow through,
+     * mirroring how session.onEvent forwards activity frames.
+     */
+    session.broadcastPreview = (statusOrFrame) => {
+      if (!statusOrFrame) return;
+      // An already-typed frame (has a `type`) is broadcast as-is; a raw served
+      // handle is projected onto the SAFE preview_status frame first.
+      const frame =
+        typeof statusOrFrame.type === 'string'
+          ? statusOrFrame
+          : previewStatusFrame(statusOrFrame);
+      session.broadcast(frame);
     };
 
     /**
@@ -441,6 +567,15 @@ export function createBuilderServer(opts = {}) {
     if (projectManager && req.method === 'POST' && pathname === '/projects') {
       return handleCreateProject(req, res);
     }
+    // Strictly additive: the Preview surface is only routed when a
+    // PreviewController is injected (Req 4.4, Req 3.1-3.7). With none injected,
+    // these paths fall through to 405 exactly as an unknown route always has.
+    if (previewController && req.method === 'GET' && pathname === '/preview') {
+      return handlePreview(req, res);
+    }
+    if (previewController && req.method === 'POST' && pathname === '/preview/restart') {
+      return handlePreviewRestart(req, res);
+    }
 
     res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'GET, POST' });
     res.end('method not allowed');
@@ -512,6 +647,79 @@ export function createBuilderServer(opts = {}) {
     return sendJson(res, 201, { id: created.project.id, project: created.project });
   }
 
+  // -------- GET /preview — only routed when a PreviewController is injected
+
+  /**
+   * Return the current served Preview handle for an authenticated + authorized
+   * (accountId, projectId) session (Req 3.1, 3.3, 3.4; Req 16.4/16.5 shape).
+   * Reuses the EXISTING gate() so an unauthenticated OR unauthorized-project
+   * request receives the IDENTICAL non-disclosing 401 ACCESS_DENIED — no Project
+   * existence/contents disclosure. Requires the projectId query param exactly as
+   * handleEvents does (400 when missing). The handle is exactly what
+   * previewController.servedPreview(projectId) returns (snapshotId, url, status,
+   * showingPrior, buildError-as-safe-summary is not applied here — the raw
+   * handle is returned only to an authorized owner over the same-origin surface;
+   * the SAFE summary is applied only to BROADCAST frames).
+   */
+  async function handlePreview(req, res) {
+    const url = new URL(req.url, 'http://localhost');
+    const projectId = url.searchParams.get('projectId');
+    if (!projectId) return sendJson(res, 400, { error: "a 'projectId' query parameter is required" });
+
+    const result = await gate(req, projectId);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const served = previewController.servedPreview(projectId);
+    return sendJson(res, 200, { preview: served });
+  }
+
+  // -------- POST /preview/restart — only routed when a PreviewController is injected
+
+  /**
+   * Restart the Dev_Server for an authenticated + authorized session (Req 3.7).
+   * Reuses the EXISTING gate() (identical non-disclosing 401 on denial) and the
+   * EXISTING projectCwd/sandboxManager wiring to resolve the Sandbox handle,
+   * never duplicating either. Delegates to previewController.restart({projectId,
+   * sandbox, targetCategory}); the restart cap (exactly 3 attempts) and its
+   * persistent-failure result are OWNED by the controller — this route only
+   * surfaces the result as JSON and broadcasts the resulting lifecycle status
+   * frame to the session's SSE clients so the Activity_Stream and Preview stay
+   * concurrent (Req 4.4). Only a SAFE summary reaches the broadcast frame.
+   */
+  async function handlePreviewRestart(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    const projectId = typeof body?.projectId === 'string' ? body.projectId : '';
+    if (!projectId) return sendJson(res, 400, { error: "a 'projectId' field is required" });
+
+    const result = await gate(req, projectId);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    // Resolve the Sandbox handle through the SAME wiring the Builder_Agent uses
+    // (reuse, do not duplicate). A missing SandboxManager simply yields an
+    // undefined handle; the controller/dev-server seam tolerates that.
+    const sandbox =
+      sandboxManager && typeof sandboxManager.acquire === 'function'
+        ? sandboxManager.acquire(projectId)
+        : undefined;
+    const targetCategory = typeof body?.targetCategory === 'string' ? body.targetCategory : undefined;
+
+    const restart = previewController.restart({ projectId, sandbox, targetCategory });
+
+    // Broadcast the lifecycle status on the SAME per-session SSE stream as the
+    // Activity_Stream so a client observing the reasoning feed also sees the
+    // preview status update (Req 4.4). Only a SAFE summary is broadcast.
+    const session = sessionFor(result.account.id, projectId);
+    session.broadcast(restartStatusFrame(restart));
+
+    return sendJson(res, 200, { restart });
+  }
+
   // -------- GET /events (SSE)
 
   async function handleEvents(req, res) {
@@ -544,6 +752,14 @@ export function createBuilderServer(opts = {}) {
     // longer see. Mirrors plumby's reconnection frame set.
     const frames = [{ type: 'turn_state', running: session.running != null }];
     if (session.running) frames.push({ type: 'turn_start' });
+    // When a PreviewController is injected, a (re)connecting client also learns
+    // the CURRENT preview status (loading/ready/showing_prior/error) so it can
+    // render the running-preview state immediately alongside the Activity_Stream
+    // (Req 4.4). Only a SAFE summary crosses the wire. Strictly additive: with
+    // no previewController the reconnection frame set is unchanged.
+    if (previewController && typeof previewController.servedPreview === 'function') {
+      frames.push(previewStatusFrame(previewController.servedPreview(projectId)));
+    }
     for (const payload of session.pendingConfirmPayloads.values()) frames.push(payload);
     for (const payload of frames) {
       try {
@@ -777,12 +993,39 @@ export function createBuilderServer(opts = {}) {
     return boundAddress ?? server.address();
   }
 
+  /**
+   * Push a Preview lifecycle status onto a specific (accountId, projectId)
+   * session's SSE stream — the SAME stream the Activity_Stream flows on (Req
+   * 4.4). This is the per-session hook a composition (ProjectManager +
+   * PreviewController) calls when the served preview changes (publish-on-commit,
+   * loading, ready, showing-prior, an unexpected exit, or a mobile QR/URL), so
+   * the client sees the preview status update concurrently with the reasoning
+   * feed. The `statusOrFrame` is either a served-preview handle (projected onto
+   * a SAFE preview_status frame) or an already-typed frame (e.g. preview_mobile).
+   * A no-op when the target session has never been touched (no client to reach).
+   *
+   * Only SAFE summaries reach the wire — no raw cause/secret. Strictly additive:
+   * unused when no previewController is injected.
+   *
+   * @param {string} accountId
+   * @param {string} projectId
+   * @param {object} statusOrFrame  a served-preview handle or a typed frame
+   * @returns {boolean} whether a live session received the frame
+   */
+  function broadcastPreviewStatus(accountId, projectId, statusOrFrame) {
+    const session = sessions.get(sessionKey(accountId, projectId));
+    if (!session) return false;
+    session.broadcastPreview(statusOrFrame);
+    return true;
+  }
+
   return Object.freeze({
     server,
     listen,
     close,
     address,
     pendingCount,
+    broadcastPreviewStatus,
     securityHeaders: () => ({ ...baselineHeaders }),
   });
 }

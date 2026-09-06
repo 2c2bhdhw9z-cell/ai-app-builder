@@ -598,6 +598,143 @@ test('pipeline: verify FAIL does NOT start the Dev_Server, surfaces the captured
   }
 });
 
+// ----------------- PreviewController wiring in finalizePass (Task 18, additive)
+
+/**
+ * A fake PreviewController that RECORDS start/publish calls. Used to prove the
+ * ProjectManager PASS path routes through it when injected, and never touches it
+ * on FAIL. Launches nothing (offline seam).
+ */
+function fakePreviewController() {
+  const startCalls = [];
+  const publishCalls = [];
+  return {
+    startCalls,
+    publishCalls,
+    start(args) {
+      startCalls.push(args);
+      return { ok: true, status: 'ready', url: `http://preview.local/${args?.projectId}`, startupMs: 1, previewAvailableMs: 2 };
+    },
+    publish(args) {
+      publishCalls.push(args);
+      return { ok: true, status: 'served', snapshotId: args?.snapshotId, publishMs: 1, showingPrior: false };
+    },
+  };
+}
+
+/** Assemble a ProjectManager with an injected PreviewController + fakes. */
+function makeManagerWithPreview({ layout, previewController, verify, snapshotStore } = {}) {
+  const registry = createProjectRegistry({ layout });
+  const sandboxManager = fakeSandboxManager();
+  const devServer = fakeDevServer();
+  const agentFactory = fakeAgentFactory();
+  const manager = createProjectManager({
+    registry,
+    sandboxManager,
+    snapshotStore,
+    previewController,
+    devServer,
+    agentFactory,
+    verify,
+    now: steppingClock(),
+    idFactory: seqIdFactory(),
+  });
+  return { manager, registry, sandboxManager, devServer, previewController };
+}
+
+test('pipeline: with an injected PreviewController, a verify-PASS turn publishes the committed snapshot exactly once and starts the preview lifecycle', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const snapshotStore = {
+      onTurnComplete() {
+        return { ok: true, committed: true, snapshotId: 'snap-77', trigger: 'turn-pass' };
+      },
+    };
+    const previewController = fakePreviewController();
+    const { manager, devServer } = makeManagerWithPreview({
+      layout,
+      previewController,
+      snapshotStore,
+      verify: () => 'verdict: PASS',
+    });
+
+    const created = manager.createProject({ accountId: OWNER, description: 'app', ...VALID });
+    const result = await manager.runGeneration({
+      project: created.project,
+      sandbox: created.sandbox,
+      message: 'build it',
+      projectTree: { 'index.js': 'export const x = 1;\n' },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.verdict, 'PASS');
+    // Routed THROUGH the PreviewController: its start was called, and the direct
+    // devServer.start was NOT (the controller owns the lifecycle now).
+    assert.equal(previewController.startCalls.length, 1, 'preview lifecycle started via the controller');
+    assert.equal(devServer.startCalls.length, 0, 'direct devServer.start bypassed when a controller is injected');
+    // The committed snapshot was published EXACTLY once with buildOk:true.
+    assert.equal(previewController.publishCalls.length, 1, 'committed snapshot published exactly once');
+    assert.equal(previewController.publishCalls[0].snapshotId, 'snap-77');
+    assert.equal(previewController.publishCalls[0].buildOk, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test('pipeline: with an injected PreviewController, a verify-FAIL turn publishes ZERO times and starts NO preview (FAIL branch is mutation-sensitive)', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const previewController = fakePreviewController();
+    const { manager, devServer } = makeManagerWithPreview({
+      layout,
+      previewController,
+      verify: () => 'verdict: FAIL\nexit code: 1\nboom',
+    });
+
+    const created = manager.createProject({ accountId: OWNER, description: 'app', ...VALID });
+    const result = await manager.runGeneration({
+      project: created.project,
+      sandbox: created.sandbox,
+      message: 'build it',
+      projectTree: { 'index.js': 'boom(' },
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.verdict, 'FAIL');
+    // A FAIL must neither start the preview lifecycle nor publish anything. A
+    // mutation that started/published on FAIL flips these assertions.
+    assert.equal(previewController.startCalls.length, 0, 'no preview start on FAIL');
+    assert.equal(previewController.publishCalls.length, 0, 'no publish on FAIL');
+    assert.equal(devServer.startCalls.length, 0, 'Dev_Server not started on FAIL');
+  } finally {
+    cleanup();
+  }
+});
+
+test('pipeline: with NO PreviewController the existing direct devServer.start behavior is unchanged (byte-identical, additive)', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const { manager, devServer } = makeManager({
+      layout,
+      verify: () => 'verdict: PASS',
+    });
+    const created = manager.createProject({ accountId: OWNER, description: 'app', ...VALID });
+    const result = await manager.runGeneration({
+      project: created.project,
+      sandbox: created.sandbox,
+      message: 'build it',
+      projectTree: { 'index.js': 'export const x = 1;\n' },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.verdict, 'PASS');
+    // No controller: the direct devServer.start still runs exactly once.
+    assert.equal(devServer.startCalls.length, 1, 'direct devServer.start unchanged with no controller');
+    assert.equal(result.preview, undefined, 'no preview field emitted without a controller');
+  } finally {
+    cleanup();
+  }
+});
+
 // ---------------------------- POST /projects endpoint (Req 1.4, gate reuse) --
 
 /** A fake IdP verifier: any idToken maps to a stable subject. */

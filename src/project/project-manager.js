@@ -97,6 +97,14 @@ const DEFAULT_MODEL = 'claude-sonnet';
  *        additive). Heal is invoked ONLY from this generation-COMPLETION path,
  *        never mid-edit — the seam itself expresses the "do not heal when the
  *        user is mid-edit" safeguard.
+ * @param {object} [args.previewController] OPTIONAL PreviewController
+ *        (src/project/preview-controller.js). When injected, finalizePass
+ *        PUBLISHES the committed Snapshot through it (the served preview reflects
+ *        the most-recent successfully-built COMMITTED Snapshot, decision (d)) and
+ *        tracks the Dev_Server lifecycle THROUGH it, layered on the same
+ *        devServer seam and threaded with the same injected clock. Its ABSENCE
+ *        keeps the existing direct devServer.start behavior BYTE-IDENTICAL —
+ *        preview publishing is strictly additive (Task 18).
  * @param {object} args.devServer       the Dev_Server seam (start/stop) — see dev-server.js
  * @param {Function} args.agentFactory  builds the Builder_Agent for a turn (plumby via engine boundary)
  * @param {Function} args.verify        the verify seam; returns plumby-verify TEXT
@@ -116,6 +124,7 @@ export function createProjectManager({
   projectOrigin,
   persistenceStore,
   selfHealingController,
+  previewController,
   devServer,
   agentFactory,
   verify,
@@ -586,11 +595,36 @@ export function createProjectManager({
    */
   function finalizePass({ project, sandbox, verifyResult, snapshot, healed } = {}) {
     const startedAt = now();
-    const started = devServer.start({
-      projectId: project.id,
-      sandbox,
-      targetCategory: project.targetCategory,
-    });
+
+    // Task 18: when a PreviewController is injected, route the PASS turn THROUGH
+    // it — start/track the Dev_Server lifecycle via the controller (layered on
+    // the SAME devServer seam) and PUBLISH the committed Snapshot so the served
+    // preview reflects the most-recent successfully-built COMMITTED Snapshot
+    // (decision (d), Req 3.3, Property 3). When NO controller is injected, the
+    // pre-existing direct devServer.start behavior is BYTE-IDENTICAL (strictly
+    // additive). The verify-FAIL branch never reaches finalizePass, so a FAIL
+    // still neither starts the Dev_Server nor publishes a preview.
+    let started;
+    let preview;
+    if (previewController && typeof previewController.start === 'function') {
+      started = previewController.start({
+        projectId: project.id,
+        sandbox,
+        targetCategory: project.targetCategory,
+      });
+      // Publish the committed Snapshot (buildOk:true — a PASS turn is a
+      // successfully-built commit). Only publish when a Snapshot was committed.
+      const snapshotId = snapshot && snapshot.ok !== false ? snapshot.snapshotId : undefined;
+      if (typeof snapshotId === 'string' && typeof previewController.publish === 'function') {
+        preview = previewController.publish({ projectId: project.id, snapshotId, buildOk: true });
+      }
+    } else {
+      started = devServer.start({
+        projectId: project.id,
+        sandbox,
+        targetCategory: project.targetCategory,
+      });
+    }
     const elapsedMs = now() - startedAt;
 
     return {
@@ -598,6 +632,7 @@ export function createProjectManager({
       verdict: 'PASS',
       verifyResult,
       devServer: started,
+      ...(preview !== undefined ? { preview } : {}),
       ...(snapshot !== undefined ? { snapshot } : {}),
       ...(healed !== undefined
         ? {

@@ -9,10 +9,23 @@
  * reaches the loop. Mirrors how src/auth/index.js, src/sandbox/index.js, and
  * src/persistence/index.js aggregate their modules.
  *
+ * When an OPTIONAL PreviewController is injected, the surface also presents the
+ * running Preview CONCURRENTLY with the Activity_Stream (Req 4.4): GET /preview
+ * returns the served Preview handle for an authorized session, POST
+ * /preview/restart restarts the Dev_Server (capped at 3 attempts), and Preview
+ * lifecycle status frames are broadcast on the SAME per-session SSE stream as the
+ * reasoning feed. This is strictly additive and behind the injected controller.
+ *
  * The Builder_Agent behind each Project Session reaches plumby ONLY through the
  * boundary module (src/engine/plumby.js); this subsystem never imports the
  * plumby package directly.
  */
 
-export { createBuilderServer, securityHeaders } from './builder-server.js';
+export {
+  createBuilderServer,
+  securityHeaders,
+  previewStatusFrame,
+  restartStatusFrame,
+  safePreviewCause,
+} from './builder-server.js';
 export { createActivityStream, toActivityFrame } from './activity-stream.js';
