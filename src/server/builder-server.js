@@ -133,6 +133,19 @@ const ACCESS_DENIED = { error: 'access denied' };
  * @param {(projectId: string) => (object|null|Promise<object|null>)} [opts.projectResolver]
  *        resolves a projectId to a control-plane project record { id, ownerId }
  *        for the authorization check. Returning null denies WITHOUT disclosure.
+ *        A ProjectRegistry's resolver (src/project/project-registry.js) is the
+ *        natural production wiring here — see opts.projectManager.
+ * @param {object} [opts.projectManager]  an OPTIONAL ProjectManager (src/project/
+ *        project-manager.js). When present, a POST /projects route is enabled that
+ *        runs the EXISTING gate() authn (no projectId yet, so authn only), then
+ *        the EXISTING QuotaManager gate for the 'project.create' operation
+ *        (checkRate) BEFORE invoking projectManager.createProject — returning 400
+ *        with the specific message on validation rejection, 429 naming the limit
+ *        on quota/rate rejection, and 201 with the created project id on success.
+ *        This is STRICTLY ADDITIVE: with no projectManager injected the server
+ *        behaves exactly as before and the /events, /message, /confirm routes are
+ *        unchanged. (When a ProjectRegistry's resolver is wired as projectResolver
+ *        above, that satisfies the open "real projectResolver" review finding.)
  * @param {number} [opts.confirmTimeoutMs=60000]  fail-closed confirm ceiling.
  * @param {() => number} [opts.now]       injectable clock.
  * @returns {object} frozen server handle.
@@ -146,6 +159,7 @@ export function createBuilderServer(opts = {}) {
     commandGuard,
     projectResolver,
     quotaManager,
+    projectManager,
     observability,
     confirmTimeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS,
     now = () => Date.now(),
@@ -423,9 +437,79 @@ export function createBuilderServer(opts = {}) {
     if (req.method === 'GET' && pathname === '/events') return handleEvents(req, res);
     if (req.method === 'POST' && pathname === '/message') return handleMessage(req, res);
     if (req.method === 'POST' && pathname === '/confirm') return handleConfirm(req, res);
+    // Strictly additive: only enabled when a ProjectManager is injected.
+    if (projectManager && req.method === 'POST' && pathname === '/projects') {
+      return handleCreateProject(req, res);
+    }
 
     res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'GET, POST' });
     res.end('method not allowed');
+  }
+
+  // -------- POST /projects (create) — only routed when a ProjectManager is injected
+
+  /**
+   * Create a Project. Reuses the EXISTING gate ordering: gate() authn (there is
+   * no projectId yet, so authn only), then the EXISTING QuotaManager gate for the
+   * 'project.create' operation (checkRate) BEFORE any allocation, then delegates
+   * to projectManager.createProject (which itself enforces the totalProjects
+   * Resource_Quota behind this gate and allocates the Sandbox). Never duplicates
+   * the gate. Responses: 400 (validation) / 429 (rate|quota, naming the limit) /
+   * 201 (created, with the project id). An unauthenticated request receives the
+   * generic access-denied — no limit disclosed before auth.
+   */
+  async function handleCreateProject(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    // AUTH GATE (authn only — no projectId exists yet at create time).
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    // RATE-LIMIT GATE for 'project.create' — AFTER authn, BEFORE any allocation.
+    if (quotaManager && typeof quotaManager.checkRate === 'function') {
+      const rate = quotaManager.checkRate(result.account, 'project.create');
+      if (rate && rate.ok === false) {
+        return sendJson(res, 429, {
+          error: rate.message ?? 'rate limit exceeded',
+          limit: rate.limit,
+          operation: rate.operation,
+        });
+      }
+    }
+
+    // Delegate to the ProjectManager (validation + totalProjects quota + acquire).
+    const created = projectManager.createProject({
+      accountId: result.account.id,
+      description: body?.description,
+      targetCategory: body?.targetCategory,
+      origin: body?.origin,
+      ref: typeof body?.ref === 'string' ? body.ref : undefined,
+    });
+
+    if (created && created.ok === false) {
+      // A Resource_Quota rejection (totalProjects OR concurrentSandboxes) is a
+      // 429 naming the limit; a post-registration Sandbox-acquire failure is a
+      // 503 (the create was rolled back, so it is retryable); every other
+      // rejection (validation) is a 400 with the specific message.
+      if (created.code === 'QUOTA_EXCEEDED') {
+        return sendJson(res, 429, {
+          error: created.message,
+          limit: created.limit,
+          resource: created.resource,
+        });
+      }
+      if (created.code === 'SANDBOX_ACQUIRE_FAILED') {
+        return sendJson(res, 503, { error: created.message, code: created.code });
+      }
+      return sendJson(res, 400, { error: created.message, code: created.code });
+    }
+
+    return sendJson(res, 201, { id: created.project.id, project: created.project });
   }
 
   // -------- GET /events (SSE)

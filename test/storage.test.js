@@ -28,6 +28,18 @@ test('exportRoot and controlRoot are siblings; neither contains the other', () =
   assert.ok(relUp.startsWith('..'), 'exportRoot must not be under controlRoot');
 });
 
+test('controlProjectRegistryRoot is the OUT-OF-TREE parent of every per-owner registry path', () => {
+  const layout = createStorageLayout(BASE);
+  const root = layout.controlProjectRegistryRoot();
+  // The registry root is out of every export tree...
+  assert.equal(layout.isInsideExportTree(root), false, 'registry root must be out-of-tree');
+  // ...and each per-owner projects.json lives directly under <root>/<ownerId>/,
+  // so the explicit accessor replaces the old __probe__ sentinel derivation.
+  const ownerPath = layout.controlProjectRegistryPath(OWNER);
+  assert.equal(path.dirname(path.dirname(ownerPath)), root, 'owner path is under the registry root');
+  assert.equal(path.basename(path.dirname(ownerPath)), OWNER, 'owner dir is keyed by ownerId');
+});
+
 test('exportable project tree, memory, and skills are INSIDE the export tree', () => {
   const layout = createStorageLayout(BASE);
   const tree = layout.exportableProjectTree(PROJECT);
