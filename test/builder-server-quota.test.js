@@ -153,7 +153,13 @@ test('the quota gate runs strictly AFTER authn/authz: an unauthenticated over-li
     config: { rate: { 'generation.turn': { max: 0, windowMs: 60_000 } } },
   });
 
-  const { base, close } = await startServer({ authService, sandboxManager, quotaManager });
+  // Inject a fake agentFactory: the server now requires either an agentFactory
+  // or a provider at construction (audit H13). This test exercises the AUTH
+  // gate, not the agent path, so the fake never runs for this unauthenticated
+  // request — it only satisfies construction.
+  const agentFactory = ({ onEvent }) => ({ agent: { async send(text) { onEvent({ type: 'assistant_text', text }); } } });
+
+  const { base, close } = await startServer({ authService, agentFactory, sandboxManager, quotaManager });
   try {
     const res = await fetch(`${base}/message`, {
       method: 'POST',

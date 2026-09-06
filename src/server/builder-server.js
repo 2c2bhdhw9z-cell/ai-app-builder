@@ -107,6 +107,20 @@ export function securityHeaders() {
 const ACCESS_DENIED = { error: 'access denied' };
 
 /**
+ * Whether `provider` is a usable plumby provider (audit H13): plumby's
+ * createAgent requires a provider exposing complete() and/or stream(). We check
+ * the shape here so a misconfigured provider fails fast at construction with a
+ * clear message rather than deep inside the loop on the first turn.
+ */
+function isUsableProvider(provider) {
+  return (
+    !!provider &&
+    typeof provider === 'object' &&
+    (typeof provider.complete === 'function' || typeof provider.stream === 'function')
+  );
+}
+
+/**
  * Project a served-preview handle (from previewController.servedPreview) onto a
  * SAFE, broadcastable preview_status frame (Req 3.1-3.7, Req 4.4). PURE, so the
  * exact shape is unit-testable and cannot drift between the /preview response,
@@ -199,6 +213,14 @@ export function restartStatusFrame(result = {}) {
  * Create the Builder Server.
  *
  * @param {object} opts
+ * @param {object} [opts.provider]    a plumby PROVIDER (from src/engine/plumby.js:
+ *        createAnthropicProvider / createGeminiProvider / createOpenRouterProvider,
+ *        or createScriptedProvider in tests). REQUIRED when no agentFactory is
+ *        injected: the default agent path builds a plumby agent, which throws
+ *        without a provider (audit H13). Construction fails fast if neither is
+ *        supplied, rather than 500ing on the first POST /message.
+ * @param {string} [opts.model]       optional model id threaded onto the default
+ *        agent build (falls back to the provider's own default).
  * @param {object} opts.authService   the AuthService gate (src/auth). Required:
  *        provides tryVerifySession(token) and authorize(account, action,
  *        resource, context) — the single authn + authz choke point.
@@ -276,12 +298,28 @@ export function createBuilderServer(opts = {}) {
     projectManager,
     observability,
     previewController,
+    provider,
+    model,
     confirmTimeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS,
     now = () => Date.now(),
   } = opts;
 
   if (!authService || typeof authService.tryVerifySession !== 'function') {
     throw new TypeError('createBuilderServer requires an authService with tryVerifySession()');
+  }
+
+  // FAIL FAST at construction (audit H13): the default agent path calls plumby's
+  // createAgent, which THROWS without a provider. Previously that throw happened
+  // mid-request on the first POST /message (a 500 for every default wiring). If
+  // no agentFactory is injected, a provider MUST be supplied here so the failure
+  // surfaces at construction, not per-request. A `model` is threaded onto the
+  // agent build. Tests inject agentFactory (scripted), so they need no provider.
+  if (typeof agentFactory !== 'function' && !isUsableProvider(provider)) {
+    throw new TypeError(
+      'createBuilderServer requires either an agentFactory or a provider ' +
+        '(the default agent path builds a plumby agent, which needs a provider). ' +
+        'Pass opts.provider (e.g. createAnthropicProvider from src/engine/plumby.js) or opts.agentFactory.',
+    );
   }
 
   const buildAgent = typeof agentFactory === 'function' ? agentFactory : defaultAgentFactory;
@@ -496,20 +534,26 @@ export function createBuilderServer(opts = {}) {
    * supplies; if a guard is present its onConfirmRequest is threaded onto the
    * agent's confirm hook so a confirm-class command reaches this server.
    */
-  function defaultAgentFactory({ cwd, onEvent }) {
-    // Command execution flows through the injected CommandGuard, which the
-    // caller wires with this session's onConfirmRequest seam (see the factory
-    // call site), so a confirm-class command reaches this server's POST /confirm
-    // rather than the plumby loop's own confirm hook. The session's `accountId`
-    // is also handed to this factory (ignored here) so a guard-wiring factory
-    // can bind it into guard.run(pid, cmd, { accountId }) and make
-    // CONFIRM_CLASS_OP audit entries attributable rather than account-null.
+  function defaultAgentFactory({ cwd, onEvent, onConfirmRequest }) {
+    // A provider is REQUIRED (audit H13): createAgent throws without one. The
+    // server construction already guaranteed a usable provider exists when no
+    // agentFactory was injected, so this cannot be reached without one.
+    // Confirm wiring (audit H13): plumby's confirm hook is named `confirm` and
+    // takes ({ command, category, reason }) -> Promise<boolean>. We thread THIS
+    // session's onConfirmRequest onto it, so a confirm-class command in the
+    // default wiring reaches this server's POST /confirm round-trip instead of
+    // being silently denied by plumby's no-hook default. When no seam is
+    // supplied, plumby's safe default (deny confirm-class) still applies.
     const agent = createAgent({
       cwd,
+      provider,
+      ...(typeof model === 'string' && model !== '' ? { model } : {}),
       system: buildSystemPrompt({ cwd }),
       tools: [...defaultTools, spawnSubagentTool],
       subagentTools,
+      subagentProvider: provider,
       onEvent,
+      ...(typeof onConfirmRequest === 'function' ? { confirm: onConfirmRequest } : {}),
     });
     return { agent };
   }

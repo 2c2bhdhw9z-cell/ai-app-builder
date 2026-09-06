@@ -23,6 +23,16 @@ export { buildSystemPrompt } from 'plumby/src/core/prompt.js';
 // The scripted (fake) provider that replays canned turns — the hermetic test seam.
 export { createScriptedProvider } from 'plumby/src/providers/scripted.js';
 
+// LIVE provider factories. Re-exported so the Builder Server can construct a
+// real provider without importing plumby directly (audit H13): createAgent
+// throws without a provider, so the default agent path was dead until the
+// boundary could supply one. Each is a factory that reads its API key from the
+// environment by default; construction here is offline (no network until a
+// request is made).
+export { createAnthropicProvider } from 'plumby/src/providers/anthropic.js';
+export { createGeminiProvider } from 'plumby/src/providers/gemini.js';
+export { createOpenRouterProvider } from 'plumby/src/providers/openrouter.js';
+
 // The permission model: the command classifier and its rule tables.
 export {
   classifyCommand,
