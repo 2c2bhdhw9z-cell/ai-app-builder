@@ -625,6 +625,13 @@ export function createBuilderServer(opts = {}) {
     const url = new URL(req.url, 'http://localhost');
     const { pathname } = url;
 
+    // Unauthenticated readiness probe (deploy/uptime checks). Placed BEFORE the
+    // auth-gated routes so a container host or load balancer can poll readiness
+    // without credentials. Discloses nothing sensitive: a fixed, minimal body.
+    if (req.method === 'GET' && pathname === '/healthz') {
+      return sendJson(res, 200, { status: 'ok' });
+    }
+
     if (req.method === 'GET' && pathname === '/events') return handleEvents(req, res);
     if (req.method === 'POST' && pathname === '/message') return handleMessage(req, res);
     if (req.method === 'POST' && pathname === '/confirm') return handleConfirm(req, res);
