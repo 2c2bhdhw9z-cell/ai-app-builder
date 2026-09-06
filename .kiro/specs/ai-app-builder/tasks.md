@@ -718,15 +718,122 @@ top of the security foundations (Auth, SecretStore, Builder Server) once those e
   - Ensure all tests pass, confirm every subsystem is wired through the Builder Server behind Auth and the
     Isolation_Boundary + CommandGuard, and ask the user if questions arise.
 
+- [ ] 31. Implement Workspace Experiences (presentation layer, non-mutating)
+  - [ ] 31.1 Add the Workspace_Experience closed enum + control-plane persistence
+    - Add a frozen `Workspace_Experience` enum to `src/model/enums.js` with exactly the five values
+      (`kiro-style`, `vibe-first`, `technical-workbench`, `mobile-command-center`, `custom`) plus an
+      `isValidWorkspaceExperience` predicate, mirroring the existing closed-enum + `isValidX` convention
+    - Persist the selected Workspace_Experience (and, for `custom`, the saved layout) **per User_Account** in
+      the control-plane storage split (out of the exported Project tree, alongside the Project registry),
+      scoped to the owning account; apply a documented default when the user has made no selection
+    - _Requirements: 27.1, 27.4, 27.5, 27.6_
+
+  - [ ] 31.2 Wire Workspace_Experience selection into the Builder Server surface (layout-only)
+    - Handle selection/switch as a surface event on the existing SSE surface (`src/server/builder-server.js`,
+      reusing the `src/web/server.js` seam): apply only layout/organization changes to the Activity_Stream,
+      Preview, chat/compose area, file/tool panels, and Session_Header; enqueue no loop turn and mutate no
+      Project files; guarantee no change to Theme, Work_Mode, source code, agent state, Project data, models,
+      Skills, Connectors, permissions, or Project_Origin; reject an out-of-enum value with the current
+      experience left in effect
+    - Support the `custom` experience as a user-arrangeable layout that is composed and saved per user
+    - _Requirements: 27.2, 27.3, 27.7_
+
+  - [ ]* 31.3 Write property test for Workspace_Experience non-mutation
+    - **Property 20: Workspace_Experience switching preserves everything but layout** — for all switches
+      among the five values, only layout changes; Theme, Work_Mode, source, agent state, Project data,
+      models, Skills, Connectors, permissions, and Project_Origin are byte-for-byte unchanged
+    - `fast-check` generates switch sequences over a snapshot of the non-layout state and asserts equality;
+      ≥100 iterations; tag `Feature: ai-app-builder, Property 20: Workspace_Experience switching preserves everything but layout`
+    - **Validates: Requirements 27.2, 27.3**
+
+  - [ ]* 31.4 Write unit tests for the five experiences + rejection
+    - all five names offered and applied layout-only; `custom` arrange + persist per user; persisted
+      selection re-applied to a later Session; default applied when unset; out-of-enum rejected leaving the
+      current experience in effect
+    - _Requirements: 27.1, 27.4, 27.5, 27.6, 27.7_
+
+- [ ] 32. Implement Work Modes (interaction flow, confirmed switch, state-preserving)
+  - [ ] 32.1 Add the Work_Mode closed enum + Session default
+    - Add a frozen `Work_Mode` enum to `src/model/enums.js` with exactly `vibe`, `spec`, `hybrid` plus an
+      `isValidWorkMode` predicate; default a new Session to `vibe` when the user makes no selection; carry the
+      active Work_Mode in per-Session presentation state
+    - _Requirements: 28.1, 28.3_
+
+  - [ ] 32.2 Offer all three modes at creation and show/switch from the Session_Header
+    - At Session creation, clearly offer all three modes as selectable choices; always display the active
+      Work_Mode in the Session_Header while the Session is active; expose a switch control that routes through
+      the existing confirm surface (`POST /confirm`, reusing the CommandGuard confirm-gating discipline for a
+      presentation/flow change) so a switch applies only after explicit user confirmation
+    - A confirmed switch reshapes only the next turn's flow (vibe = describe-and-build, spec =
+      plan/requirements-first, hybrid = blend) and preserves all Project state — source, agent state, Project
+      data, Snapshots, models, Skills, Connectors, permissions, Project_Origin, Theme, and
+      Workspace_Experience — unchanged; reject an out-of-enum mode with the current mode left in effect
+    - _Requirements: 28.2, 28.4, 28.5, 28.6, 28.7_
+
+  - [ ]* 32.3 Write property test for Work_Mode observability + confirmed, state-preserving switch
+    - **Property 21: Work_Mode is always observable and switching is confirmed and state-preserving** — the
+      active mode is always in the Session_Header; a switch applies only after explicit confirmation and
+      leaves all Project state unchanged
+    - `fast-check` models switch-request/confirm/deny sequences over a Session and asserts header
+      observability, confirm-gating, and state preservation; ≥100 iterations; tag
+      `Feature: ai-app-builder, Property 21: Work_Mode is always observable and switching is confirmed and state-preserving`
+    - **Validates: Requirements 28.4, 28.5, 28.6**
+
+  - [ ]* 32.4 Write unit tests for mode creation/default/switch/rejection
+    - all three offered at creation; `vibe` default when unselected; header always shows active mode;
+      unconfirmed switch not applied; confirmed switch preserves state; out-of-enum rejected leaving the
+      current mode in effect
+    - _Requirements: 28.1, 28.2, 28.3, 28.4, 28.5, 28.6, 28.7_
+
+- [ ] 33. Implement Themes (persisted visual preference, independent of experience/mode)
+  - [ ] 33.1 Add the Theme closed-but-extensible enum + per-user persistence
+    - Add a frozen `Theme` enum to `src/model/enums.js` whose initial members are `light` and `dark`,
+      documented as extensible only by a spec change (never open-ended input), plus an `isValidTheme`
+      predicate; persist the selected Theme **per User_Account** in the control-plane settings and re-apply it
+      to the user's subsequent Sessions
+    - _Requirements: 29.1, 29.2, 29.3_
+
+  - [ ] 33.2 Apply Theme on the surface, independent and non-mutating
+    - Apply a Theme selection as a visual-only surface change on the existing SSE surface; keep the Theme
+      independent of the Workspace_Experience and Work_Mode (changing one never changes the others);
+      guarantee a Theme change alters no source code, agent state, Project data, models, Skills, Connectors,
+      permissions, Work_Mode, or Project_Origin; reject an out-of-enum value with the current Theme left in
+      effect
+    - _Requirements: 29.4, 29.5, 29.6_
+
+  - [ ]* 33.3 Write property test for Theme non-mutation + independence
+    - **Property 22: Theme change preserves state and is independent** — a Theme change alters visuals only
+      and leaves source, agent state, Project data, models, Skills, Connectors, permissions, Work_Mode,
+      Workspace_Experience, and Project_Origin unchanged; the persisted Theme is independent of experience
+      and mode
+    - `fast-check` generates Theme switch sequences and asserts visuals-only change and independence; ≥100
+      iterations; tag `Feature: ai-app-builder, Property 22: Theme change preserves state and is independent`
+    - **Validates: Requirements 29.4, 29.5**
+
+  - [ ]* 33.4 Write unit tests for theme values/persistence/independence/rejection
+    - at least `light` and `dark` offered; selection persists per user and re-applies to a later Session;
+      independent of experience and mode; out-of-enum rejected leaving the current Theme in effect
+    - _Requirements: 29.1, 29.2, 29.3, 29.4, 29.6_
+
+- [ ] 34. Checkpoint - workspace experiences, work modes, and themes
+  - Ensure all tests pass, confirm the three presentation features are wired on the existing Builder Server
+    SSE surface and persisted per User_Account in the control-plane split, mutate no Project data or agent
+    state, and ask the user if questions arise.
+
 ## Notes
 
 - Tasks marked with `*` are optional test sub-tasks and can be skipped for a faster MVP; they remain in the
   dependency graph for scheduling.
 - Each task references specific requirement clauses and/or correctness properties for traceability.
-- The 19 correctness properties are each implemented by a single property-based test (≥100 iterations) with
+- The 22 correctness properties are each implemented by a single property-based test (≥100 iterations) with
   a real PBT library (`fast-check`), tagged `Feature: ai-app-builder, Property N: {title}`. Properties 7, 11,
   12, and 13 are toolchain-backed and use plumby's `eval/runner.js` hermetic-temp-dir pattern with the
-  scripted provider.
+  scripted provider. Properties 20–22 are the presentation-layer non-mutation invariants (tasks 31–33).
+- Workspace Experiences (Req 27), Work Modes (Req 28), and Themes (Req 29) are a presentation/surface layer
+  (tasks 31–34): they ride the existing Builder Server SSE surface and Session_Header, persist per
+  User_Account in the control-plane storage split, use new closed enums in `src/model/enums.js`, and mutate
+  no Project data or agent state. They depend on the Builder Server (task 10) and Auth (task 4) and so are
+  scheduled after the full-system checkpoint.
 - The security-critical foundations (Isolation_Boundary, Auth, CommandGuard fail-closed / refuse-never-runs,
   secret non-leakage) are built and tested early (tasks 4–8) because every later subsystem depends on them.
 - The cross-cutting platform-operations subsystems — rate limiting/quotas (Req 23), data
@@ -774,7 +881,10 @@ top of the security foundations (Auth, SecretStore, Builder Server) once those e
     { "id": 27, "tasks": ["26.2", "26.3", "27.1"] },
     { "id": 28, "tasks": ["26.4", "27.2"] },
     { "id": 29, "tasks": ["27.3", "27.4", "27.5", "27.6", "29.1"] },
-    { "id": 30, "tasks": ["29.2"] }
+    { "id": 30, "tasks": ["29.2"] },
+    { "id": 31, "tasks": ["31.1", "32.1", "33.1"] },
+    { "id": 32, "tasks": ["31.2", "32.2", "33.2"] },
+    { "id": 33, "tasks": ["31.3", "31.4", "32.3", "32.4", "33.3", "33.4"] }
   ]
 }
 ```

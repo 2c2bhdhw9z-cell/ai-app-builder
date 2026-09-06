@@ -71,6 +71,10 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 - **Rate_Limit**: A configured ceiling on the number of resource-creating operations a User_Account may perform within a time window (e.g., Project creations, builds, deployments, or generation turns per minute).
 - **Resource_Quota**: A configured ceiling on the resources a User_Account or Project may consume concurrently or in total (e.g., maximum concurrent Sandboxes, maximum total Projects, and the per-Sandbox CPU/memory/execution-time limits).
 - **Encryption_At_Rest**: The property that a stored value is persisted in encrypted form on disk so that the raw value is not recoverable from the stored bytes without the decryption key.
+- **Workspace_Experience**: A user-selected arrangement of the builder's surfaces (the Activity_Stream, the Preview, the chat/compose area, file and tool panels, and the session header) that governs only layout and organization. One of `kiro-style`, `vibe-first`, `technical-workbench`, `mobile-command-center`, or `custom`. A Workspace_Experience is presentation-only: it MUST NOT change the Theme, the Work_Mode, source code, agent state, Project data, models, Skills, Connectors, permissions, or Project_Origin. `custom` is a user-arrangeable layout the user composes and saves.
+- **Session_Header**: The persistent header region of a Project Session that always displays the active Work_Mode and offers a user-confirmed control to switch it, alongside the current Workspace_Experience and Theme.
+- **Work_Mode**: A user-selected interaction flow for a Session, governing how the user and Builder_Agent collaborate. One of `vibe` (describe-and-build: the user describes intent and the Builder_Agent builds directly), `spec` (plan/requirements-first: the Builder_Agent produces a plan or requirements the user reviews before building), or `hybrid` (a blend of the two). `vibe` is the default for new Sessions. A Work_Mode changes interaction flow only and MUST NOT destroy or mutate Project state.
+- **Theme**: A user-selectable visual appearance setting that persists per User_Account, at minimum `light` and `dark`, defined as a closed but extensible enum. A Theme is a visual preference only, independent of Workspace_Experience and Work_Mode; changing a Theme MUST NOT alter source code, agent state, Project data, models, Skills, Connectors, permissions, Work_Mode, or Project_Origin.
 
 ## Requirements
 
@@ -463,6 +467,47 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 6. WHEN a user revokes a Share_Link, THE AI_App_Builder SHALL deny all subsequent access via that Share_Link within 5 seconds of revocation.
 7. IF a user requests revocation of a Share_Link that does not exist or was already revoked, THEN THE AI_App_Builder SHALL report that no active Share_Link matched and SHALL make no change to other Share_Links.
 
+### Requirement 27: Workspace Experiences
+
+**User Story:** As a builder user, I want to choose how my workspace is laid out — a Kiro-style layout, a vibe-first layout, a technical workbench, a mobile command center, or my own custom arrangement — so that the surfaces are organized the way I work, without any of my choices touching my project, my code, or my other settings.
+
+#### Acceptance Criteria
+
+1. THE AI_App_Builder SHALL offer exactly five Workspace_Experiences, identified by name: "Kiro-style Workspace" (`kiro-style`), "Vibe-first Workspace" (`vibe-first`), "Technical Workbench" (`technical-workbench`), "Mobile Command Center" (`mobile-command-center`), and "Custom Workspace" (`custom`).
+2. WHEN a user selects a Workspace_Experience, THE AI_App_Builder SHALL apply only layout and organization changes to the builder surfaces (the arrangement, visibility, and sizing of the Activity_Stream, Preview, chat/compose area, file and tool panels, and Session_Header).
+3. WHEN a user selects or switches a Workspace_Experience, THE AI_App_Builder SHALL NOT change the Theme, the Work_Mode, any Project source code, agent state, Project data, the selected models, Skills, Connectors, permissions, or Project_Origin.
+4. WHERE a user selects the "Custom Workspace" (`custom`) Workspace_Experience, THE AI_App_Builder SHALL allow the user to arrange the builder surfaces into a layout and SHALL persist that arrangement per User_Account.
+5. THE AI_App_Builder SHALL persist the selected Workspace_Experience per User_Account and SHALL apply it to that user's subsequent Sessions until the user selects a different Workspace_Experience.
+6. THE AI_App_Builder SHALL provide a default Workspace_Experience for a user who has made no selection, and SHALL apply that default without altering any Project data or other setting.
+7. IF a user selects a Workspace_Experience that is not one of the five defined values, THEN THE AI_App_Builder SHALL reject the selection, SHALL leave the current Workspace_Experience in effect, and SHALL return an error indicating the Workspace_Experience is unsupported.
+
+### Requirement 28: Work Modes
+
+**User Story:** As a builder user, I want to choose how I collaborate with the agent — describe-and-build, plan-first, or a blend — and always see and change the active mode from the session header, so that I can work the way that fits the task without ever losing my project state.
+
+#### Acceptance Criteria
+
+1. THE AI_App_Builder SHALL support exactly three Work_Modes: `vibe` (describe-and-build), `spec` (plan/requirements-first then build), and `hybrid` (a blend of the two).
+2. WHEN a user creates a new Session, THE AI_App_Builder SHALL clearly offer all three Work_Modes — `vibe`, `spec`, and `hybrid` — as selectable choices.
+3. WHERE a user creates a new Session without selecting a Work_Mode, THE AI_App_Builder SHALL default the Session to `vibe`.
+4. WHILE a Session is active, THE AI_App_Builder SHALL always display the active Work_Mode in the Session_Header.
+5. WHEN a user requests a Work_Mode switch from the Session_Header, THE AI_App_Builder SHALL require an explicit user confirmation before applying the switch, and SHALL apply the switch only if confirmation is granted.
+6. WHEN a Work_Mode switch is confirmed, THE AI_App_Builder SHALL change only the interaction flow and SHALL preserve all Project state — source code, agent state, Project data, Snapshots, models, Skills, Connectors, permissions, Project_Origin, Theme, and Workspace_Experience — unchanged.
+7. IF a user selects a Work_Mode that is not one of `vibe`, `spec`, or `hybrid`, THEN THE AI_App_Builder SHALL reject the selection, SHALL leave the current Work_Mode in effect, and SHALL return an error indicating the Work_Mode is unsupported.
+
+### Requirement 29: Themes
+
+**User Story:** As a builder user, I want to pick a visual theme such as light or dark that sticks across my sessions, so that the platform looks the way I prefer without that choice affecting my project, my code, or my other settings.
+
+#### Acceptance Criteria
+
+1. THE AI_App_Builder SHALL offer a user-selectable Theme with at least `light` and `dark` values, defined as a closed but extensible enum.
+2. WHEN a user selects a Theme, THE AI_App_Builder SHALL apply only the visual appearance change and SHALL persist the selected Theme per User_Account.
+3. THE AI_App_Builder SHALL apply a user's persisted Theme to that user's subsequent Sessions until the user selects a different Theme.
+4. THE AI_App_Builder SHALL keep the Theme independent of the Workspace_Experience and the Work_Mode, such that changing a Workspace_Experience or a Work_Mode does not change the Theme and changing the Theme does not change either of them.
+5. WHEN a user changes the Theme, THE AI_App_Builder SHALL NOT alter any Project source code, agent state, Project data, the selected models, Skills, Connectors, permissions, Work_Mode, or Project_Origin.
+6. IF a user selects a Theme that is not one of the defined values, THEN THE AI_App_Builder SHALL reject the selection, SHALL leave the current Theme in effect, and SHALL return an error indicating the Theme is unsupported.
+
 ## Correctness Properties (for Property-Based Testing)
 
 The following invariants are candidates for property-based testing. Each is stated so that it holds for all valid inputs.
@@ -486,3 +531,6 @@ The following invariants are candidates for property-based testing. Each is stat
 17. **Memory is fully exportable.** FOR ALL memory stores, exporting the memory SHALL reproduce every current Memory_Entry as human-readable content with no hidden state omitted. (Invariant; supports Requirement 14.)
 18. **Off mode adds nothing automatically.** FOR ALL memory stores under Memory_Mode `off`, no Memory_Entry SHALL be added except by explicit user action. (Invariant; supports Requirement 14.)
 19. **Skills remain portable.** FOR ALL Skills in a user's Skill_Library, each Skill SHALL remain a valid open-format Agent Skill (a SKILL.md with `name` and `description`) that can be exported and loaded by another Agent Skills-compatible tool. (Invariant; supports Requirement 13.)
+20. **Workspace_Experience switching preserves everything but layout.** FOR ALL Workspace_Experience selections among the five defined values, switching the Workspace_Experience SHALL change only surface layout/organization and SHALL leave the Theme, Work_Mode, Project source code, agent state, Project data, models, Skills, Connectors, permissions, and Project_Origin byte-for-byte unchanged. (Invariant; supports Requirement 27.)
+21. **Work_Mode is always observable and switching is confirmed and state-preserving.** FOR ALL active Sessions, the active Work_Mode SHALL be observable in the Session_Header at all times; and FOR ALL Work_Mode switch requests, the switch SHALL be applied only after explicit user confirmation and SHALL leave all Project state — source code, agent state, Project data, Snapshots, models, Skills, Connectors, permissions, Project_Origin, Theme, and Workspace_Experience — unchanged. (Invariant; supports Requirement 28.)
+22. **Theme change preserves state and is independent.** FOR ALL Theme selections among the defined values, changing the Theme SHALL alter only visual appearance and SHALL leave source code, agent state, Project data, models, Skills, Connectors, permissions, Work_Mode, Workspace_Experience, and Project_Origin unchanged; and the persisted Theme SHALL be independent of the Workspace_Experience and Work_Mode. (Invariant; supports Requirement 29.)
