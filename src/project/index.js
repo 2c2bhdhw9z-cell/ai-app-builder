@@ -24,6 +24,12 @@ export { createProjectRegistry } from './project-registry.js';
 
 export { createDevServer } from './dev-server.js';
 
+// The iterative-refinement router (Task 16.1, Req 2.1-2.7): routes a follow-up
+// turn to edit ONLY files within the existing Project via plumby's edit_file
+// exact-string replacement, renders the change as a <=2s diff, and surfaces the
+// not-uniquely-located / file-not-found / no-changes-applied error contracts.
+export { createRefinementRouter, DIFF_SLO_MS } from './refinement.js';
+
 // The REAL Template library (Task 15.1) + the baseline-build/instantiation SLO
 // check. `createTemplateProvider` is the production `templateProvider` the
 // Task-14 'template' Project_Origin consumes via `forCategory`.

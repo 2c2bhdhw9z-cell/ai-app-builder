@@ -33,6 +33,7 @@ export {
 // Individual tools we surface directly.
 export { verifyTool } from 'plumby/src/tools/verify.js';
 export { loadSkillTool } from 'plumby/src/tools/load_skill.js';
+export { editFileTool } from 'plumby/src/tools/edit_file.js';
 
 // Skill discovery: the surface loader and the core indexer.
 export { loadSkills } from 'plumby/src/cli/project_context.js';
