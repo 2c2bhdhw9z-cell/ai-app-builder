@@ -18,6 +18,27 @@
 
 export { createProjectManager, MAX_DESCRIPTION_CHARS } from './project-manager.js';
 
+// The shared verify-seam result parser (Req 20.1): the single 'verdict:
+// PASS'/'verdict: FAIL' TEXT-contract parser that BOTH the ProjectManager
+// (runGeneration) and the Self-Healing controller import, so no duplicated
+// parser can drift out of agreement.
+export { normalizeVerifyResult } from './verify-result.js';
+
+// The Self-Healing controller (Task 17.1, Req 20.1-20.11): a bounded,
+// observable, cancellation-aware verify-driven loop that, on a plumby verify
+// FAIL, feeds the failure back to the Builder_Agent and re-verifies — stopping
+// on PASS, at a strict max-attempt cap, or early on a repeated failure signature
+// (oscillation), and on give-up leaves the files editable. It REUSES plumby
+// verify + the Builder_Agent loop ONLY through injected seams (never imports the
+// plumby package) and reuses the SnapshotStore turn-pass policy on a healed PASS.
+export {
+  createSelfHealingController,
+  failureSignatureOf,
+  MAX_ATTEMPTS_FLOOR,
+  MAX_ATTEMPTS_CEILING,
+  HEAL_CONFIG_DEFAULTS,
+} from './self-healing.js';
+
 export { createProjectOrigin, TEMPLATE_POPULATE_SLO_MS } from './project-origins.js';
 
 export { createProjectRegistry } from './project-registry.js';
