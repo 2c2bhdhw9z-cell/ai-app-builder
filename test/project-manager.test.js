@@ -38,6 +38,7 @@ import { fileURLToPath } from 'node:url';
 
 import { createStorageLayout } from '../src/storage/layout.js';
 import { createProjectRegistry } from '../src/project/project-registry.js';
+import { createPersistenceStore } from '../src/persistence/index.js';
 import { createProjectManager, MAX_DESCRIPTION_CHARS } from '../src/project/project-manager.js';
 import { Target_Category, Project_Origin } from '../src/model/enums.js';
 import { createBuilderServer } from '../src/server/index.js';
@@ -935,3 +936,80 @@ function makeRegistryCount(base, ownerId) {
     throw err;
   }
 }
+
+// -------------------------------------------- audit H14: populateOrigin rollback
+
+/** A valid Project record to hand populateOrigin (already "registered"). */
+function projectForOrigin(id, ownerId) {
+  return {
+    id,
+    ownerId,
+    description: 'demo',
+    targetCategory: 'web',
+    origin: 'github-import',
+    originRef: 'https://example.com/repo.git',
+    targets: [],
+    snapshots: [],
+    connectors: [],
+    sandboxId: `sbx-${id}`,
+    provider: 'anthropic',
+    model: 'claude-sonnet',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  };
+}
+
+test('H14: a THROWING persist during populateOrigin rolls back the sandbox + registry', async () => {
+  const { base, layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    // Real PersistenceStore (debounce 0 => persist writes immediately and its
+    // normalizeTree THROWS on a bad tree key).
+    const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+
+    // Track sandbox release so we can prove rollback reaped the sandbox.
+    const released = [];
+    const sandboxManager = {
+      acquireCalls: [],
+      acquire(projectId) { this.acquireCalls.push(projectId); return { projectId, handle: `sbx:${projectId}` }; },
+      release(projectId) { released.push(projectId); return { ok: true }; },
+      activeProjectIds() { return [...new Set(this.acquireCalls)].filter((id) => !released.includes(id)); },
+    };
+
+    // A ProjectOrigin whose populate SUCCEEDS but returns a tree with an
+    // attacker-influenced filename that persist() REJECTS BY THROWING (a `..`
+    // segment) — the github-import hazard the audit describes.
+    const projectOrigin = {
+      async populate() {
+        return { ok: true, origin: 'github-import', populateMs: 1, projectTree: { '../escape.txt': 'evil' } };
+      },
+    };
+
+    const manager = createProjectManager({
+      registry,
+      sandboxManager,
+      projectOrigin,
+      persistenceStore,
+      devServer: fakeDevServer(),
+      agentFactory: () => ({ agent: { async send() {} } }),
+      idFactory: () => 'proj-h14',
+    });
+
+    const project = projectForOrigin('proj-h14', OWNER);
+    registry.register(project); // simulate the create having registered it
+
+    const res = await manager.populateOrigin({ project, sandbox: { projectId: project.id } });
+
+    // Pre-fix, the persist throw escaped and NONE of this held.
+    assert.equal(res.ok, false, 'a throwing persist is a structured failure, not an escape');
+    assert.equal(res.code, 'ORIGIN_PERSIST_FAILED');
+
+    // Rollback ran: sandbox reaped and registry entry gone (no orphan / no quota leak).
+    assert.ok(released.includes(project.id), 'the sandbox was released on persist failure');
+    assert.equal(sandboxManager.activeProjectIds().includes(project.id), false, 'no leaked active sandbox');
+    assert.equal(registry.get(project.id), null, 'the registry entry was rolled back');
+    assert.equal(makeRegistryCount(base, OWNER), 0, 'no partial project persisted');
+  } finally {
+    cleanup();
+  }
+});

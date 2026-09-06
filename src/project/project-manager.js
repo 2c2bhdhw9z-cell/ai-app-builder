@@ -419,10 +419,29 @@ export function createProjectManager({
     // durably (persist + flush). If the persistence write itself fails, roll back
     // as well so no orphaned Sandbox / partial Project survives.
     if (persistenceStore && typeof persistenceStore.persist === 'function') {
-      persistenceStore.persist(project.id, populated.projectTree);
-      const flushed = typeof persistenceStore.flush === 'function'
-        ? persistenceStore.flush(project.id)
-        : { ok: true };
+      // persist()/flush() can THROW, not just return { ok:false } (audit H14):
+      // the real store's normalizeTree rejects an absolute key, a `..` segment,
+      // an empty key, or a non-string/Buffer value by THROWING — and a
+      // github-import clone carries attacker-influenced filenames. Pre-fix, that
+      // throw escaped populateOrigin, so rollbackAfterAcquire never ran: the
+      // Project stayed registered, its Sandbox stayed acquired forever
+      // (permanently consuming the owner's concurrentSandboxes quota), and its
+      // tree was empty. Wrap BOTH the structured-error and the thrown-error
+      // paths so any persist failure rolls back and returns ORIGIN_PERSIST_FAILED.
+      let flushed;
+      try {
+        persistenceStore.persist(project.id, populated.projectTree);
+        flushed = typeof persistenceStore.flush === 'function'
+          ? persistenceStore.flush(project.id)
+          : { ok: true };
+      } catch (err) {
+        rollbackAfterAcquire(project.id, project.ownerId);
+        return {
+          ok: false,
+          code: 'ORIGIN_PERSIST_FAILED',
+          message: `failed to persist origin tree for project ${project.id}: ${err?.message ?? err}`,
+        };
+      }
       if (flushed && flushed.ok === false) {
         rollbackAfterAcquire(project.id, project.ownerId);
         return {
