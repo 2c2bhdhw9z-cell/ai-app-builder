@@ -26,7 +26,10 @@
  * OFFLINE / HERMETIC: every time bound and every wait is measured against the
  * injected `now` clock; no real sleeps. The whole loop is verifiable offline via
  * the scripted-provider harness (test/support/scripted-agent.js) plus spy/counter
- * fakes for the verify + agentFactory seams.
+ * fakes for the verify + agentFactory seams. The injected `now` clock stamps an
+ * `at` timestamp on every per-attempt history record and observability event, so
+ * heal visibility is time-ordered against the SAME injected clock the rest of the
+ * pipeline uses (no wall-clock reads inside the loop).
  *
  * Conventions: a factory returning Object.freeze({...}); dependency injection for
  * the clock and every collaborator; structured { ok:true|false, code?, ... }
@@ -60,21 +63,30 @@ export const HEAL_CONFIG_DEFAULTS = Object.freeze({
  * identical error compare EQUAL even though their raw text differs run-to-run:
  *   - absolute filesystem paths          -> '<path>'
  *   - hex object ids / addresses (0x..)  -> '<hex>'
- *   - standalone PIDs / long digit runs  -> '<num>'
+ *   - long digit runs (PIDs/ports/offs)  -> '<num>'
  *   - ISO-8601 timestamps                -> '<ts>'
  *   - clock times (HH:MM:SS[.mmm])       -> '<time>'
  *   - carriage returns + trailing WS     -> collapsed
+ *
+ * OVER-NORMALIZATION GUARD (Req 20.8 — "the same error recurring"): we do NOT
+ * blanket-collapse ALL multi-digit numbers, because a short numeric error/status
+ * code or line number is frequently the ONLY discriminator between two GENUINELY
+ * different failures (e.g. HTTP 404 vs 500, or a compile error on line 12 vs 87).
+ * Collapsing those would hash two distinct failures equal and trigger a PREMATURE
+ * 'oscillation' stop that abandons a still-progressing fix. So the two fields are
+ * normalized at DIFFERENT strengths:
+ *   - `failureLines` (the discriminating summary) preserves SHORT numeric tokens
+ *     (1..3 digits — status/error codes, line numbers) and only collapses LONG
+ *     runs (4+ digits — PIDs, ports, byte offsets that vary per run);
+ *   - `outputTail` (noisy scrollback) collapses ALL multi-digit runs (2+), since
+ *     it carries the volatile pid/port/offset noise we explicitly want to ignore.
  * The result is a short hex digest, so signatures are cheap to compare and store.
  *
  * @param {object} verifyResult  a VerifyResult ({ verdict, exitCode, failureLines, outputTail })
  * @returns {string} a stable signature (hex digest)
  */
-export function failureSignatureOf(verifyResult) {
-  const vr = verifyResult ?? {};
-  const exitCode = typeof vr.exitCode === 'number' ? vr.exitCode : '';
-  const raw = `${vr.failureLines ?? ''}\n${vr.outputTail ?? ''}`;
-
-  const normalized = raw
+function normalizeFailureText(text, { collapseShortNumbers }) {
+  const normalized = String(text ?? '')
     .replace(/\r/g, '')
     // ISO-8601 timestamps (2024-01-02T03:04:05.678Z and friends).
     .replace(/\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:?\d{2})?/g, '<ts>')
@@ -84,17 +96,34 @@ export function failureSignatureOf(verifyResult) {
     .replace(/(?:[A-Za-z]:)?(?:\/[\w.\-@ ]+)+\/?/g, '<path>')
     .replace(/[A-Za-z]:\\(?:[\w.\-@ ]+\\?)+/g, '<path>')
     // Hex ids / addresses.
-    .replace(/0x[0-9a-fA-F]+/g, '<hex>')
-    // Long digit runs (PIDs, ports, line/col offsets that vary per run).
-    .replace(/\b\d{2,}\b/g, '<num>')
+    .replace(/0x[0-9a-fA-F]+/g, '<hex>');
+
+  // Digit-run collapse: ALL multi-digit runs for the noisy outputTail, but only
+  // LONG (4+) runs for failureLines so short error/status/line codes survive as
+  // discriminators (see the OVER-NORMALIZATION GUARD note above).
+  const withNums = collapseShortNumbers
+    ? normalized.replace(/\b\d{2,}\b/g, '<num>')
+    : normalized.replace(/\b\d{4,}\b/g, '<num>');
+
+  return withNums
     // Collapse trailing whitespace per line and blank runs.
     .split('\n')
     .map((line) => line.replace(/\s+$/g, ''))
     .join('\n')
     .replace(/\n{2,}/g, '\n')
     .trim();
+}
 
-  return createHash('sha256').update(`${exitCode}\u0000${normalized}`).digest('hex').slice(0, 32);
+export function failureSignatureOf(verifyResult) {
+  const vr = verifyResult ?? {};
+  const exitCode = typeof vr.exitCode === 'number' ? vr.exitCode : '';
+  const failureLines = normalizeFailureText(vr.failureLines, { collapseShortNumbers: false });
+  const outputTail = normalizeFailureText(vr.outputTail, { collapseShortNumbers: true });
+
+  return createHash('sha256')
+    .update(`${exitCode}\u0000${failureLines}\u0000${outputTail}`)
+    .digest('hex')
+    .slice(0, 32);
 }
 
 /**
@@ -182,8 +211,12 @@ export function createSelfHealingController({
     return { ok: true, enabled, maxAttempts: rawMax };
   }
 
-  /** Emit a per-attempt operational event + metric, when observability is injected. */
-  function emitAttempt({ projectId, attempt, verdict, signature }) {
+  /**
+   * Emit a per-attempt operational event + metric, when observability is
+   * injected. `at` is stamped from the injected `now` clock so heal events are
+   * time-ordered against the same clock the rest of the pipeline uses.
+   */
+  function emitAttempt({ projectId, attempt, verdict, signature, at }) {
     if (!observability) return;
     if (typeof observability.emitOperationalEvent === 'function') {
       observability.emitOperationalEvent({
@@ -193,10 +226,11 @@ export function createSelfHealingController({
         attempt,
         verdict,
         signature,
+        at,
       });
     }
     if (typeof observability.emitMetric === 'function') {
-      observability.emitMetric('self_heal.attempt', { subsystem: 'build', projectId, attempt, verdict });
+      observability.emitMetric('self_heal.attempt', { subsystem: 'build', projectId, attempt, verdict, at });
     }
   }
 
@@ -300,9 +334,10 @@ export function createSelfHealingController({
         verdict: currentResult.verdict,
         signature: failureSignatureOf(currentResult),
         failureLines: currentResult.failureLines,
+        at: now(),
       },
     ];
-    emitAttempt({ projectId: project.id, attempt: 0, verdict: currentResult.verdict, signature: history[0].signature });
+    emitAttempt({ projectId: project.id, attempt: 0, verdict: currentResult.verdict, signature: history[0].signature, at: history[0].at });
 
     const diffs = [];
 
@@ -341,6 +376,13 @@ export function createSelfHealingController({
       const diff = sendResult && (sendResult.diff ?? sendResult.diffs);
       if (diff !== undefined) diffs.push({ attempt, diff });
 
+      // Re-check cancellation AFTER the agent turn resolves but BEFORE the
+      // re-verify: an abort that lands during/after the agent turn must NOT
+      // trigger one more verify — stop cleanly with the same CANCELLED result.
+      if (signal && signal.aborted) {
+        return cancelled({ attempts: attempt - 1, currentResult, history });
+      }
+
       // Re-run verify after the attempt (Req 20.4). A verify seam that cannot
       // produce a verdict inside the loop stops cleanly (Req 20.2 applies to a
       // re-verify too): report VERIFY_UNAVAILABLE with the attempt count.
@@ -350,8 +392,8 @@ export function createSelfHealingController({
       }
       currentResult = reverify.verifyResult;
       const signature = failureSignatureOf(currentResult);
-      history.push({ attempt, verdict: currentResult.verdict, signature, failureLines: currentResult.failureLines });
-      emitAttempt({ projectId: project.id, attempt, verdict: currentResult.verdict, signature });
+      history.push({ attempt, verdict: currentResult.verdict, signature, failureLines: currentResult.failureLines, at: now() });
+      emitAttempt({ projectId: project.id, attempt, verdict: currentResult.verdict, signature, at: history[history.length - 1].at });
 
       // On PASS: STOP immediately (Req 20.7). Do NOT run another agent turn.
       if (currentResult.verdict === VERIFY_VERDICTS[0]) {

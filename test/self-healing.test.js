@@ -277,6 +277,26 @@ test('(4b) failureSignatureOf is stable across volatile noise (paths/timestamps/
   assert.notEqual(a, c, 'a real difference produces a different signature');
 });
 
+test('(4c) two failures differing ONLY in a short multi-digit code/line number are DISTINGUISHED (no premature oscillation, Req 20.8)', () => {
+  // Over-normalization guard: a short numeric status/error code is often the ONLY
+  // discriminator between two genuinely-different failures. Collapsing it would
+  // hash them equal and prematurely stop a still-progressing fix. failureLines
+  // preserves short (1..3 digit) numeric tokens, so these must DIFFER.
+  const http404 = failureSignatureOf({ verdict: 'FAIL', exitCode: 1, failureLines: 'request failed with status 404', outputTail: 'see log' });
+  const http500 = failureSignatureOf({ verdict: 'FAIL', exitCode: 1, failureLines: 'request failed with status 500', outputTail: 'see log' });
+  assert.notEqual(http404, http500, 'HTTP 404 vs 500 must NOT collapse to the same signature');
+
+  const line12 = failureSignatureOf({ verdict: 'FAIL', exitCode: 1, failureLines: 'SyntaxError at line 12', outputTail: '' });
+  const line87 = failureSignatureOf({ verdict: 'FAIL', exitCode: 1, failureLines: 'SyntaxError at line 87', outputTail: '' });
+  assert.notEqual(line12, line87, 'a compile error on line 12 vs line 87 must NOT collapse');
+
+  // But a genuinely LONG digit run (pid/port/offset) in failureLines still
+  // collapses — those are volatile noise, not a discriminator.
+  const pidA = failureSignatureOf({ verdict: 'FAIL', exitCode: 1, failureLines: 'worker crashed pid 48213', outputTail: '' });
+  const pidB = failureSignatureOf({ verdict: 'FAIL', exitCode: 1, failureLines: 'worker crashed pid 91375', outputTail: '' });
+  assert.equal(pidA, pidB, 'long PID runs are still normalized away');
+});
+
 // ---------------------------------------------------------------------- cancellation
 
 test('(5) an already-aborted signal aborts cleanly with NO agent/verify calls', async () => {
@@ -307,6 +327,29 @@ test('(5b) an agent turn returning stopReason:aborted stops the loop with no fur
   assert.equal(res.code, 'CANCELLED');
   assert.equal(agentFactory.sends.length, 1, 'the aborted turn was attempted once');
   assert.equal(verify.calls.length, 0, 'no re-verify after an aborted agent turn');
+});
+
+test('(5c) an abort landing DURING the agent turn (before it resolves normally) triggers NO extra verify (mid-loop cancellation window)', async () => {
+  // The agent turn resolves NORMALLY (not stopReason:aborted, no throw) but the
+  // signal has already been aborted by the time it returns. The controller must
+  // re-check the signal BEFORE safeVerify so the abort does not trigger one more
+  // verify — it returns the same clean CANCELLED result.
+  const ac = new AbortController();
+  const verify = scriptedVerify([PASS_TEXT]);
+  const agentFactory = countingAgentFactory(() => {
+    // Abort mid-turn, then resolve normally (no thrown abort, no aborted flag).
+    ac.abort();
+    return { stopReason: 'end_turn', diff: 'partial fix' };
+  });
+  const controller = createSelfHealingController({ agentFactory, verify, defaultMaxAttempts: 5 });
+
+  const res = await controller.heal({ project: PROJECT, sandbox: SANDBOX, verifyResult: failResult(), signal: ac.signal });
+
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'CANCELLED');
+  assert.equal(res.editable, true);
+  assert.equal(agentFactory.sends.length, 1, 'the one in-flight agent turn ran');
+  assert.equal(verify.calls.length, 0, 'NO re-verify runs after the mid-turn abort');
 });
 
 // ---------------------------------------------------------------------- 20.6 (disabled)
@@ -374,6 +417,27 @@ test('(8) observability emits a per-attempt self_heal_attempt event (Activity St
   assert.equal(observability.events[0].subsystem, 'build');
   assert.ok(observability.events.some((e) => e.verdict === 'PASS'));
   assert.ok(observability.metrics.length >= 1);
+});
+
+test('(8b) the injected now() clock stamps `at` on every attempt event, metric, and history record (Req 20 time seam)', async () => {
+  const verify = scriptedVerify([PASS_TEXT]);
+  const agentFactory = countingAgentFactory(() => ({ stopReason: 'end_turn' }));
+  const observability = spyObservability();
+  // A deterministic monotonic clock so we can assert `at` is sourced from it.
+  let t = 5000;
+  const now = () => (t += 100);
+  const controller = createSelfHealingController({ agentFactory, verify, observability, now });
+
+  const res = await controller.heal({ project: PROJECT, sandbox: SANDBOX, verifyResult: failResult() });
+
+  assert.equal(res.ok, true);
+  // Every history record carries an `at` from the injected clock (multiples of 100 above 5000).
+  assert.ok(res.history.every((h) => typeof h.at === 'number' && h.at > 5000 && h.at % 100 === 0), 'history stamped via now()');
+  // The clock is monotonic across the recorded attempts.
+  assert.ok(res.history[1].at > res.history[0].at, 'attempt timestamps advance with the injected clock');
+  // The emitted events + metrics carry the same `at` stamp.
+  assert.ok(observability.events.every((e) => typeof e.at === 'number'), 'events carry an at stamp');
+  assert.ok(observability.metrics.every((m) => typeof m.fields.at === 'number'), 'metrics carry an at stamp');
 });
 
 // ---------------------------------------------------------------------- real agent turn (hermetic harness)
@@ -474,6 +538,54 @@ test('(10) runGeneration engages the controller on FAIL and returns the PASS sha
     assert.equal(failed.editable, true);
     assert.equal(failed.healed, undefined, 'no controller -> no healed flag (unchanged behavior)');
     assert.equal(startCalls.length, 0, 'FAIL never starts the Dev_Server');
+  } finally {
+    fsSync.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('(11) no double-commit on a healed PASS: the SAME SnapshotStore in BOTH the manager and the controller commits onTurnComplete EXACTLY once', async () => {
+  // Pins the no-double-commit invariant: the controller commits the turn-pass
+  // snapshot via onTurnComplete, and runGeneration REUSES healed.snapshot rather
+  // than re-committing. With one shared store across both layers, calls.length
+  // must be exactly 1 (a re-commit in runGeneration would flip this to 2).
+  const fsSync = await import('node:fs');
+  const base = fsSync.mkdtempSync(path.join(os.tmpdir(), 'aab-heal-once-'));
+  try {
+    const layout = createStorageLayout(base);
+    const registry = createProjectRegistry({ layout });
+
+    const devServer = { start() { return { ok: true, url: 'http://preview.local' }; }, stop() { return { ok: true }; } };
+    const sandboxManager = { acquire: (id) => ({ projectId: id }), activeProjectIds: () => [], release() {} };
+    const genAgentFactory = () => ({ agent: { async send() {} } });
+
+    const genVerify = scriptedVerify([failText('gen broke')]); // generation -> FAIL
+    const healVerify = scriptedVerify([PASS_TEXT]);             // heal re-verify -> PASS
+
+    // ONE shared spy store injected into BOTH the controller and the manager.
+    const snapshotStore = spySnapshotStore();
+    const controller = createSelfHealingController({
+      agentFactory: countingAgentFactory(() => ({ stopReason: 'end_turn', diff: 'fix' })),
+      verify: healVerify,
+      snapshotStore,
+    });
+    const pm = createProjectManager({
+      registry, sandboxManager, devServer,
+      agentFactory: genAgentFactory,
+      verify: genVerify,
+      selfHealingController: controller,
+      snapshotStore,
+      now: () => 1000,
+    });
+
+    const project = { id: 'pm-once-1', ownerId: 'acct-1', sandboxId: 'pm-once-1', targetCategory: 'web-app' };
+    const res = await pm.runGeneration({ project, sandbox: { projectId: 'pm-once-1' }, message: 'build it', projectTree: { 'a.js': '1' } });
+
+    assert.equal(res.ok, true);
+    assert.equal(res.verdict, 'PASS');
+    assert.equal(res.healed, true);
+    // THE invariant: exactly one turn-pass snapshot committed, never two.
+    assert.equal(snapshotStore.calls.length, 1, 'onTurnComplete called EXACTLY once — no double-commit');
+    assert.equal(snapshotStore.calls[0].verifyResult.verdict, 'PASS');
   } finally {
     fsSync.rmSync(base, { recursive: true, force: true });
   }
