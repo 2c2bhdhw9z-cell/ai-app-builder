@@ -386,6 +386,48 @@ test('a binary write_file degrades to a "binary file (N bytes)" indicator, not a
     assert.equal(writeFrame.diff.notice, `binary file (${bytes.length} bytes)`, 'exact notice');
     // It must NOT carry a text line-diff (no line model for arbitrary bytes).
     assert.equal(writeFrame.diff.lines, undefined, 'no misleading text line-diff for binary content');
+
+    // audit H12: the raw binary Buffer must NOT be re-attached to the frame.
+    // Pre-fix, base.input = event.input restored the Buffer, and the transport
+    // JSON-serialised it as {"type":"Buffer","data":[...]} (~6x blow-up) to
+    // every SSE client. The frame must instead carry the byte length only.
+    assert.equal(writeFrame.input?.content, undefined, 'raw binary content is stripped from the frame');
+    assert.equal(writeFrame.input?.contentByteLength, bytes.length, 'the frame carries the byte length, not the bytes');
+    // Prove the serialised frame contains no Buffer-JSON expansion of the bytes.
+    const serialized = JSON.stringify(writeFrame);
+    assert.equal(serialized.includes('"type":"Buffer"'), false, 'no Buffer JSON expansion in the frame');
+    assert.equal(serialized.includes('255,254'), false, 'the raw byte array is not serialised into the frame');
+  } finally {
+    await close();
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('H12: an oversized SSE frame is dropped and replaced with a compact notice', async () => {
+  const { authService, token } = await authWithToken();
+  const cwd = freshProjectDir();
+
+  // A scripted turn whose assistant text is larger than the 256KB frame cap.
+  // Pre-fix, broadcast() serialised the whole payload to every client with no
+  // size bound; the fix caps it and substitutes a compact typed notice.
+  const huge = 'x'.repeat(300 * 1024);
+  const turns = [{ text: huge }];
+
+  const { base, close } = await startServer({
+    authService,
+    agentFactory: scriptedAgentFactory(turns, cwd),
+  });
+  try {
+    const frames = await runTurn({ base, token, projectId: 'proj-huge' });
+
+    // No frame on the wire carries the full 300KB payload; the oversized one is
+    // replaced by a truncated notice frame. Every frame is under a sane bound.
+    for (const f of frames) {
+      assert.ok(JSON.stringify(f).length <= 300 * 1024, 'no frame exceeds the payload size on the wire');
+    }
+    const dropped = frames.find((f) => f.truncated === true && typeof f.notice === 'string' && /frame dropped/.test(f.notice));
+    assert.ok(dropped, 'the oversized frame was replaced with a drop notice');
+    assert.ok(!JSON.stringify(dropped).includes(huge), 'the dropped frame does not carry the huge payload');
   } finally {
     await close();
     fs.rmSync(cwd, { recursive: true, force: true });

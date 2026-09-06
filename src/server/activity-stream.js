@@ -93,7 +93,13 @@ export function toActivityFrame(event, options = {}) {
       delete strippedInput.content;
       const base = toViewEvent({ ...event, input: strippedInput }, options);
       if (!base) return null;
-      base.input = event.input ?? {};
+      // CRITICAL (audit H12): do NOT restore the raw binary `content` onto the
+      // frame. The transport JSON-serialises the whole frame, and
+      // JSON.stringify(Buffer) expands to {"type":"Buffer","data":[...]} — ~6
+      // bytes of JSON per binary byte — so a multi-MB file became a giant SSE
+      // frame broadcast to every client (a direct OOM path). Keep the stripped
+      // input and surface the size as a scalar `contentByteLength` instead.
+      base.input = { ...strippedInput, contentByteLength: detected.byteLength };
       base.diff = binaryChangeIndicator(event.input?.path, detected.byteLength);
       return base;
     }

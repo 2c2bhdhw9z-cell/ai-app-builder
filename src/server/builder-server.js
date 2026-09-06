@@ -60,6 +60,16 @@ const MAX_BODY_BYTES = 1024 * 1024;
 const DEFAULT_CONFIRM_TIMEOUT_MS = 60_000;
 
 /**
+ * Hard cap on a single SSE frame we will broadcast (audit H12). A malformed or
+ * pathological view payload (e.g. a binary Buffer that slipped through as
+ * {"type":"Buffer","data":[...]}, ~6 bytes of JSON per source byte) could
+ * otherwise be serialized in full and pushed to EVERY connected client — a
+ * direct OOM path with no backpressure. Any frame over this size is dropped and
+ * replaced with a compact notice so the stream stays alive without blowing up.
+ */
+const MAX_SSE_FRAME_BYTES = 256 * 1024;
+
+/**
  * The baseline security headers every response carries. Pure, so the exact set
  * is unit-testable and cannot drift between routes. Mirrors plumby's
  * securityHeaders(): same-origin CSP (the SSE stream and POST routes are all
@@ -334,7 +344,18 @@ export function createBuilderServer(opts = {}) {
     /** Send a raw view payload to every SSE client of THIS session. */
     session.broadcast = (payload) => {
       if (!payload) return;
-      const frame = `data: ${JSON.stringify(payload)}\n\n`;
+      let body = JSON.stringify(payload);
+      // Cap total frame size (audit H12): never broadcast an oversized frame to
+      // every client. Replace it with a compact, typed notice carrying only the
+      // event type and the dropped byte count — never the offending content.
+      if (typeof body === 'string' && body.length > MAX_SSE_FRAME_BYTES) {
+        body = JSON.stringify({
+          type: typeof payload.type === 'string' ? payload.type : 'frame',
+          truncated: true,
+          notice: `[frame dropped: ${body.length} bytes exceeds ${MAX_SSE_FRAME_BYTES}-byte cap]`,
+        });
+      }
+      const frame = `data: ${body}\n\n`;
       for (const res of session.sseClients) {
         try {
           res.write(frame);
