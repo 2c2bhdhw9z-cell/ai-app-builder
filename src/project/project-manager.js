@@ -61,7 +61,8 @@ import { randomUUID } from 'node:crypto';
 import { fail } from '../model/validate.js';
 import { isValidTargetCategory, isValidProjectOrigin, Target_Category, Project_Origin } from '../model/enums.js';
 import { createProject as createProjectRecord } from '../model/project.js';
-import { createVerifyResult, VERIFY_VERDICTS } from '../model/deployment.js';
+import { VERIFY_VERDICTS } from '../model/deployment.js';
+import { normalizeVerifyResult } from './verify-result.js';
 
 /** The maximum accepted Project description length, after trimming (Req 5.7). */
 export const MAX_DESCRIPTION_CHARS = 5000;
@@ -87,6 +88,15 @@ const DEFAULT_MODEL = 'claude-sonnet';
  * @param {object} [args.persistenceStore] OPTIONAL PersistenceStore; when injected
  *        with a projectOrigin, populateOrigin persists the origin tree durably
  *        (persist + flush) into layout.exportableProjectTree(projectId).
+ * @param {object} [args.selfHealingController] OPTIONAL Self-Healing controller
+ *        (src/project/self-healing.js) with heal({...}); when injected AND
+ *        enabled, runGeneration engages it on a verify FAIL to attempt bounded,
+ *        observable, cancellation-aware auto-correction BEFORE returning the
+ *        editable FAIL result (Task 17, Req 20). Its ABSENCE keeps the existing
+ *        no-controller behavior byte-identical (auto-healing is strictly
+ *        additive). Heal is invoked ONLY from this generation-COMPLETION path,
+ *        never mid-edit — the seam itself expresses the "do not heal when the
+ *        user is mid-edit" safeguard.
  * @param {object} args.devServer       the Dev_Server seam (start/stop) — see dev-server.js
  * @param {Function} args.agentFactory  builds the Builder_Agent for a turn (plumby via engine boundary)
  * @param {Function} args.verify        the verify seam; returns plumby-verify TEXT
@@ -105,6 +115,7 @@ export function createProjectManager({
   snapshotStore,
   projectOrigin,
   persistenceStore,
+  selfHealingController,
   devServer,
   agentFactory,
   verify,
@@ -440,46 +451,6 @@ export function createProjectManager({
   }
 
   /**
-   * Normalize a verify seam result into a VerifyResult record (createVerifyResult,
-   * VERIFY_VERDICTS). The plumby verify contract is TEXT beginning with
-   * 'verdict: PASS' or 'verdict: FAIL'; we parse that. A caller may instead pass
-   * an already-structured VerifyResult-shaped object, which we accept directly.
-   *
-   * @param {string|object} raw
-   * @returns {object} VerifyResult
-   */
-  function normalizeVerifyResult(raw) {
-    // Already a structured result (has a verdict): validate through the model.
-    if (raw && typeof raw === 'object' && typeof raw.verdict === 'string') {
-      return createVerifyResult({
-        verdict: raw.verdict,
-        exitCode: typeof raw.exitCode === 'number' ? raw.exitCode : (raw.verdict === 'PASS' ? 0 : 1),
-        failureLines: typeof raw.failureLines === 'string' ? raw.failureLines : '',
-        outputTail: typeof raw.outputTail === 'string' ? raw.outputTail : '',
-      });
-    }
-
-    const text = typeof raw === 'string' ? raw : String(raw ?? '');
-    // The contract: the text BEGINS with 'verdict: PASS' or 'verdict: FAIL'.
-    const firstLine = text.split('\n', 1)[0]?.trim() ?? '';
-    const pass = /^verdict:\s*PASS\b/i.test(firstLine);
-    const fail_ = /^verdict:\s*FAIL\b/i.test(firstLine);
-    const verdict = pass ? VERIFY_VERDICTS[0] : fail_ ? VERIFY_VERDICTS[1] : VERIFY_VERDICTS[1];
-
-    // Best-effort exit-code parse ("exit code: <n>"), default 0 on PASS / 1 on FAIL.
-    let exitCode = verdict === 'PASS' ? 0 : 1;
-    const m = /exit code:\s*(-?\d+)/i.exec(text);
-    if (m) exitCode = Number.parseInt(m[1], 10);
-
-    // On FAIL, capture the output tail (everything after the verdict line) so the
-    // caller can report the failure without reinterpreting it.
-    const outputTail = verdict === 'FAIL' ? text : '';
-    const failureLines = verdict === 'FAIL' ? firstLine : '';
-
-    return createVerifyResult({ verdict, exitCode, failureLines, outputTail });
-  }
-
-  /**
    * runGeneration({ project, sandbox, message, projectTree?, signal? }) — the
    * generation -> verify -> Dev_Server pipeline (spec subtask 13.2, Req 1.3/1.7).
    *
@@ -534,9 +505,51 @@ export function createProjectManager({
       return { ok: false, code: 'VERIFY_FAILED', message: err?.message ?? String(err) };
     }
 
-    // 4) FAIL: report the captured error, DO NOT start the Dev_Server, leave the
-    //    files editable (no destructive tree change performed here).
+    // 4) FAIL: Task 17 (Req 20) — when a Self-Healing controller is injected AND
+    //    healing is enabled, engage it BEFORE reporting the failure. Auto-healing
+    //    runs ONLY on THIS generation-COMPLETION path (never mid-edit — the
+    //    safeguard is expressed by the seam: runGeneration is the only caller),
+    //    is bounded, observable and cancellation-aware, and reuses plumby verify
+    //    + the Builder_Agent loop through the SAME injected seams this manager
+    //    uses. A healed PASS is finalized exactly like any PASS turn; a give-up
+    //    still returns the editable FAIL report.
     if (verifyResult.verdict === VERIFY_VERDICTS[1]) {
+      if (selfHealingController && typeof selfHealingController.heal === 'function') {
+        const healed = await selfHealingController.heal({
+          project,
+          sandbox,
+          verifyResult,
+          projectTree,
+          message,
+          signal,
+        });
+        // A healed PASS: finalize as a normal PASS turn (Dev_Server start + the
+        // healed VerifyResult). The controller already committed the turn-pass
+        // Snapshot via snapshotStore.onTurnComplete, so reuse it here rather than
+        // re-committing (snapshot logic is never duplicated).
+        if (healed && healed.ok === true && healed.verdict === VERIFY_VERDICTS[0]) {
+          return finalizePass({
+            project,
+            sandbox,
+            verifyResult: healed.verifyResult ?? verifyResult,
+            snapshot: healed.snapshot,
+            healed,
+          });
+        }
+        // A give-up (max-attempts / oscillation), a disabled report, a
+        // cancellation, or a verify-unavailable path: surface the controller's
+        // structured report. It already carries editable:true on give-up
+        // (Req 20.9/20.10); default to editable:true for the FAIL reports so the
+        // user can always intervene (files unchanged / editable).
+        if (healed && healed.ok === false) {
+          return {
+            editable: true,
+            ...healed,
+          };
+        }
+      }
+      // No controller (or it produced nothing usable): the pre-existing FAIL
+      // report, byte-identical to the no-controller behavior.
       return {
         ok: false,
         verdict: 'FAIL',
@@ -553,7 +566,25 @@ export function createProjectManager({
     if (snapshotStore && typeof snapshotStore.onTurnComplete === 'function' && projectTree !== undefined) {
       snapshot = snapshotStore.onTurnComplete({ projectId: project.id, projectTree, verifyResult });
     }
+    return finalizePass({ project, sandbox, verifyResult, snapshot });
+  }
 
+  /**
+   * Finalize a PASS turn: start the Dev_Server seam and measure the <=60s
+   * "Preview available" SLO against the injected clock, returning the PASS shape.
+   * Shared by the plain-PASS path and the Self-Healing healed-PASS path so both
+   * return an identical, single-Dev_Server-start result.
+   *
+   * @param {object} args
+   * @param {object} args.project
+   * @param {object} [args.sandbox]
+   * @param {object} args.verifyResult  the (possibly healed) PASS VerifyResult
+   * @param {object} [args.snapshot]    the turn-pass snapshot result (if any)
+   * @param {object} [args.healed]      the Self-Healing report, when this PASS
+   *        was reached by healing — surfaces attempts/diffs/history to the caller
+   * @returns {{ ok:true, verdict:'PASS', ... }}
+   */
+  function finalizePass({ project, sandbox, verifyResult, snapshot, healed } = {}) {
     const startedAt = now();
     const started = devServer.start({
       projectId: project.id,
@@ -568,6 +599,14 @@ export function createProjectManager({
       verifyResult,
       devServer: started,
       ...(snapshot !== undefined ? { snapshot } : {}),
+      ...(healed !== undefined
+        ? {
+            healed: true,
+            attempts: healed.attempts,
+            ...(healed.diffs !== undefined ? { diffs: healed.diffs } : {}),
+            ...(healed.history !== undefined ? { history: healed.history } : {}),
+          }
+        : {}),
       startedAt,
       elapsedMs,
     };
