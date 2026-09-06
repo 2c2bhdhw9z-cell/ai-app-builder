@@ -17,7 +17,7 @@
  *   3. delete the Project's SNAPSHOTS — the .git repo + out-of-tree registry
  *      (snapshotStore.deleteSnapshots);
  *   4. delete the Project's associated SECRETS (secretStore.deleteProjectSecrets);
- *   5. remove the Project from the registry (projectRegistry.remove);
+ *   5. remove the Project from the registry (projectRegistry.unregister);
  *   6. emit AUDIT_EVENTS.PROJECT_DELETED (scoped to the acting account, routed
  *      through the redactor so no secret material can enter the audit record)
  *      and RETURN a confirmation object listing each step's result.
@@ -78,9 +78,11 @@ function accountIdOf(userAccount) {
  * @param {object} args.sandboxManager    SandboxManager; release(projectId).
  * @param {object} args.secretStore       SecretStore; deleteProjectSecrets(projectId)
  *                                         + deleteAccountData(userAccountId).
- * @param {object} args.projectRegistry   owns the owner's project list; must expose
- *        listProjectIds(ownerId)->string[] (for account deletion) and
- *        remove(ownerId, projectId) (drop the registry entry on project deletion).
+ * @param {object} args.projectRegistry   the real ProjectRegistry (src/project/
+ *        project-registry.js). Must expose listForOwner(ownerId) -> Project[]
+ *        (full records { id, ownerId, ... }, used to enumerate an account's
+ *        projects for account deletion) and unregister(projectId, ownerId) ->
+ *        boolean (projectId FIRST; drops the registry entry on project deletion).
  * @param {object} [args.connectorStore]  OPTIONAL; deleteAccountData(userAccountId).
  * @param {object} [args.memoryStore]     OPTIONAL; deleteAccountData(userAccountId)
  *        covering BOTH Project_Memory and Global_Memory.
@@ -130,10 +132,10 @@ export function createRetentionService(args = {}) {
   }
   if (
     !projectRegistry ||
-    typeof projectRegistry.listProjectIds !== 'function' ||
-    typeof projectRegistry.remove !== 'function'
+    typeof projectRegistry.listForOwner !== 'function' ||
+    typeof projectRegistry.unregister !== 'function'
   ) {
-    throw new TypeError('createRetentionService: projectRegistry with listProjectIds(ownerId) + remove(ownerId, projectId) is required');
+    throw new TypeError('createRetentionService: projectRegistry with listForOwner(ownerId) + unregister(projectId, ownerId) is required');
   }
 
   const emitAudit = toAuditSink(auditSink);
@@ -165,8 +167,9 @@ export function createRetentionService(args = {}) {
     const snapshots = snapshotStore.deleteSnapshots(projectId);
     // 4) Delete associated Secrets.
     const secrets = secretStore.deleteProjectSecrets(projectId);
-    // 5) Remove from the registry.
-    const registry = projectRegistry.remove(accountId, projectId);
+    // 5) Remove from the registry (real API: projectId FIRST, ownerId second;
+    // returns a boolean recording whether a record was actually removed).
+    const registry = projectRegistry.unregister(projectId, accountId);
 
     // 6) Emit the deletion audit event (redacted) and confirm.
     audit({
@@ -212,7 +215,10 @@ export function createRetentionService(args = {}) {
     const categories = {};
 
     // --- Projects: loop deleteProject over every owned project id. ---------
-    const projectIds = projectRegistry.listProjectIds(accountId) ?? [];
+    // The real registry's listForOwner(ownerId) returns full Project RECORDS
+    // ({ id, ownerId, ... }), NOT ids, so map to r.id.
+    const projects = projectRegistry.listForOwner(accountId) ?? [];
+    const projectIds = projects.map((r) => r.id);
     const projectResults = [];
     for (const pid of projectIds) {
       projectResults.push(await deleteProject(userAccount, pid));

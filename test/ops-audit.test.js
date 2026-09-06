@@ -214,8 +214,8 @@ test('RetentionService deletions land in the AuditLog, redacted + account-scoped
     deleteAccountData: () => ({ ok: true }),
   };
   const projectRegistry = {
-    listProjectIds: () => ['p1'],
-    remove: () => ({ ok: true }),
+    listForOwner: () => [{ id: 'p1', ownerId: 'acct-11' }],
+    unregister: () => true,
   };
 
   const retention = createRetentionService({
