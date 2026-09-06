@@ -18,14 +18,27 @@
  *     dependence in the fork branch, so no injected clock is needed. No network,
  *     no container.
  *
- * MUTATION SENSITIVITY: independence holds ONLY because the fork branch returns a
- * DEEP copy (Buffers copied via Buffer.from, strings immutable). A mutation that
- * SHARED state — a shallow copy `{ ...tree }` that reuses the same Buffer
- * instances, or handing back the restored tree directly — would let a write to
- * the fork's Buffer alias into the origin's snapshot bytes, FLIPPING this
- * property. The generators deliberately include Buffer (binary) entries so a
- * shared-Buffer regression is caught; the in-place Buffer mutation below
- * (`byte[0] ^= 0xff`) is exactly what a shared Buffer would leak to the origin.
+ * MUTATION SENSITIVITY (genuinely exercised — see below): independence holds ONLY
+ * because the fork branch returns a DEEP copy (Buffers copied via Buffer.from,
+ * strings immutable). A mutation that SHARED state — a shallow copy `{ ...tree }`
+ * that reuses the same Buffer instances, or handing back the restored tree
+ * directly — would let a write to the fork's Buffer alias into the SAME in-memory
+ * object the fork was built from.
+ *
+ * The naive check "mutate the fork, then re-`restore()` the origin and compare"
+ * does NOT exercise the deep copy: `restore()` runs a fresh git checkout and
+ * re-reads the working tree from disk, returning a brand-new object every call,
+ * so the origin's committed bytes are ALWAYS re-read regardless of in-memory
+ * sharing — a shallow or absent copy would still pass. To make the deep copy
+ * observable, this test builds the fork from ONE captured restored object
+ * (`sourceForFork`), keeps that same object, and after mutating the fork asserts:
+ *   (1) BUFFER NON-IDENTITY: the fork's Buffer is not the SAME instance as the
+ *       source's Buffer (a shared/shallow copy fails here immediately); and
+ *   (2) the captured `sourceForFork` object is byte-for-byte unchanged after the
+ *       fork's in-place `byte[0] ^= 0xff` mutation (a shared Buffer would leak
+ *       the flip into it).
+ * We ALSO keep the re-`restore()` / persisted-tree checks as a belt-and-braces
+ * assertion that the origin's durable state is untouched.
  *
  * NOTE (from FEAT-003): the tree codec decodes valid-utf8 bytes back to a
  * String, so a "binary" fixture must use NON-utf8 bytes to actually round-trip
@@ -163,8 +176,23 @@ test(propertyTag(10, 'Fork independence'), async () => {
         // A deep, structured snapshot of the origin's bytes to compare against.
         const beforeBytes = normalize(beforeRestored.projectTree);
 
+        // Capture ONE restored source object and force the fork to be built from
+        // THIS exact object, so the deep copy is observable. We wrap the real
+        // snapshotStore so restore() hands back `sourceForFork` (a genuine git
+        // re-read); the fork's deepCopyTree runs over it, and we keep the
+        // reference to prove the fork neither aliases its Buffers nor mutates it.
+        const sourceForFork = snapshotStore.restore(sourceId, beforeLatest.id);
+        assert.equal(sourceForFork.ok, true);
+        const capturingSnapshotStore = {
+          latestSnapshot: (id) => snapshotStore.latestSnapshot(id),
+          restore: (id, snapId) => {
+            if (id === sourceId && snapId === beforeLatest.id) return sourceForFork;
+            return snapshotStore.restore(id, snapId);
+          },
+        };
+
         // Fork it (owner is authorized). The fork copies the MOST RECENT snapshot.
-        const origin = createProjectOrigin({ snapshotStore, persistenceStore, authorizer, projectRegistry: registry });
+        const origin = createProjectOrigin({ snapshotStore: capturingSnapshotStore, persistenceStore, authorizer, projectRegistry: registry });
         const forked = await origin.populate({
           project: projectRecord({ origin: 'fork', id: 'fork' }),
           origin: 'fork',
@@ -179,6 +207,28 @@ test(propertyTag(10, 'Fork independence'), async () => {
         // The fork must equal the source's most-recent snapshot content.
         assert.deepEqual(normalize(forkTree), beforeBytes, 'fork copies the most recent snapshot');
 
+        // (1) BUFFER NON-IDENTITY: the fork must NOT reuse the SAME Buffer
+        // instance the fork was built from. This is the assertion a shallow copy
+        // (`out[rel] = contents`) or a no-copy return would FAIL directly. There
+        // is at least one genuine Buffer entry ('assets/blob.bin') by construction.
+        let assertedBufferIdentity = false;
+        for (const [k, v] of Object.entries(sourceForFork.projectTree)) {
+          if (Buffer.isBuffer(v)) {
+            assert.ok(Buffer.isBuffer(forkTree[k]), `fork keeps ${k} as a Buffer`);
+            assert.notEqual(
+              forkTree[k],
+              v,
+              `fork Buffer for ${k} must be a DISTINCT instance from the source (deep copy)`,
+            );
+            assertedBufferIdentity = true;
+          }
+        }
+        assert.ok(assertedBufferIdentity, 'at least one genuine Buffer entry was checked for non-identity');
+
+        // Baseline of the SAME object the fork was built from, taken BEFORE the
+        // fork mutation, so a shared Buffer leaking the flip is detectable in-memory.
+        const sourceForForkBaseline = normalize(sourceForFork.projectTree);
+
         // MUTATE THE FORK aggressively: flip a byte in every Buffer in place
         // (this is precisely what a shared Buffer would leak into the origin),
         // reassign string entries, and add a brand-new file to the fork.
@@ -190,6 +240,16 @@ test(propertyTag(10, 'Fork independence'), async () => {
           }
         }
         forkTree['injected-by-fork.txt'] = 'only in the fork\n';
+
+        // (2) SAME-OBJECT INDEPENDENCE: the exact restored object the fork was
+        // built from must be byte-for-byte unchanged after the fork's in-place
+        // mutation. A shared/shallow copy would have leaked the `byte[0] ^= 0xff`
+        // flip into this object, FLIPPING this assertion.
+        assert.deepEqual(
+          normalize(sourceForFork.projectTree),
+          sourceForForkBaseline,
+          'the restored source object the fork was built from is untouched by fork mutation',
+        );
 
         // COMPARE: the origin's most-recent snapshot must be byte-for-byte the
         // same as before the fork was mutated (independent, deep copy).

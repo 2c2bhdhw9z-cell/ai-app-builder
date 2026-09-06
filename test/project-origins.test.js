@@ -658,6 +658,44 @@ test('github-import: authorization is checked BEFORE cloning — an unauthorized
   assert.equal(cloneCalled, false, 'the network clone was NEVER attempted after a denial');
 });
 
+test('github-import (TRUST BOUNDARY): a repoResource whose ownerId DIFFERS from the requester, with no grant, is DENIED — the caller cannot forge ownership to self-authorize', async () => {
+  // The trust boundary named in project-origins.js: `repoResource.ownerId` is
+  // caller-asserted, so this layer must FAIL CLOSED when the asserted repo owner
+  // is not the requester and no grant covers the access. Production MUST populate
+  // repoResource from the VERIFIED connected GitHub identity; this test pins the
+  // fail-closed behavior that guarantee relies on.
+  const clock = manualClock({ start: 0 });
+  const authorizer = createAuthorizer();
+  const sandboxManager = importSandboxManager();
+  let cloneCalled = false;
+  const cloner = {
+    async clone() {
+      cloneCalled = true;
+      return { ok: true, projectTree: { 'index.js': "console.log('leaked');\n" } };
+    },
+  };
+  const origin = createProjectOrigin({ authorizer, sandboxManager, cloner, now: clock });
+
+  const result = await origin.populate({
+    project: projectRecord({ origin: 'github-import', id: 'imp-forged' }),
+    sandbox: { projectId: 'imp-forged' },
+    origin: 'github-import',
+    targetCategory: 'web',
+    ref: 'https://github.com/victim/private.git',
+    // The repo is (asserted to be) owned by 'victim'; the REQUESTER is a
+    // different account holding NO grant. resolveAccess denies (owner mismatch,
+    // no grant), so the clone is never attempted and nothing is created.
+    repoResource: { id: 'https://github.com/victim/private.git', ownerId: 'victim' },
+    userAccount: { id: 'not-the-owner' },
+    grants: [],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'IMPORT_UNAUTHORIZED');
+  assert.equal(cloneCalled, false, 'a forged/mismatched repo owner never triggers the fetch');
+  assert.deepEqual(sandboxManager.execCalls, [], 'no confined clone command was issued');
+});
+
 // -------------------------------------------------------------------- fork
 
 /** Seed a real source Project (registry + persisted tree + a snapshot). */
@@ -685,7 +723,23 @@ test('fork: copies the source Project MOST RECENT Snapshot as an INDEPENDENT sta
     seedSource({ layout, registry, snapshotStore, persistenceStore, id: 'src-1', tree: { 'index.js': "console.log('source v1');\n" } });
     snapshotStore.commitExplicit('src-1', sourceTree);
 
-    const origin = createProjectOrigin({ snapshotStore, persistenceStore, authorizer, projectRegistry: registry, now: steppingClock() });
+    // Capture ONE restored source object and force the fork to be built from THIS
+    // exact object, so the deep copy is OBSERVABLE. A bare re-restore after
+    // mutation would re-read fresh bytes from git and pass even for a shallow /
+    // no-copy fork; wrapping restore() to return `sourceForFork` lets us assert
+    // Buffer non-identity and that this same in-memory object is never aliased.
+    const originLatest0 = snapshotStore.latestSnapshot('src-1');
+    const sourceForFork = snapshotStore.restore('src-1', originLatest0.id);
+    assert.equal(sourceForFork.ok, true);
+    const capturingSnapshotStore = {
+      latestSnapshot: (id) => snapshotStore.latestSnapshot(id),
+      restore: (id, snapId) => {
+        if (id === 'src-1' && snapId === originLatest0.id) return sourceForFork;
+        return snapshotStore.restore(id, snapId);
+      },
+    };
+
+    const origin = createProjectOrigin({ snapshotStore: capturingSnapshotStore, persistenceStore, authorizer, projectRegistry: registry, now: steppingClock() });
 
     const result = await origin.populate({
       project: projectRecord({ origin: 'fork', id: 'fork-1' }),
@@ -702,10 +756,23 @@ test('fork: copies the source Project MOST RECENT Snapshot as an INDEPENDENT sta
     assert.ok(Buffer.isBuffer(result.projectTree['data.bin']));
     assert.deepEqual([...result.projectTree['data.bin']], [0xff, 0xfe, 0x00, 0x80]);
 
-    // Property 10: mutate the fork's tree/buffer and confirm the ORIGIN's most
-    // recent snapshot is unchanged (deep, independent copy — no shared Buffers).
+    // Property 10 (deep copy is OBSERVABLE): the fork's Buffer must be a DISTINCT
+    // instance from the source's Buffer — a shallow copy (`out[rel] = contents`)
+    // or a no-copy return would FAIL this assertion directly.
+    assert.notEqual(
+      result.projectTree['data.bin'],
+      sourceForFork.projectTree['data.bin'],
+      'fork Buffer must be a distinct instance from the source (deep copy)',
+    );
+
+    // Property 10: mutate the fork's tree/buffer and confirm the origin is
+    // unchanged. Check BOTH (a) the SAME in-memory object the fork was built from
+    // (a shared Buffer would leak the flip into it) AND (b) the origin's durable
+    // most-recent snapshot re-read from git (belt-and-braces).
     result.projectTree['data.bin'][0] = 99;
     result.projectTree['index.js'] = 'tampered';
+    assert.deepEqual([...sourceForFork.projectTree['data.bin']], [0xff, 0xfe, 0x00, 0x80], 'the source object the fork was built from is untouched');
+    assert.equal(sourceForFork.projectTree['index.js'], "console.log('source v2');\n", 'source object index.js untouched');
     const originLatest = snapshotStore.latestSnapshot('src-1');
     const originRestored = snapshotStore.restore('src-1', originLatest.id);
     assert.equal(originRestored.projectTree['index.js'], "console.log('source v2');\n", 'origin source unchanged');
@@ -891,6 +958,66 @@ test('ProjectManager.populateOrigin: a github-import failure rolls back the Sand
     // registry entry rolled back — no partial Project, no orphaned Sandbox.
     assert.ok(sandboxManager.releaseCalls.includes(created.project.id), 'sandbox reaped on import failure');
     assert.equal(registry.countForOwner(OWNER), 0, 'no partial Project after import failure');
+  } finally {
+    cleanup();
+  }
+});
+
+test('ProjectManager.populateOrigin: a github-import SUCCESS materializes the cloned tree AND routes through the SAME runGeneration pipeline — a single Dev_Server start (Req 6.9 convergence, like the other origins)', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    const sandboxManager = fakeSandboxManager();
+    const devServer = fakeDevServer();
+    const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    const authorizer = createAuthorizer();
+
+    // A scripted cloner (SEAM) that succeeds and returns a runnable tree. The
+    // ACTUAL network fetch cannot run offline, so it is injected.
+    const cloner = {
+      async clone() {
+        return { ok: true, sizeBytes: 1024, projectTree: { 'package.json': '{"name":"imported"}\n', 'index.js': "console.log('imported');\n" } };
+      },
+    };
+    const projectOrigin = createProjectOrigin({ authorizer, sandboxManager, cloner, persistenceStore, now: steppingClock() });
+    const manager = createProjectManager({
+      registry,
+      sandboxManager,
+      devServer,
+      projectOrigin,
+      persistenceStore,
+      agentFactory: fakeAgentFactory(),
+      verify: () => 'verdict: PASS',
+      now: steppingClock(),
+      idFactory: seqIdFactory('imp-ok'),
+    });
+
+    const created = manager.createProject({
+      accountId: OWNER, description: 'app', targetCategory: 'web', origin: 'github-import', ref: 'https://github.com/acme/app.git',
+    });
+    assert.equal(created.ok, true);
+
+    // Population is a SEPARATE step from the 10s begins-creation window.
+    const populated = await manager.populateOrigin({
+      project: created.project,
+      sandbox: created.sandbox,
+      userAccount: { id: OWNER },
+      repoResource: { id: 'https://github.com/acme/app.git', ownerId: OWNER },
+    });
+    assert.equal(populated.ok, true, 'github-import populate ok');
+    assert.equal(populated.origin, 'github-import');
+
+    // The cloned tree materialized into the Project's OWN exportable tree.
+    const onDisk = persistenceStore.readPersistedTree(created.project.id);
+    assert.deepEqual(Object.keys(onDisk).sort(), ['index.js', 'package.json']);
+
+    // CONVERGENCE (Req 6.9): the SAME runGeneration pipeline runs for the import
+    // origin — exactly like blank/template/fork — a single Dev_Server start, no
+    // forked lifecycle.
+    const result = await manager.runGeneration({ project: created.project, sandbox: created.sandbox, message: 'build it', projectTree: onDisk });
+    assert.equal(result.ok, true, 'github-import runGeneration ok');
+    assert.equal(result.verdict, 'PASS');
+    assert.equal(devServer.startCalls.length, 1, 'Dev_Server started once for the import origin');
   } finally {
     cleanup();
   }

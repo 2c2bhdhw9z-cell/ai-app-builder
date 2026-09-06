@@ -416,11 +416,24 @@ export function createProjectOrigin({
 
     // 1) Authorize the repo ref BEFORE any clone (Req 6.4). The repo resource is
     //    a control-plane record describing the repo's access ({ id, ownerId }):
-    //    the caller supplies it via `repoResource` (resolved from the connected
-    //    GitHub identity / repo owner). resolveAccess is an owner-or-grant read
-    //    resolution against the REQUESTING userAccount. A denial creates nothing
-    //    and never triggers the fetch. We do NOT fabricate requester ownership:
-    //    with no repoResource and no matching grant the import is denied.
+    //    the caller supplies it via `repoResource`. resolveAccess is an
+    //    owner-or-grant read resolution against the REQUESTING userAccount. A
+    //    denial creates nothing and never triggers the fetch. We do NOT fabricate
+    //    requester ownership: with no repoResource and no matching grant the
+    //    import is denied.
+    //
+    //    *** TRUST BOUNDARY (network / repo ownership) ***
+    //    `repoResource.ownerId` is CALLER-ASSERTED. This layer does NOT (and
+    //    cannot, offline) verify that the requester's connected GitHub identity
+    //    actually owns or can read the repo behind `ref`. A caller that forges
+    //    `repoResource.ownerId === requester.id` would self-authorize an import.
+    //    PRODUCTION REQUIREMENT: the caller (the create route / control plane)
+    //    MUST populate `repoResource` from the VERIFIED connected GitHub identity
+    //    (the OAuth/App identity that owns or has been granted the repo), NEVER
+    //    from unvalidated client input. resolveAccess then enforces owner-or-grant
+    //    against that verified resource. The unit test
+    //    "a repoResource whose ownerId differs from the requester (no grant) is
+    //    DENIED" pins the fail-closed behavior this boundary relies on.
     const resource =
       repoResource && typeof repoResource === 'object'
         ? repoResource
