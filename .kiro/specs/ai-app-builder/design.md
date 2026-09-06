@@ -893,6 +893,20 @@ file mutation.
   out-of-enum value is rejected with the current experience left in effect (Req 27.7). Because a
   Workspace_Experience is pure presentation, it is orthogonal to the "Vibe-first" **layout** and the `vibe`
   **Work_Mode** — the shared word is intentional but they are different axes (layout vs. interaction flow).
+
+  **Technical Workbench — design intent and attribution (Req 27.8).** The `technical-workbench` experience
+  is the project's **IDE-style developer surface**: file and tool panels alongside the editor, the
+  chat/compose area, and the live Activity_Stream — the "developer cockpit" layout. Its look-and-feel is
+  **deliberately inspired by agentic coding assistants such as Kiro** (the same product class this platform's
+  own engine, plumby, belongs to), but it is an **original, clean-room implementation** built on this
+  platform's own surfaces and components. Explicit boundaries, so the intent is unambiguous for whoever
+  implements it: (a) it borrows *general layout ideas and interaction feel* only — never a third party's
+  name, logo, proprietary styling, or code; (b) it must never imply affiliation with or endorsement by any
+  third party (including AWS or Kiro); (c) it is fully theme-able through the Theme setting, so it is never a
+  fixed clone of any one tool's appearance; and (d) the web surface carries an honest, non-affiliated
+  "inspired by" credit line (e.g. "Inspired by tools like Kiro"), which is presentation only and changes no
+  Project data. This attribution posture is consistent with the project's anti-lock-in, open-tooling
+  principle: acknowledge influences openly, own the implementation outright.
   The **Mobile Command Center** layout reuses the same mobile-oriented rendering the phone surface already
   needs (§4 Expo Preview, README phone-reconnect frames); it does not create a new runtime.
 
