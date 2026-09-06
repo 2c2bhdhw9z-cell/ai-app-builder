@@ -21,6 +21,20 @@
  *                                              from the SandboxManager) and max
  *                                              total Projects (an injected
  *                                              per-account project counter).
+ *                                              The concurrent-Sandbox quota has
+ *                                              TWO additive dimensions: a GLOBAL
+ *                                              cross-Sandbox ceiling AND an
+ *                                              optional PER-ACCOUNT ceiling that
+ *                                              prevents one tenant from starving
+ *                                              others (Req 23). The per-account
+ *                                              VALUE is a deferred product
+ *                                              decision, so the per-account
+ *                                              ceiling defaults to unlimited
+ *                                              (null) and is a strict no-op
+ *                                              unless BOTH a limit value AND a
+ *                                              per-account count seam are
+ *                                              supplied; the global ceiling is
+ *                                              unchanged.
  *
  *   observeUsage(sandboxId, signal)          — abuse detection: on a sustained
  *                                              failed-build / runaway-resource
@@ -81,6 +95,11 @@ export const DEFAULT_QUOTA_CONFIG = Object.freeze({
   }),
   quota: Object.freeze({
     maxConcurrentSandboxes: 10,
+    // Additive PER-ACCOUNT concurrent-Sandbox ceiling (Req 23 anti-starvation).
+    // null == no per-account limit / effectively unlimited: the per-account
+    // check is a strict no-op so existing (global-only) behavior is unchanged.
+    // The concrete VALUE is a deferred product decision (see module header).
+    maxConcurrentSandboxesPerAccount: null,
     maxTotalProjects: 50,
   }),
   abuse: Object.freeze({
@@ -118,6 +137,11 @@ function accountIdOf(userAccount) {
  * @param {number} [args.concurrencyCount]  alternative fixed concurrent-sandbox
  *        count (takes precedence over sandboxManager.activeProjectIds when a
  *        function; used mainly by tests/callers without a live manager).
+ * @param {(accountId:string)=>number} [args.accountConcurrencyCount]  returns the
+ *        current live concurrent-Sandbox count FOR A SINGLE account (per-account
+ *        concurrentSandboxes quota). Optional; if absent and the SandboxManager
+ *        does not expose activeProjectIdsForOwner(accountId), the per-account
+ *        ceiling cannot attribute usage and is a strict no-op.
  * @param {(args:{sandboxId:string,projectId:string,action:string})=>any} [args.suspendAction]
  *        optional explicit mitigation action; when absent, mitigation calls
  *        sandboxManager.release(projectId).
@@ -133,6 +157,7 @@ export function createQuotaManager(args = {}) {
     sandboxManager,
     projectCounter,
     concurrencyCount,
+    accountConcurrencyCount,
     suspendAction,
     auditSink,
     operationalSink,
@@ -229,13 +254,43 @@ export function createQuotaManager(args = {}) {
   }
 
   /**
+   * Resolve the current live concurrent-Sandbox count FOR A SINGLE account, or
+   * null when per-account usage cannot be attributed (no seam available). The
+   * caller treats a null as "no per-account limit enforceable" (no-op), so the
+   * per-account ceiling only ever engages when attribution is possible.
+   */
+  function currentConcurrentSandboxesForAccount(accountId) {
+    if (typeof accountId !== 'string' || accountId.length === 0) return null;
+    if (typeof accountConcurrencyCount === 'function') {
+      const n = accountConcurrencyCount(accountId);
+      return typeof n === 'number' ? n : 0;
+    }
+    if (sandboxManager && typeof sandboxManager.activeProjectIdsForOwner === 'function') {
+      const ids = sandboxManager.activeProjectIdsForOwner(accountId);
+      return Array.isArray(ids) ? ids.length : 0;
+    }
+    return null;
+  }
+
+  /**
    * checkQuota(userAccount, projectId, resource) — enforce a Resource_Quota.
    *
-   *   'concurrentSandboxes' — compare the current live boundary count (from
+   *   'concurrentSandboxes' — TWO additive ceilings. FIRST the GLOBAL one:
+   *       compare the current live boundary count (from
    *       sandboxManager.activeProjectIds().length, or an injected concurrency
    *       counter) against config.quota.maxConcurrentSandboxes. This is a
    *       CROSS-Sandbox ceiling; it does NOT touch per-Sandbox CPU/memory/exec
-   *       limits, which the SandboxManager already enforces (Req 8.2).
+   *       limits, which the SandboxManager already enforces (Req 8.2). THEN,
+   *       only if config.quota.maxConcurrentSandboxesPerAccount is a number AND
+   *       a per-account count seam is available (accountConcurrencyCount or
+   *       sandboxManager.activeProjectIdsForOwner) AND an accountId is
+   *       resolvable, compare that account's live count against the per-account
+   *       ceiling. This PER-ACCOUNT dimension is anti-starvation (Req 23): it
+   *       prevents one tenant from consuming the whole global capacity. It is
+   *       purely ADDITIVE — when unset (default null) or unattributable, it is a
+   *       strict no-op and the global-only behavior is unchanged. Account-scope
+   *       rejections carry scope:'account' to distinguish them from the global
+   *       ceiling; the VALUE is a deferred product decision (see module header).
    *
    *   'totalProjects'       — compare projectCounter(accountId) against
    *       config.quota.maxTotalProjects.
@@ -246,13 +301,15 @@ export function createQuotaManager(args = {}) {
    * @param {object|string} userAccount
    * @param {string|null} projectId
    * @param {string} resource  one of QUOTA_RESOURCES
-   * @returns {{ ok:true } | { ok:false, limit:'Resource_Quota', resource:string, max:number, current:number, message:string }}
+   * @returns {{ ok:true } | { ok:false, limit:'Resource_Quota', resource:string, scope?:'account', max:number, current:number, message:string }}
    */
   function checkQuota(userAccount, projectId, resource) {
     const accountId = accountIdOf(userAccount);
     const nowMs = now();
 
     if (resource === QUOTA_RESOURCES.CONCURRENT_SANDBOXES) {
+      // GLOBAL cross-Sandbox ceiling — evaluated FIRST, exactly as before. Its
+      // rejection shape is byte-identical to the pre-per-account behavior.
       const max = quotaConfig.maxConcurrentSandboxes;
       const current = currentConcurrentSandboxes();
       if (typeof max === 'number' && current >= max) {
@@ -271,6 +328,40 @@ export function createQuotaManager(args = {}) {
         });
         return { ok: false, limit: 'Resource_Quota', resource, max, current, message };
       }
+
+      // ADDITIVE PER-ACCOUNT ceiling (Req 23 anti-starvation). Engages only when
+      // a limit VALUE is configured AND per-account usage is attributable AND an
+      // accountId is resolvable; otherwise it is a strict no-op (unlimited).
+      const perAccountMax = quotaConfig.maxConcurrentSandboxesPerAccount;
+      if (typeof perAccountMax === 'number') {
+        const accountCurrent = currentConcurrentSandboxesForAccount(accountId);
+        if (typeof accountCurrent === 'number' && accountCurrent >= perAccountMax) {
+          const message =
+            `Resource_Quota exceeded: max concurrent Sandboxes per account ` +
+            `(${perAccountMax}) reached (current ${accountCurrent})`;
+          emitAudit({
+            type: AUDIT_EVENTS.QUOTA_EXCEEDED,
+            at: nowMs,
+            accountId,
+            projectId: projectId ?? null,
+            limit: 'Resource_Quota',
+            resource,
+            scope: 'account',
+            max: perAccountMax,
+            current: accountCurrent,
+          });
+          return {
+            ok: false,
+            limit: 'Resource_Quota',
+            resource,
+            scope: 'account',
+            max: perAccountMax,
+            current: accountCurrent,
+            message,
+          };
+        }
+      }
+
       return { ok: true };
     }
 
