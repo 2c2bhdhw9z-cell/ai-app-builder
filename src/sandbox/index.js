@@ -11,6 +11,8 @@
 
 export { createSandboxManager } from './sandbox-manager.js';
 
+export { createPackageManager, DEFAULT_INSTALL_TIMEOUT_MS } from './package-manager.js';
+
 export {
   createCommandGuard,
   truncateStream,
