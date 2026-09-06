@@ -350,10 +350,18 @@ export function createProjectManager({
    * @param {object} args.project  the created Project record (from createProject)
    * @param {object} [args.sandbox] the acquired Sandbox handle
    * @param {string} [args.ref]     origin ref (import url / fork source id)
-   * @returns {{ ok:true, project, projectTree, populateMs, origin }
-   *          | { ok:false, code, message, failedArtifact? }}
+   * @param {object} [args.userAccount] the REQUESTING account, threaded through
+   *        to the ProjectOrigin for github-import / fork authorization (Req 6.4,
+   *        6.7). Absent for origins that need no authorization (blank/template).
+   * @param {Array<object>} [args.grants]  optional Share_Link grants for authorization
+   * @param {object} [args.repoResource]   github-import repo record { id, ownerId }
+   *        the repo authorization is resolved against (threaded to the ProjectOrigin)
+   * @param {(progress:object)=>void} [args.onProgress]  large-repo import progress sink
+   * @param {AbortSignal} [args.signal]     optional abort signal for the import clone
+   * @returns {Promise<{ ok:true, project, projectTree, populateMs, origin }
+   *          | { ok:false, code, message, failedArtifact? }>}
    */
-  function populateOrigin({ project, sandbox, ref } = {}) {
+  async function populateOrigin({ project, sandbox, ref, userAccount, grants, repoResource, onProgress, signal } = {}) {
     if (!project || typeof project.id !== 'string') {
       return { ok: false, code: 'PROJECT_REQUIRED', message: 'a project record is required' };
     }
@@ -361,12 +369,17 @@ export function createProjectManager({
       return { ok: false, code: 'ORIGIN_UNAVAILABLE', message: 'no projectOrigin was injected' };
     }
 
-    const populated = projectOrigin.populate({
+    const populated = await projectOrigin.populate({
       project,
       sandbox,
       origin: project.origin,
       targetCategory: project.targetCategory,
       ref: ref ?? project.originRef,
+      userAccount,
+      grants,
+      repoResource,
+      onProgress,
+      signal,
     });
 
     // On any populate failure AFTER acquire, roll back the Sandbox + registry so

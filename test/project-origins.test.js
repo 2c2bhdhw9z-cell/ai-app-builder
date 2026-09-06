@@ -35,7 +35,15 @@ import { createStorageLayout } from '../src/storage/layout.js';
 import { createPersistenceStore } from '../src/persistence/index.js';
 import { createProjectRegistry } from '../src/project/project-registry.js';
 import { createProjectManager } from '../src/project/project-manager.js';
-import { createProjectOrigin, TEMPLATE_POPULATE_SLO_MS } from '../src/project/project-origins.js';
+import {
+  createProjectOrigin,
+  TEMPLATE_POPULATE_SLO_MS,
+  IMPORT_SMALL_REPO_SLO_MS,
+  IMPORT_MAX_CLONE_SLO_MS,
+  IMPORT_SMALL_REPO_MAX_BYTES,
+} from '../src/project/project-origins.js';
+import { createSnapshotStore } from '../src/persistence/snapshot-store.js';
+import { createAuthorizer } from '../src/auth/authorize.js';
 import { Target_Category } from '../src/model/enums.js';
 import { createProject as createProjectRecord } from '../src/model/project.js';
 import { createTemplateFixtureProvider } from './support/template-fixture.js';
@@ -80,9 +88,9 @@ function projectRecord({ origin, targetCategory = 'web', id = 'proj-1' }) {
 
 // ------------------------------------------------------------- blank origin
 
-test('blank origin: produces ONLY minimal runnable files (package.json with a start script + an entry file), no template', () => {
+test('blank origin: produces ONLY minimal runnable files (package.json with a start script + an entry file), no template', async () => {
   const origin = createProjectOrigin({ now: steppingClock() });
-  const result = origin.populate({
+  const result = await origin.populate({
     project: projectRecord({ origin: 'blank' }),
     origin: 'blank',
     targetCategory: 'web',
@@ -110,13 +118,13 @@ test('blank origin: produces ONLY minimal runnable files (package.json with a st
 
 // ------------------------------------------------------------ template origin
 
-test('template origin: populates ALL fixture template files + the dependency manifest for EVERY Target_Category, exposing a measured populateMs', () => {
+test('template origin: populates ALL fixture template files + the dependency manifest for EVERY Target_Category, exposing a measured populateMs', async () => {
   const templateProvider = createTemplateFixtureProvider();
   const origin = createProjectOrigin({ templateProvider, now: steppingClock() });
 
   for (const targetCategory of Target_Category) {
     const expected = templateProvider.forCategory(targetCategory);
-    const result = origin.populate({
+    const result = await origin.populate({
       project: projectRecord({ origin: 'template', targetCategory }),
       origin: 'template',
       targetCategory,
@@ -136,7 +144,7 @@ test('template origin: populates ALL fixture template files + the dependency man
   }
 });
 
-test('template origin: a write failure ABORTS, produces NO projectTree, and names the failed artifact (Req 5.3)', () => {
+test('template origin: a write failure ABORTS, produces NO projectTree, and names the failed artifact (Req 5.3)', async () => {
   // Force a template whose one artifact has non-persistable contents (a number),
   // so populate must abort naming that artifact.
   const templateProvider = createTemplateFixtureProvider({
@@ -147,7 +155,7 @@ test('template origin: a write failure ABORTS, produces NO projectTree, and name
   });
   const origin = createProjectOrigin({ templateProvider, now: steppingClock() });
 
-  const result = origin.populate({
+  const result = await origin.populate({
     project: projectRecord({ origin: 'template', targetCategory: 'web' }),
     origin: 'template',
     targetCategory: 'web',
@@ -159,12 +167,12 @@ test('template origin: a write failure ABORTS, produces NO projectTree, and name
   assert.equal(result.projectTree, undefined, 'no partial tree produced on failure');
 });
 
-test('template origin: a template missing its dependency manifest is a TEMPLATE_WRITE_FAILED naming the missing manifest', () => {
+test('template origin: a template missing its dependency manifest is a TEMPLATE_WRITE_FAILED naming the missing manifest', async () => {
   const templateProvider = createTemplateFixtureProvider({
     overrides: (category) => (category === 'web' ? { 'index.js': "console.log('x');\n" } : undefined),
   });
   const origin = createProjectOrigin({ templateProvider, now: steppingClock() });
-  const result = origin.populate({
+  const result = await origin.populate({
     project: projectRecord({ origin: 'template', targetCategory: 'web' }),
     origin: 'template',
     targetCategory: 'web',
@@ -174,7 +182,7 @@ test('template origin: a template missing its dependency manifest is a TEMPLATE_
   assert.equal(result.failedArtifact, 'package.json');
 });
 
-test('template origin: partial cleanup removes any earlier-materialized on-disk tree via the persistenceStore (Req 5.3)', () => {
+test('template origin: partial cleanup removes any earlier-materialized on-disk tree via the persistenceStore (Req 5.3)', async () => {
   const { layout, cleanup } = tempLayout();
   try {
     const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
@@ -189,7 +197,7 @@ test('template origin: partial cleanup removes any earlier-materialized on-disk 
       overrides: (category) => (category === 'web' ? { 'package.json': '{}\n', 'bad': {} } : undefined),
     });
     const origin = createProjectOrigin({ persistenceStore, templateProvider, now: steppingClock() });
-    const result = origin.populate({ project, origin: 'template', targetCategory: 'web' });
+    const result = await origin.populate({ project, origin: 'template', targetCategory: 'web' });
 
     assert.equal(result.ok, false);
     assert.equal(result.code, 'TEMPLATE_WRITE_FAILED');
@@ -200,9 +208,9 @@ test('template origin: partial cleanup removes any earlier-materialized on-disk 
   }
 });
 
-test('template origin: without a templateProvider a template origin is a structured TEMPLATE_PROVIDER_MISSING, not a throw', () => {
+test('template origin: without a templateProvider a template origin is a structured TEMPLATE_PROVIDER_MISSING, not a throw', async () => {
   const origin = createProjectOrigin({ now: steppingClock() });
-  const result = origin.populate({
+  const result = await origin.populate({
     project: projectRecord({ origin: 'template' }),
     origin: 'template',
     targetCategory: 'web',
@@ -213,22 +221,9 @@ test('template origin: without a templateProvider a template origin is a structu
 
 // --------------------------------------------------- exhaustive dispatch guard
 
-test('populate: github-import and fork are exhaustive-but-not-yet-implemented (FEAT-003), returned as structured results', () => {
+test('populate: an origin OUTSIDE the closed enum is rejected (defense in depth), never throws', async () => {
   const origin = createProjectOrigin({ now: steppingClock() });
-  for (const notYet of ['github-import', 'fork']) {
-    const result = origin.populate({
-      project: projectRecord({ origin: notYet }),
-      origin: notYet,
-      targetCategory: 'web',
-    });
-    assert.equal(result.ok, false);
-    assert.equal(result.code, 'ORIGIN_NOT_IMPLEMENTED');
-  }
-});
-
-test('populate: an origin OUTSIDE the closed enum is rejected (defense in depth), never throws', () => {
-  const origin = createProjectOrigin({ now: steppingClock() });
-  const result = origin.populate({ origin: 'clone', targetCategory: 'web' });
+  const result = await origin.populate({ origin: 'clone', targetCategory: 'web' });
   assert.equal(result.ok, false);
   assert.equal(result.code, 'UNSUPPORTED_ORIGIN');
 });
@@ -307,7 +302,7 @@ test('ProjectManager.populateOrigin: blank AND template both materialize into th
       assert.equal(created.ok, true, `${origin} create ok`);
 
       // Origin population is a SEPARATE step from the 10s begins-creation window.
-      const populated = manager.populateOrigin({ project: created.project, sandbox: created.sandbox });
+      const populated = await manager.populateOrigin({ project: created.project, sandbox: created.sandbox });
       assert.equal(populated.ok, true, `${origin} populate ok`);
       assert.equal(typeof populated.populateMs, 'number');
 
@@ -331,7 +326,7 @@ test('ProjectManager.populateOrigin: blank AND template both materialize into th
   }
 });
 
-test('ProjectManager.populateOrigin: a populate failure rolls back the Sandbox AND the registry (no partial Project, no orphaned Sandbox)', () => {
+test('ProjectManager.populateOrigin: a populate failure rolls back the Sandbox AND the registry (no partial Project, no orphaned Sandbox)', async () => {
   const { layout, cleanup } = tempLayout();
   try {
     const registry = createProjectRegistry({ layout });
@@ -358,7 +353,7 @@ test('ProjectManager.populateOrigin: a populate failure rolls back the Sandbox A
     assert.equal(created.ok, true);
     assert.equal(registry.countForOwner(OWNER), 1);
 
-    const populated = manager.populateOrigin({ project: created.project, sandbox: created.sandbox });
+    const populated = await manager.populateOrigin({ project: created.project, sandbox: created.sandbox });
     assert.equal(populated.ok, false);
     assert.equal(populated.code, 'TEMPLATE_WRITE_FAILED');
     assert.equal(populated.failedArtifact, 'bad');
@@ -372,7 +367,7 @@ test('ProjectManager.populateOrigin: a populate failure rolls back the Sandbox A
   }
 });
 
-test('ProjectManager.populateOrigin: without a projectOrigin injected it is a structured ORIGIN_UNAVAILABLE (strictly additive — existing flows unaffected)', () => {
+test('ProjectManager.populateOrigin: without a projectOrigin injected it is a structured ORIGIN_UNAVAILABLE (strictly additive — existing flows unaffected)', async () => {
   const { layout, cleanup } = tempLayout();
   try {
     const registry = createProjectRegistry({ layout });
@@ -387,9 +382,562 @@ test('ProjectManager.populateOrigin: without a projectOrigin injected it is a st
     });
     const created = manager.createProject({ accountId: OWNER, description: 'app', targetCategory: 'web', origin: 'blank' });
     assert.equal(created.ok, true);
-    const populated = manager.populateOrigin({ project: created.project, sandbox: created.sandbox });
+    const populated = await manager.populateOrigin({ project: created.project, sandbox: created.sandbox });
     assert.equal(populated.ok, false);
     assert.equal(populated.code, 'ORIGIN_UNAVAILABLE');
+  } finally {
+    cleanup();
+  }
+});
+
+// =========================================================================
+// FEAT-003: github-import + fork origins (spec 14.2, Req 6.4-6.8)
+//
+// HERMETIC + OFFLINE: the ACTUAL external github clone cannot run here, so the
+// network fetch is a SEAM injected as a scripted `cloner`; SLO/timeout/orphan-
+// cleanup are verified against fakes + a manually-advanced injected clock. The
+// fork tests use a REAL SnapshotStore over a temp layout (local git works
+// offline) so Property 10's "independent copy" is exercised for real.
+// =========================================================================
+
+/**
+ * A manually-advanced ms clock: reads return the current value; tests call
+ * advance(ms) to move wall-clock time forward deterministically (no real waits).
+ */
+function manualClock({ start = 0 } = {}) {
+  let t = start;
+  const now = () => t;
+  now.advance = (ms) => {
+    t += ms;
+  };
+  now.set = (ms) => {
+    t = ms;
+  };
+  return now;
+}
+
+/** A SandboxManager fake that records exec + release calls (async release). */
+function importSandboxManager() {
+  const execCalls = [];
+  const releaseCalls = [];
+  return {
+    execCalls,
+    releaseCalls,
+    async exec(projectId, command, opts) {
+      execCalls.push({ projectId, command, opts });
+      return { stdout: '', stderr: '', exitCode: 0, denied: false, projectId };
+    },
+    async release(projectId) {
+      releaseCalls.push(projectId);
+      return { projectId, released: true, reaped: [], errors: [] };
+    },
+  };
+}
+
+// ------------------------------------------------------------ github-import
+
+test('github-import: a small repo (<=100 MB) clones within the 120s SLO, produces the cloned tree, and reports cloneMs', async () => {
+  const clock = manualClock({ start: 1000 });
+  const authorizer = createAuthorizer();
+  const sandboxManager = importSandboxManager();
+  // Scripted cloner: runs the clone as a bash command through the confined exec
+  // seam, advances the injected clock to model a ~30s clone, returns a tree.
+  const cloner = {
+    async clone({ ref, exec, onProgress }) {
+      assert.equal(typeof exec, 'function', 'the clone runs through the confined exec seam');
+      await exec(`git clone ${ref} .`, { timeoutMs: 120_000 });
+      clock.advance(30_000); // 30s < 120s SLO
+      onProgress({ phase: 'done' });
+      return { ok: true, sizeBytes: 5 * 1024 * 1024, projectTree: { 'README.md': '# imported\n', 'index.js': "console.log('imported');\n" } };
+    },
+  };
+  const origin = createProjectOrigin({ authorizer, sandboxManager, cloner, now: clock });
+
+  const result = await origin.populate({
+    project: projectRecord({ origin: 'github-import', id: 'imp-1' }),
+    sandbox: { projectId: 'imp-1' },
+    origin: 'github-import',
+    targetCategory: 'web',
+    ref: 'https://github.com/acme/app.git',
+    userAccount: { id: OWNER },
+    repoResource: { id: 'https://github.com/acme/app.git', ownerId: OWNER },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.origin, 'github-import');
+  assert.deepEqual(Object.keys(result.projectTree).sort(), ['README.md', 'index.js']);
+  assert.equal(typeof result.cloneMs, 'number');
+  assert.ok(result.cloneMs <= IMPORT_SMALL_REPO_SLO_MS, 'cloneMs within the 120s import SLO');
+  // The clone WAS issued as a confined bash command through the Sandbox exec path.
+  assert.equal(sandboxManager.execCalls.length, 1);
+  assert.match(sandboxManager.execCalls[0].command, /git clone/);
+  // Sandbox reaped in a finally even on success (Req 6.5) — no orphan lingers.
+  assert.deepEqual(sandboxManager.releaseCalls, ['imp-1']);
+});
+
+test('github-import: a large repo (>100 MB) reports ongoing progress and honors a configurable max clone time (default 600s)', async () => {
+  const clock = manualClock({ start: 0 });
+  const authorizer = createAuthorizer();
+  const sandboxManager = importSandboxManager();
+  const progress = [];
+  const cloner = {
+    async clone({ exec, onProgress, maxCloneMs, smallRepoMaxBytes }) {
+      // The configurable large-repo budget is threaded through (default 600s).
+      assert.equal(maxCloneMs, IMPORT_MAX_CLONE_SLO_MS);
+      await exec('git clone --progress <ref> .', {});
+      // Stream progress as a large clone proceeds, staying under the 600s budget.
+      for (const pct of [25, 50, 75, 100]) {
+        clock.advance(120_000); // 4 * 120s = 480s < 600s
+        onProgress({ percent: pct });
+      }
+      return { ok: true, sizeBytes: smallRepoMaxBytes + 1, projectTree: { 'big.bin': Buffer.from('x'.repeat(16)) } };
+    },
+  };
+  const origin = createProjectOrigin({ authorizer, sandboxManager, cloner, now: clock });
+
+  const result = await origin.populate({
+    project: projectRecord({ origin: 'github-import', id: 'imp-large' }),
+    sandbox: { projectId: 'imp-large' },
+    origin: 'github-import',
+    targetCategory: 'web',
+    ref: 'https://github.com/acme/big.git',
+    userAccount: { id: OWNER },
+    repoResource: { id: 'https://github.com/acme/big.git', ownerId: OWNER },
+    onProgress: (p) => progress.push(p),
+  });
+
+  assert.equal(result.ok, true, 'large clone under the 600s budget succeeds');
+  assert.deepEqual(progress.map((p) => p.percent), [25, 50, 75, 100], 'ongoing progress was reported');
+  assert.ok(result.cloneMs <= IMPORT_MAX_CLONE_SLO_MS);
+  assert.deepEqual(sandboxManager.releaseCalls, ['imp-large']);
+});
+
+test('github-import: a large clone EXCEEDING the configurable max clone time aborts with the cause, no partial Project, sandbox reaped', async () => {
+  const clock = manualClock({ start: 0 });
+  const authorizer = createAuthorizer();
+  const sandboxManager = importSandboxManager();
+  const cloner = {
+    async clone({ exec, smallRepoMaxBytes }) {
+      await exec('git clone <ref> .', {});
+      clock.advance(700_000); // 700s > 600s max clone time
+      return { ok: true, sizeBytes: smallRepoMaxBytes + 1, projectTree: { 'big.bin': Buffer.from('x') } };
+    },
+  };
+  const origin = createProjectOrigin({ authorizer, sandboxManager, cloner, now: clock });
+
+  const result = await origin.populate({
+    project: projectRecord({ origin: 'github-import', id: 'imp-slow' }),
+    sandbox: { projectId: 'imp-slow' },
+    origin: 'github-import',
+    targetCategory: 'web',
+    ref: 'https://github.com/acme/big.git',
+    userAccount: { id: OWNER },
+    repoResource: { id: 'https://github.com/acme/big.git', ownerId: OWNER },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'IMPORT_FAILED');
+  assert.match(result.message, /max clone time/);
+  assert.equal(result.projectTree, undefined, 'no partial tree on timeout');
+  // Sandbox reaped in the finally even on the failure path (Req 6.5).
+  assert.deepEqual(sandboxManager.releaseCalls, ['imp-slow'], 'orphan sandbox reaped on failure');
+});
+
+test('github-import: an honored configurable maxCloneMs override bounds the clone', async () => {
+  const clock = manualClock({ start: 0 });
+  const authorizer = createAuthorizer();
+  const sandboxManager = importSandboxManager();
+  const cloner = {
+    async clone({ exec, maxCloneMs, smallRepoMaxBytes }) {
+      assert.equal(maxCloneMs, 5000, 'the factory maxCloneMs override is threaded through');
+      await exec('git clone <ref> .', {});
+      clock.advance(6000); // 6s > the 5s override
+      return { ok: true, sizeBytes: smallRepoMaxBytes + 1, projectTree: { 'big.bin': Buffer.from('x') } };
+    },
+  };
+  const origin = createProjectOrigin({ authorizer, sandboxManager, cloner, now: clock, maxCloneMs: 5000 });
+
+  const result = await origin.populate({
+    project: projectRecord({ origin: 'github-import', id: 'imp-cfg' }),
+    sandbox: { projectId: 'imp-cfg' },
+    origin: 'github-import',
+    targetCategory: 'web',
+    ref: 'https://github.com/acme/big.git',
+    userAccount: { id: OWNER },
+    repoResource: { id: 'https://github.com/acme/big.git', ownerId: OWNER },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'IMPORT_FAILED');
+  assert.deepEqual(sandboxManager.releaseCalls, ['imp-cfg']);
+});
+
+test('github-import: an invalid/inaccessible ref aborts with the cause, no partial Project, sandbox reaped in a finally (Req 6.5)', async () => {
+  const clock = manualClock({ start: 0 });
+  const authorizer = createAuthorizer();
+  const sandboxManager = importSandboxManager();
+  const cloner = {
+    async clone({ exec }) {
+      await exec('git clone <bad-ref> .', {});
+      // The confined clone command failed inside the box (invalid/inaccessible).
+      return { ok: false, message: 'repository not found or access denied' };
+    },
+  };
+  const origin = createProjectOrigin({ authorizer, sandboxManager, cloner, now: clock });
+
+  const result = await origin.populate({
+    project: projectRecord({ origin: 'github-import', id: 'imp-bad' }),
+    sandbox: { projectId: 'imp-bad' },
+    origin: 'github-import',
+    targetCategory: 'web',
+    ref: 'https://github.com/acme/missing.git',
+    userAccount: { id: OWNER },
+    repoResource: { id: 'https://github.com/acme/missing.git', ownerId: OWNER },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'IMPORT_FAILED');
+  assert.match(result.message, /not found or access denied/);
+  assert.equal(result.projectTree, undefined, 'no partial tree on invalid ref');
+  assert.deepEqual(sandboxManager.releaseCalls, ['imp-bad'], 'orphan sandbox reaped on invalid-ref failure');
+});
+
+test('github-import: a cloner that THROWS is caught, aborts with IMPORT_FAILED, and still reaps the sandbox in the finally', async () => {
+  const clock = manualClock({ start: 0 });
+  const authorizer = createAuthorizer();
+  const sandboxManager = importSandboxManager();
+  const cloner = {
+    async clone() {
+      throw new Error('network unreachable');
+    },
+  };
+  const origin = createProjectOrigin({ authorizer, sandboxManager, cloner, now: clock });
+  const result = await origin.populate({
+    project: projectRecord({ origin: 'github-import', id: 'imp-throw' }),
+    sandbox: { projectId: 'imp-throw' },
+    origin: 'github-import',
+    targetCategory: 'web',
+    ref: 'https://github.com/acme/x.git',
+    userAccount: { id: OWNER },
+    repoResource: { id: 'https://github.com/acme/x.git', ownerId: OWNER },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'IMPORT_FAILED');
+  assert.match(result.message, /network unreachable/);
+  assert.deepEqual(sandboxManager.releaseCalls, ['imp-throw'], 'sandbox reaped even when the cloner throws');
+});
+
+test('github-import: authorization is checked BEFORE cloning — an unauthorized repo never triggers the fetch and creates nothing', async () => {
+  const clock = manualClock({ start: 0 });
+  // An authorizer that denies (the requester owns nothing and holds no grant).
+  const authorizer = createAuthorizer();
+  const sandboxManager = importSandboxManager();
+  let cloneCalled = false;
+  const cloner = {
+    async clone() {
+      cloneCalled = true;
+      return { ok: true, projectTree: {} };
+    },
+  };
+  const origin = createProjectOrigin({ authorizer, sandboxManager, cloner, now: clock });
+
+  const result = await origin.populate({
+    project: projectRecord({ origin: 'github-import', id: 'imp-unauth' }),
+    sandbox: { projectId: 'imp-unauth' },
+    origin: 'github-import',
+    targetCategory: 'web',
+    ref: 'https://github.com/someone-else/private.git',
+    // The repo is owned by someone else; a requester with a DIFFERENT id and no
+    // grant is denied BEFORE the fetch.
+    repoResource: { id: 'https://github.com/someone-else/private.git', ownerId: 'someone-else' },
+    userAccount: { id: 'intruder' },
+    grants: [],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'IMPORT_UNAUTHORIZED');
+  assert.equal(cloneCalled, false, 'the network clone was NEVER attempted after a denial');
+});
+
+// -------------------------------------------------------------------- fork
+
+/** Seed a real source Project (registry + persisted tree + a snapshot). */
+function seedSource({ layout, registry, snapshotStore, persistenceStore, id = 'src-1', tree }) {
+  const record = projectRecord({ origin: 'blank', id });
+  registry.register(record);
+  persistenceStore.persist(id, tree);
+  persistenceStore.flush(id);
+  const committed = snapshotStore.commitExplicit(id, tree);
+  return { record, committed };
+}
+
+test('fork: copies the source Project MOST RECENT Snapshot as an INDEPENDENT starting state (Property 10 — mutating the fork never touches the origin)', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    const snapshotStore = createSnapshotStore({ layout, ownerId: OWNER });
+    const authorizer = createAuthorizer();
+
+    // Non-utf8 bytes so the content round-trips as a genuine Buffer (binary),
+    // exercising the deep-copy-of-Buffers half of Property 10.
+    const sourceTree = { 'index.js': "console.log('source v2');\n", 'data.bin': Buffer.from([0xff, 0xfe, 0x00, 0x80]) };
+    // Commit an older snapshot first, then the most-recent one, to prove "most recent".
+    seedSource({ layout, registry, snapshotStore, persistenceStore, id: 'src-1', tree: { 'index.js': "console.log('source v1');\n" } });
+    snapshotStore.commitExplicit('src-1', sourceTree);
+
+    const origin = createProjectOrigin({ snapshotStore, persistenceStore, authorizer, projectRegistry: registry, now: steppingClock() });
+
+    const result = await origin.populate({
+      project: projectRecord({ origin: 'fork', id: 'fork-1' }),
+      origin: 'fork',
+      targetCategory: 'web',
+      ref: 'src-1',
+      userAccount: { id: OWNER },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.origin, 'fork');
+    // The MOST RECENT snapshot's tree was copied (v2, plus the binary file).
+    assert.equal(result.projectTree['index.js'], "console.log('source v2');\n");
+    assert.ok(Buffer.isBuffer(result.projectTree['data.bin']));
+    assert.deepEqual([...result.projectTree['data.bin']], [0xff, 0xfe, 0x00, 0x80]);
+
+    // Property 10: mutate the fork's tree/buffer and confirm the ORIGIN's most
+    // recent snapshot is unchanged (deep, independent copy — no shared Buffers).
+    result.projectTree['data.bin'][0] = 99;
+    result.projectTree['index.js'] = 'tampered';
+    const originLatest = snapshotStore.latestSnapshot('src-1');
+    const originRestored = snapshotStore.restore('src-1', originLatest.id);
+    assert.equal(originRestored.projectTree['index.js'], "console.log('source v2');\n", 'origin source unchanged');
+    assert.deepEqual([...originRestored.projectTree['data.bin']], [0xff, 0xfe, 0x00, 0x80], 'origin binary bytes untouched');
+  } finally {
+    cleanup();
+  }
+});
+
+test('fork: a source with NO snapshot yet falls back to its most recent persisted tree (Req 6.7)', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    const snapshotStore = createSnapshotStore({ layout, ownerId: OWNER });
+    const authorizer = createAuthorizer();
+
+    // Register + persist a tree, but DO NOT commit any snapshot.
+    registry.register(projectRecord({ origin: 'blank', id: 'src-nosnap' }));
+    persistenceStore.persist('src-nosnap', { 'app.js': "console.log('persisted only');\n" });
+    persistenceStore.flush('src-nosnap');
+
+    const origin = createProjectOrigin({ snapshotStore, persistenceStore, authorizer, projectRegistry: registry, now: steppingClock() });
+    const result = await origin.populate({
+      project: projectRecord({ origin: 'fork', id: 'fork-2' }),
+      origin: 'fork',
+      targetCategory: 'web',
+      ref: 'src-nosnap',
+      userAccount: { id: OWNER },
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(Object.keys(result.projectTree), ['app.js']);
+    assert.equal(result.projectTree['app.js'], "console.log('persisted only');\n");
+  } finally {
+    cleanup();
+  }
+});
+
+test('fork: a source with neither a snapshot nor a persisted tree is rejected (FORK_EMPTY), creating nothing', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    const snapshotStore = createSnapshotStore({ layout, ownerId: OWNER });
+    const authorizer = createAuthorizer();
+    registry.register(projectRecord({ origin: 'blank', id: 'src-empty' }));
+
+    const origin = createProjectOrigin({ snapshotStore, persistenceStore, authorizer, projectRegistry: registry, now: steppingClock() });
+    const result = await origin.populate({
+      project: projectRecord({ origin: 'fork', id: 'fork-3' }),
+      origin: 'fork',
+      targetCategory: 'web',
+      ref: 'src-empty',
+      userAccount: { id: OWNER },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'FORK_EMPTY');
+    assert.equal(result.projectTree, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test('fork: a NONEXISTENT source Project is rejected (FORK_NOT_FOUND) and creates nothing', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    const snapshotStore = createSnapshotStore({ layout, ownerId: OWNER });
+    const authorizer = createAuthorizer();
+
+    const origin = createProjectOrigin({ snapshotStore, persistenceStore, authorizer, projectRegistry: registry, now: steppingClock() });
+    const result = await origin.populate({
+      project: projectRecord({ origin: 'fork', id: 'fork-4' }),
+      origin: 'fork',
+      targetCategory: 'web',
+      ref: 'does-not-exist',
+      userAccount: { id: OWNER },
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'FORK_NOT_FOUND');
+    assert.equal(result.projectTree, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test('fork: an UNAUTHORIZED source Project (owned by another account, no grant) is rejected (FORK_UNAUTHORIZED), creating nothing', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    const snapshotStore = createSnapshotStore({ layout, ownerId: OWNER });
+    const authorizer = createAuthorizer();
+
+    // Source owned by OWNER, with a real snapshot.
+    seedSource({ layout, registry, snapshotStore, persistenceStore, id: 'src-owned', tree: { 'index.js': "console.log('x');\n" } });
+
+    const origin = createProjectOrigin({ snapshotStore, persistenceStore, authorizer, projectRegistry: registry, now: steppingClock() });
+    // A DIFFERENT requester with no grant must be denied.
+    const result = await origin.populate({
+      project: projectRecord({ origin: 'fork', id: 'fork-5' }),
+      origin: 'fork',
+      targetCategory: 'web',
+      ref: 'src-owned',
+      userAccount: { id: 'intruder' },
+      grants: [],
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'FORK_UNAUTHORIZED');
+    assert.equal(result.projectTree, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test('fork: a valid read-only Share_Link grant authorizes a non-owner to fork the source', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    const snapshotStore = createSnapshotStore({ layout, ownerId: OWNER });
+    const authorizer = createAuthorizer();
+    seedSource({ layout, registry, snapshotStore, persistenceStore, id: 'src-shared', tree: { 'index.js': "console.log('shared');\n" } });
+
+    const origin = createProjectOrigin({ snapshotStore, persistenceStore, authorizer, projectRegistry: registry, now: steppingClock() });
+    const result = await origin.populate({
+      project: projectRecord({ origin: 'fork', id: 'fork-6' }),
+      origin: 'fork',
+      targetCategory: 'web',
+      ref: 'src-shared',
+      userAccount: { id: 'guest' },
+      grants: [{ projectId: 'src-shared', access: 'read-only', revoked: false }],
+    });
+    assert.equal(result.ok, true, 'a live read-only Share_Link grants the fork');
+    assert.equal(result.projectTree['index.js'], "console.log('shared');\n");
+  } finally {
+    cleanup();
+  }
+});
+
+// ------------------- ProjectManager convergence for import + fork -----------
+
+test('ProjectManager.populateOrigin: a github-import failure rolls back the Sandbox AND registry (no partial Project, no orphaned Sandbox)', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    const authorizer = createAuthorizer();
+    // The ProjectManager's fakeSandboxManager records release; the origin uses
+    // the SAME manager so its finally-release and the rollback both hit it.
+    const sandboxManager = fakeSandboxManager();
+    const cloner = { async clone() { return { ok: false, message: 'bad ref' }; } };
+    const projectOrigin = createProjectOrigin({ authorizer, sandboxManager, cloner, now: steppingClock() });
+    const manager = createProjectManager({
+      registry,
+      sandboxManager,
+      devServer: fakeDevServer(),
+      projectOrigin,
+      persistenceStore,
+      agentFactory: fakeAgentFactory(),
+      verify: () => 'verdict: PASS',
+      now: steppingClock(),
+      idFactory: seqIdFactory('imp'),
+    });
+
+    const created = manager.createProject({
+      accountId: OWNER, description: 'app', targetCategory: 'web', origin: 'github-import', ref: 'https://github.com/x/y.git',
+    });
+    assert.equal(created.ok, true);
+    assert.equal(registry.countForOwner(OWNER), 1);
+
+    const populated = await manager.populateOrigin({
+      project: created.project,
+      sandbox: created.sandbox,
+      userAccount: { id: OWNER },
+      repoResource: { id: 'https://github.com/x/y.git', ownerId: OWNER },
+    });
+    assert.equal(populated.ok, false);
+    assert.equal(populated.code, 'IMPORT_FAILED');
+    // Sandbox reaped (origin finally + rollback are both idempotent) and the
+    // registry entry rolled back — no partial Project, no orphaned Sandbox.
+    assert.ok(sandboxManager.releaseCalls.includes(created.project.id), 'sandbox reaped on import failure');
+    assert.equal(registry.countForOwner(OWNER), 0, 'no partial Project after import failure');
+  } finally {
+    cleanup();
+  }
+});
+
+test('ProjectManager.populateOrigin: a fork materializes the copied tree into the FORK own exportable tree and routes through runGeneration (Req 6.9)', async () => {
+  const { layout, cleanup } = tempLayout();
+  try {
+    const registry = createProjectRegistry({ layout });
+    const sandboxManager = fakeSandboxManager();
+    const devServer = fakeDevServer();
+    const persistenceStore = createPersistenceStore({ layout, ownerId: OWNER, debounceMs: 0 });
+    const snapshotStore = createSnapshotStore({ layout, ownerId: OWNER });
+    const authorizer = createAuthorizer();
+
+    // Seed a real source with a snapshot.
+    seedSource({ layout, registry, snapshotStore, persistenceStore, id: 'src-conv', tree: { 'package.json': '{"name":"src"}\n', 'index.js': "console.log('src');\n" } });
+
+    const projectOrigin = createProjectOrigin({ snapshotStore, persistenceStore, authorizer, projectRegistry: registry, now: steppingClock() });
+    const manager = createProjectManager({
+      registry,
+      sandboxManager,
+      devServer,
+      projectOrigin,
+      persistenceStore,
+      agentFactory: fakeAgentFactory(),
+      verify: () => 'verdict: PASS',
+      now: steppingClock(),
+      idFactory: seqIdFactory('fork'),
+    });
+
+    const created = manager.createProject({ accountId: OWNER, description: 'app', targetCategory: 'web', origin: 'fork', ref: 'src-conv' });
+    assert.equal(created.ok, true);
+
+    const populated = await manager.populateOrigin({ project: created.project, sandbox: created.sandbox, userAccount: { id: OWNER } });
+    assert.equal(populated.ok, true, 'fork populate ok');
+    assert.equal(populated.origin, 'fork');
+
+    // The copied tree is durable in the FORK's OWN exportable tree, separate from the source.
+    const forkTree = persistenceStore.readPersistedTree(created.project.id);
+    assert.deepEqual(Object.keys(forkTree).sort(), ['index.js', 'package.json']);
+
+    // The SAME runGeneration pipeline runs for the fork origin (no forked lifecycle).
+    const result = await manager.runGeneration({ project: created.project, sandbox: created.sandbox, message: 'go', projectTree: forkTree });
+    assert.equal(result.ok, true);
+    assert.equal(result.verdict, 'PASS');
+    assert.equal(devServer.startCalls.length, 1, 'Dev_Server started once for the fork');
   } finally {
     cleanup();
   }
