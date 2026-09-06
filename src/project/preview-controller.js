@@ -42,10 +42,12 @@
  * a container-capable host and is out of scope for this environment.
  *
  * TWO SEQUENTIAL PHASES (design clarification, NOT one 60s window): phase 1 is
- * the Dev_Server becoming ready (<=60s, or a startup-timeout, Req 3.5); phase 2,
- * measured FROM Dev_Server start, is the Preview becoming available (<=60s,
- * Req 1.3). start(...) exposes BOTH measured elapsed values so each SLO is
- * independently observable and testable.
+ * the Dev_Server becoming ready (<=60s, or a startup-timeout, Req 3.5), measured
+ * from t0 to the ready instant; phase 2, measured FROM that Dev_Server-ready
+ * instant (a distinct origin, NOT t0), is the Preview becoming available (<=60s,
+ * Req 1.3). start(...) captures an intermediate readiness timestamp so the two
+ * phases are genuine sequential deltas, and exposes BOTH measured elapsed values
+ * so each SLO is independently observable and testable.
  *
  * THE PLUMBY BOUNDARY: this module NEVER imports the plumby package. It only
  * touches the Dev_Server / Sandbox seams and closed enums.
@@ -172,6 +174,14 @@ export function createPreviewController({
    *     injected clock), clear any prior build error / showingPrior flag, and
    *     clear the in-progress "building" label. This is the only point at which
    *     the served content is asserted to reflect "current committed state".
+   *     HONESTY of the served URL: the url reflects the ACTUAL running Dev_Server
+   *     handle (s.devServer?.url) when one exists. When publish runs BEFORE any
+   *     start (no running handle), the committed snapshot is still published (the
+   *     served snapshotId advances exactly as before — Property 3), but url stays
+   *     null and status is 'committed' rather than 'served', so the surface never
+   *     claims a live URL for a Dev_Server that is not running. The production
+   *     ordering (finalizePass starts THEN publishes) is unaffected: with a
+   *     running handle the real url is used and status is 'served'.
    *   - buildOk === false: a committed Snapshot FAILED to build (Req 3.4). RETAIN
    *     the last successfully-built served preview, record the captured build
    *     error, and mark showingPrior:true so the surface indicates a PRIOR state
@@ -196,14 +206,20 @@ export function createPreviewController({
 
     if (buildOk) {
       // Successful build: publish the committed Snapshot as the served preview.
-      const url = s.devServer?.url ?? `http://preview.local/${projectId}`;
+      // The served URL is HONEST: it reflects the actual running Dev_Server handle
+      // when one exists, and stays null when publish runs before any start so we
+      // never advertise a live URL for a Dev_Server that is not running. The
+      // committed snapshotId advances either way (Property 3 is about snapshot
+      // identity, not URL); only the url/status differ.
+      const url = s.devServer?.url ?? null;
+      const status = url !== null ? 'served' : 'committed';
       s.served = { snapshotId, url, publishedAt: at };
       s.buildError = null;
       s.showingPrior = false;
       // The freshly-committed state is now served, so it is no longer "building".
       s.building = null;
       const publishMs = now() - at;
-      return { ok: true, snapshotId, url, status: 'served', publishMs, showingPrior: false };
+      return { ok: true, snapshotId, url, status, publishMs, showingPrior: false };
     }
 
     // Failed build: RETAIN the last successfully-built preview, capture the
@@ -229,6 +245,11 @@ export function createPreviewController({
    * successful publish); it is NEVER an uncommitted/in-progress edit — that only
    * appears under `building`. Property 3 is asserted against this method.
    *
+   * The `status` is HONEST about whether a live Dev_Server is serving the
+   * committed snapshot: 'served' when a running handle URL backs it, 'committed'
+   * when the snapshot is published but no Dev_Server is running yet (url null),
+   * and 'showing-prior' when a broken commit sits atop a prior good preview.
+   *
    * @returns {{ snapshotId:string|null, url:string|null, status:string,
    *            showingPrior:boolean, buildError:string|null, building:object|null }}
    */
@@ -248,7 +269,7 @@ export function createPreviewController({
     return {
       snapshotId: s.served.snapshotId,
       url: s.served.url,
-      status: s.showingPrior ? 'showing-prior' : 'served',
+      status: s.showingPrior ? 'showing-prior' : s.served.url !== null ? 'served' : 'committed',
       showingPrior: s.showingPrior,
       buildError: s.buildError,
       building: s.building,
@@ -266,8 +287,12 @@ export function createPreviewController({
    *     60s startup bound, return a startup-timeout error WITH a restart offer
    *     and do NOT expose a broken preview (Req 3.5).
    *   phase 2 (previewAvailableMs): the Preview becoming available, measured FROM
-   *     Dev_Server start, bounded at 60s (Req 1.3). Exposed as its own value so
-   *     it is not collapsed into phase 1.
+   *     the Dev_Server-ready instant (NOT from t0), bounded at 60s (Req 1.3).
+   *     We capture an intermediate readiness timestamp (readyAt) once the seam
+   *     reports ready and compute previewAvailableMs = now() - readyAt, so the
+   *     two phases are true SEQUENTIAL deltas from different origins rather than
+   *     two cumulative-from-t0 values. Exposed as its own value so it is not
+   *     collapsed into phase 1.
    *
    * While starting, the reported status is 'preview-loading' (Req 3.5); once the
    * seam reports started it becomes 'ready'. A successful start RESETS the
@@ -313,12 +338,14 @@ export function createPreviewController({
       };
     }
 
-    // Ready. Record the running handle. Phase 2 (preview-available) is measured
-    // FROM Dev_Server start; with the seam reporting ready synchronously here it
-    // is within bound, exposed as its own value so the SLO stays observable.
+    // Ready. Capture the readiness instant so phase 2 is measured FROM it (not
+    // from t0). Record the running handle. Phase 2 (preview-available) is the
+    // delta from Dev_Server-ready to preview-available, exposed as its own value
+    // so the SLO stays observable and independent of phase 1.
+    const readyAt = now();
     s.devServer = { url: started.url ?? `http://preview.local/${projectId}`, startedAt: started.startedAt ?? null };
     s.restartAttempts = 0;
-    const previewAvailableMs = now() - t0;
+    const previewAvailableMs = now() - readyAt;
     return {
       ok: true,
       status: 'ready',

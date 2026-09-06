@@ -102,9 +102,12 @@ const ACCESS_DENIED = { error: 'access denied' };
  * exact shape is unit-testable and cannot drift between the /preview response,
  * the /events reconnection frame, and the /preview/restart broadcast.
  *
- * The served-preview status vocabulary ('none'|'served'|'showing-prior'|
- * 'no-preview') is mapped onto the client-facing lifecycle vocabulary
- * ('loading'|'ready'|'error'|'showing_prior'). Only SAFE fields cross the wire:
+ * The served-preview status vocabulary ('none'|'served'|'committed'|
+ * 'showing-prior'|'no-preview') is mapped onto the client-facing lifecycle
+ * vocabulary ('loading'|'ready'|'error'|'showing_prior'). A 'committed' status
+ * (snapshot published but no Dev_Server running yet, so no live url) maps to
+ * 'loading' — it is honestly not-yet-ready rather than 'ready'. Only SAFE fields
+ * cross the wire:
  * status, snapshotId, url, and a redacted single-line cause SUMMARY — never a
  * raw build cause or secret, consistent with the observability error-frame
  * pattern that broadcasts only a generic userMessage.
