@@ -17,11 +17,19 @@
  *   - CONTAINMENT: the install runs INSIDE the project's Isolation_Boundary (the
  *     same one-shot boundary the build / Dev_Server use), so a dependency
  *     installed on the SUCCESS path is resolvable to the build/Dev_Server with
- *     no extra step (Req 17.1/17.2). The boundary's node_modules do NOT persist
- *     to the exportable project tree, which is exactly why a FAILED / TIMED-OUT
- *     install "exposes no partial deps": the only thing this module ever writes
- *     to the exportable tree is the manifest file, and on any non-success it is
- *     restored to its prior bytes (below).
+ *     no extra step (Req 17.1/17.2). The boundary bind-mounts the project's
+ *     EXPORTABLE tree read-write at /workspace (see sandbox-manager.js
+ *     mountSource = layout.exportableProjectTree(projectId) and
+ *     container-backend.js's read-write bind), so a real `npm install` writes
+ *     node_modules/ and the lockfile STRAIGHT INTO the exportable tree. That is
+ *     what makes a successful install resolvable with no extra step — but it
+ *     also means a FAILED / TIMED-OUT / DENIED install can leave partially
+ *     materialized dependency artifacts behind. To honor Req 17.3 ("expose no
+ *     partially installed dependency files to the build"), this module SNAPSHOTS
+ *     the dependency-output paths (node_modules + the known lockfiles) before
+ *     the install and, on ANY non-success, removes any that the install created
+ *     (paths absent before install) so no partial deps remain. The manifest is
+ *     restored to its prior bytes in the same step.
  *
  *   - MANIFEST PERSISTENCE: the manifest is the project's package.json-style
  *     file inside the exportable project tree
@@ -37,12 +45,14 @@
  *      on-disk manifest already reflects the addition when install begins.
  *   3. ROUTE the install command through commandGuard.run under the 300s ceiling.
  *   4. DENIED (classifier refuse / blocked / confirm-denied — command did NOT
- *      execute): CANCEL — restore the manifest to the prior bytes, expose no
- *      partial deps, return { ok:false, code:'CLASSIFIER_DENIED', ... } (Req 17.5).
+ *      execute): CANCEL — restore the manifest to the prior bytes, clean any
+ *      dependency artifacts the install created, expose no partial deps, return
+ *      { ok:false, code:'CLASSIFIER_DENIED'|'CONFIRM_DENIED', ... } (Req 17.5).
  *   5. FAILED / TIMED OUT (command executed but non-zero exit, or the boundary's
  *      wall-clock reaper fired at the ceiling): REPORT the installer output,
- *      restore the manifest, expose no partial deps, return { ok:false,
- *      code:'INSTALL_FAILED'|'INSTALL_TIMEOUT', ... } (Req 17.3).
+ *      restore the manifest, clean any partial dependency artifacts, expose no
+ *      partial deps, return { ok:false, code:'INSTALL_FAILED'|'INSTALL_TIMEOUT',
+ *      ... } (Req 17.3).
  *   6. SUCCESS (executed, exitCode 0): keep the new manifest, return
  *      { ok:true, ... } (Req 17.1/17.2).
  *
@@ -62,6 +72,23 @@ import { fail, requireString } from '../model/validate.js';
 export const DEFAULT_INSTALL_TIMEOUT_MS = 300_000;
 
 /**
+ * The dependency-output paths a package install materializes into the tree,
+ * relative to the manifest's directory: the installed-modules directory and the
+ * known lockfiles across npm/yarn/pnpm. These are the artifacts that must NOT be
+ * left behind on a non-success install (Req 17.3). Because the boundary bind-
+ * mounts the exportable tree read-write, a real install writes these straight
+ * into the exportable tree, so on any non-success we remove the ones the install
+ * created (i.e. that did not exist before it ran).
+ */
+export const DEPENDENCY_OUTPUT_PATHS = Object.freeze([
+  'node_modules',
+  'package-lock.json',
+  'npm-shrinkwrap.json',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+]);
+
+/**
  * Validate a manifestRelPath as a SINGLE SAFE RELATIVE path (same rule as the
  * StorageLayout / SandboxManager: no absolute path, no traversal). A relative
  * path with intermediate directories is allowed (e.g. 'packages/app/package.json'),
@@ -78,6 +105,16 @@ function requireSafeRelPath(relPath) {
     fail('PackageManager', `manifestRelPath must not contain a '..' segment, got ${JSON.stringify(relPath)}`);
   }
   return relPath;
+}
+
+/** Whether a filesystem path exists (best-effort; any stat error -> false). */
+function pathExists(absPath) {
+  try {
+    fs.accessSync(absPath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -254,39 +291,81 @@ export function createPackageManager({
     // write them to disk, so the on-disk manifest already reflects the addition
     // when the install begins (Req 17.1 "adds to the manifest, THEN invokes").
     let newManifest;
+    let manifestChanged;
     if (typeof manifestUpdate === 'string') {
       newManifest = manifestUpdate;
+      manifestChanged = true;
     } else if (typeof packageSpec === 'string' && packageSpec.trim() !== '') {
       newManifest = applyPackageSpecToManifest(priorManifest, packageSpec);
+      manifestChanged = true;
     } else {
       // No manifest change to apply — install from the manifest as-is (bare
-      // `npm install`). The prior contents ARE the current contents.
+      // `npm install`). The prior contents ARE the current contents, so this is
+      // a true no-op: do NOT rewrite the manifest with its own bytes (Issue 4).
       newManifest = priorManifest;
+      manifestChanged = false;
     }
-    if (typeof newManifest === 'string') {
+    if (manifestChanged && typeof newManifest === 'string') {
       writeManifest(absPath, newManifest);
     }
 
+    // (2a) SNAPSHOT which dependency-output paths already exist BEFORE the
+    // install runs. The boundary bind-mounts the exportable tree read-write, so
+    // a real install writes node_modules/ + a lockfile straight into it; on any
+    // non-success we must remove ONLY the artifacts this install created (paths
+    // absent before it ran), never a pre-existing node_modules/lockfile the
+    // Builder_Agent already had. Paths are resolved relative to the manifest's
+    // own directory so a nested manifest (e.g. packages/app/package.json) cleans
+    // the right tree.
+    const manifestDir = path.dirname(absPath);
+    const depOutputAbsPaths = DEPENDENCY_OUTPUT_PATHS.map((rel) => path.join(manifestDir, rel));
+    const preexistingDepPaths = new Set(depOutputAbsPaths.filter((p) => pathExists(p)));
+
     /**
-     * Restore the manifest to its prior snapshotted bytes. Reverts the
-     * Builder_Agent's addition so the on-disk manifest is byte-for-byte what it
-     * was before install (Req 17.3/17.5). When there was NO prior manifest
-     * (null) and we created one, we do not fabricate a delete here — instead we
-     * write back an empty-object manifest only if we actually created a file;
-     * but since a null prior means the caller had no manifest, we restore by
-     * removing the file so "no partial deps / unchanged" holds. writeManifest is
-     * the only tree-writing seam, so restoring it is sufficient — no node_modules
-     * are ever written to the exportable tree by this module.
+     * Cancel the install's on-disk footprint so the exportable tree is exactly
+     * what it was before install began (Req 17.3/17.5). TWO parts:
+     *
+     *   (a) MANIFEST: restore the manifest to its prior snapshotted bytes,
+     *       reverting the Builder_Agent's addition. When there was NO prior
+     *       manifest (null) and this install created one, revert to "no
+     *       manifest" by removing the file. When the manifest was not changed
+     *       (bare install no-op), there is nothing to restore.
+     *   (b) DEPENDENCY ARTIFACTS: the boundary bind-mounts the exportable tree
+     *       read-write, so a real `npm install` writes node_modules/ + a
+     *       lockfile straight into it and a failed/timed-out/denied run can
+     *       leave those partially materialized. Remove any dependency-output
+     *       path that this install CREATED (was absent before it ran), leaving
+     *       any pre-existing node_modules/lockfile the Builder_Agent already had
+     *       untouched. This is what "expose no partially installed dependency
+     *       files to the build" means against the real read-write mount.
      */
     function restoreManifest() {
-      if (typeof priorManifest === 'string') {
+      if (manifestChanged && typeof priorManifest === 'string') {
         writeManifest(absPath, priorManifest);
-      } else if (typeof newManifest === 'string') {
+      } else if (manifestChanged && typeof newManifest === 'string') {
         // We created a manifest where none existed; revert to "no manifest".
         try {
           fs.rmSync(absPath, { force: true });
         } catch {
           /* best-effort revert; the tree exposes no dep files regardless */
+        }
+      }
+      cleanPartialDeps();
+    }
+
+    /**
+     * Remove dependency-output artifacts this install created (paths that were
+     * absent before it ran). Best-effort + recursive: a partial node_modules is
+     * a directory tree. Never touches a path that pre-existed the install.
+     */
+    function cleanPartialDeps() {
+      for (const depPath of depOutputAbsPaths) {
+        if (preexistingDepPaths.has(depPath)) continue;
+        if (!pathExists(depPath)) continue;
+        try {
+          fs.rmSync(depPath, { recursive: true, force: true });
+        } catch {
+          /* best-effort clean; do not throw from the restore/cancel path */
         }
       }
     }
@@ -319,20 +398,33 @@ export function createPackageManager({
     // and expose no partial deps. Nothing in the Sandbox or manifest changed.
     if (!executed) {
       restoreManifest();
+      // Distinguish a CONSENT denial of a confirm-class command from a
+      // classifier (refuse / blocked / fail-closed) denial (Issue 3). In the
+      // confirm case the classifier DID answer — it returned 'confirm' — and the
+      // denial originated from the consent gate, not from the Permission_
+      // Classifier. Req 17.5 is about a command "denied by the classifier"; a
+      // consent denial is a different gate, so it gets its own code/message.
+      const confirmDenied = outcome === 'confirm';
+      const code = confirmDenied ? 'CONFIRM_DENIED' : 'CLASSIFIER_DENIED';
+      const message = confirmDenied
+        ? `package command requires confirmation and consent was denied${
+            classifyReason ? ` (${classifyReason})` : ''
+          }; install cancelled and manifest restored`
+        : `package command denied by the classifier (${outcome}${
+            classifyReason ? `: ${classifyReason}` : ''
+          }); install cancelled and manifest restored`;
       const result = Object.freeze({
         ok: false,
-        code: 'CLASSIFIER_DENIED',
+        code,
         outcome,
         category,
         reason: classifyReason,
         manifestRestored: true,
         durationMs,
-        message: `package command denied by the classifier (${outcome}${
-          classifyReason ? `: ${classifyReason}` : ''
-        }); install cancelled and manifest restored`,
+        message,
       });
-      emitAudit({ type: 'package.install.denied', projectId, outcome, category, reason: classifyReason });
-      emitObservability({ type: 'package.install', projectId, ok: false, code: 'CLASSIFIER_DENIED', outcome, durationMs });
+      emitAudit({ type: 'package.install.denied', projectId, code, outcome, category, reason: classifyReason });
+      emitObservability({ type: 'package.install', projectId, ok: false, code, outcome, durationMs });
       return result;
     }
 
@@ -344,8 +436,9 @@ export function createPackageManager({
 
     // (5) FAILURE / TIMEOUT path (Req 17.3): the command executed but did not
     // succeed. REPORT the installer output, RESTORE the manifest, and expose no
-    // partial deps (the boundary's node_modules never persist to the exportable
-    // tree; the only tree write this module makes is the manifest, now reverted).
+    // partial deps — restoreManifest() reverts the manifest AND removes any
+    // dependency-output artifacts (node_modules / lockfile) this install created
+    // in the read-write-mounted exportable tree.
     if (timedOut || exitCode !== 0) {
       restoreManifest();
       const code = timedOut ? 'INSTALL_TIMEOUT' : 'INSTALL_FAILED';

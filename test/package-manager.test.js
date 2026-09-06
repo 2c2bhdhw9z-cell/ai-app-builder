@@ -32,15 +32,24 @@
  *     read back BYTE-FOR-BYTE equal to the prior bytes after the non-success.
  *     Deleting restoreManifest() on the failure/timeout path leaves the added
  *     dependency on disk, so `assert.equal(after, priorBytes)` flips to fail.
- *   - no-partial-deps: the same two tests assert the exportable project tree
- *     contains ONLY the restored manifest — no node_modules / dep files. If the
- *     module ever persisted partial deps to the exportable tree, the directory
- *     listing assertion flips.
+ *   - no-partial-deps: the INSTALL-FAILURE and INSTALL-TIMEOUT tests give the
+ *     fake exec a side effect that WRITES a partial node_modules/<pkg>/index.js
+ *     AND a package-lock.json into the read-write-mounted exportable tree (as a
+ *     real `npm install` does) BEFORE returning the failure/timeout contract,
+ *     then assert those artifacts are GONE after install() returns (tree lists
+ *     only package.json). Reverting the Issue-1 cleanup leaves the artifacts on
+ *     disk, so both the directory-listing and the existsSync assertions flip.
+ *     A companion test writes a PRE-EXISTING node_modules and asserts it is
+ *     preserved (only install-created paths are cleaned); the SUCCESS test
+ *     asserts the installed deps PERSIST (cleanup must not run on success).
  *   - classifier-denied-cancels-cleanly: the CLASSIFIER-DENIED (refuse) and
  *     CONFIRM-DENIED tests assert the fake manager.exec was NEVER called
- *     (spy count === 0) AND the on-disk manifest equals the prior bytes AND
- *     code === 'CLASSIFIER_DENIED'. Removing the denial short-circuit would let
- *     exec run (count becomes 1) and/or leave the manifest changed — both flip.
+ *     (spy count === 0) AND the on-disk manifest equals the prior bytes. The
+ *     refuse case asserts code === 'CLASSIFIER_DENIED'; the confirm-consent-
+ *     denied case asserts code === 'CONFIRM_DENIED' (Issue 3 — the classifier
+ *     answered 'confirm', so the denial is NOT misattributed to the classifier).
+ *     Removing the denial short-circuit would let exec run (count becomes 1)
+ *     and/or leave the manifest changed — both flip.
  *   - timeout-via-injected-clock: the INSTALL-TIMEOUT test uses an injected `now`
  *     counter and a fake exec returning { exitCode:null, denied:true,
  *     deniedReason:'timeout', timedOut:true } with NO real waiting; it asserts
@@ -72,12 +81,19 @@ const PROJECT_ID = 'proj-1';
  * defaults so a test can model exit 0 (success), a non-zero exit (the command's
  * OWN failure, denied:false), or the boundary TIMEOUT contract.
  */
-function fakeManager(result = {}) {
+function fakeManager(result = {}, opts = {}) {
   const calls = [];
+  const { onExec } = opts;
   return {
     calls,
-    exec: async (projectId, command, opts) => {
-      calls.push({ projectId, command, opts });
+    exec: async (projectId, command, execOpts) => {
+      calls.push({ projectId, command, opts: execOpts });
+      // A real install writes node_modules/ + a lockfile straight into the
+      // read-write-mounted exportable tree. `onExec` lets a test model that
+      // side effect BEFORE the exec contract is returned, so the no-partial-deps
+      // assertions are meaningful (they would pass trivially if exec wrote
+      // nothing). See the INSTALL-FAILURE / INSTALL-TIMEOUT tests.
+      if (typeof onExec === 'function') onExec();
       return Object.freeze({
         stdout: '',
         stderr: '',
@@ -122,6 +138,20 @@ function readManifest(manifestPath) {
     if (err && err.code === 'ENOENT') return null;
     throw err;
   }
+}
+
+/**
+ * Write a partial dependency artifact into the exportable tree — a
+ * node_modules/<pkg>/index.js AND a package-lock.json — modeling what a real
+ * `npm install` materializes into the read-write mount before it fails/times
+ * out. Used as the fake exec side effect so the no-partial-deps assertions
+ * actually have something to assert against (Issue 2).
+ */
+function writePartialDeps(treeRoot, pkg = 'left-pad') {
+  const modDir = path.join(treeRoot, 'node_modules', pkg);
+  fs.mkdirSync(modDir, { recursive: true });
+  fs.writeFileSync(path.join(modDir, 'index.js'), 'module.exports = () => {};\n', 'utf8');
+  fs.writeFileSync(path.join(treeRoot, 'package-lock.json'), '{"lockfileVersion":3}\n', 'utf8');
 }
 
 /** List the exportable tree's entries (top level) — used to prove no partial deps. */
@@ -207,8 +237,12 @@ test('CONFIRM-DENIED (Req 17.5): a confirm-class command with consent denied can
   assert.equal(manager.calls.length, 0, 'confirm-denied must never reach exec');
   assert.equal(readManifest(manifestPath), prior, 'manifest must be restored to prior bytes');
   assert.equal(res.ok, false);
-  assert.equal(res.code, 'CLASSIFIER_DENIED');
+  // Issue 3: a consent denial of a confirm-class command is NOT a classifier
+  // denial (the classifier answered 'confirm'); it carries its own code so the
+  // denial cause is not misattributed to the Permission_Classifier.
+  assert.equal(res.code, 'CONFIRM_DENIED');
   assert.equal(res.outcome, 'confirm');
+  assert.match(res.message, /consent was denied/);
   assert.equal(res.manifestRestored, true);
   assert.deepEqual(listTree(treeRoot), ['package.json']);
 });
@@ -220,12 +254,19 @@ test('INSTALL-FAILURE (Req 17.3): allow-class command, non-zero exit — output 
   const prior = seedManifest(manifestPath, PRIOR_MANIFEST);
 
   // The command executed inside the box but the installer failed (denied:false).
-  const manager = fakeManager({
-    exitCode: 1,
-    denied: false,
-    stdout: '',
-    stderr: 'npm ERR! 404 Not Found - GET https://registry/does-not-exist',
-  });
+  // Its side effect writes a PARTIAL node_modules + lockfile into the read-write-
+  // mounted exportable tree BEFORE the failure contract is returned, exactly as a
+  // real `npm install` that 404s partway through would (Issue 2). The cleanup
+  // added for Issue 1 must remove these on the non-success path.
+  const manager = fakeManager(
+    {
+      exitCode: 1,
+      denied: false,
+      stdout: '',
+      stderr: 'npm ERR! 404 Not Found - GET https://registry/does-not-exist',
+    },
+    { onExec: () => writePartialDeps(treeRoot) },
+  );
   const guard = createCommandGuard({ manager });
   const pm = createPackageManager({ layout, commandGuard: guard });
 
@@ -243,8 +284,12 @@ test('INSTALL-FAILURE (Req 17.3): allow-class command, non-zero exit — output 
 
   // (b) manifest RESTORED to the prior bytes (the addition reverted).
   assert.equal(readManifest(manifestPath), prior, 'manifest restored on failure');
-  // (c) no partial dep files: only the restored manifest lives in the tree.
+  // (c) no partial dep files: the partial node_modules AND lockfile the install
+  // wrote into the tree are GONE — only the restored manifest remains. This flips
+  // to fail if the Issue-1 cleanup is reverted (the artifacts would survive).
   assert.deepEqual(listTree(treeRoot), ['package.json']);
+  assert.equal(fs.existsSync(path.join(treeRoot, 'node_modules')), false, 'partial node_modules removed');
+  assert.equal(fs.existsSync(path.join(treeRoot, 'package-lock.json')), false, 'partial lockfile removed');
 });
 
 // ---------------------------------------------------------------- (4) INSTALL-TIMEOUT (injected clock)
@@ -255,13 +300,18 @@ test('INSTALL-TIMEOUT (Req 17.3): boundary timeout via INJECTED clock — timeou
 
   // The boundary's wall-clock reaper fired at the ceiling: exitCode null,
   // denied true, deniedReason 'timeout', timedOut true — NO real waiting here.
-  const manager = fakeManager({
-    exitCode: null,
-    denied: true,
-    deniedReason: 'timeout',
-    timedOut: true,
-    stderr: 'installer output at kill: still resolving...',
-  });
+  const manager = fakeManager(
+    {
+      exitCode: null,
+      denied: true,
+      deniedReason: 'timeout',
+      timedOut: true,
+      stderr: 'installer output at kill: still resolving...',
+    },
+    // The reaper fired mid-install: a partial node_modules + lockfile were
+    // already written into the read-write-mounted tree before the kill (Issue 2).
+    { onExec: () => writePartialDeps(treeRoot) },
+  );
   const guard = createCommandGuard({ manager });
   // Injected clock advances 0 -> 300000 so durationMs is derived from it, not
   // from real wall-clock time.
@@ -290,9 +340,12 @@ test('INSTALL-TIMEOUT (Req 17.3): boundary timeout via INJECTED clock — timeou
   // durationMs derived from the injected clock (300000 - 0).
   assert.equal(res.durationMs, DEFAULT_INSTALL_TIMEOUT_MS);
 
-  // manifest restored + no partial deps.
+  // manifest restored + no partial deps: the partial node_modules + lockfile the
+  // reaped install wrote are GONE (Issue 1 cleanup on the timeout path).
   assert.equal(readManifest(manifestPath), prior, 'manifest restored on timeout');
   assert.deepEqual(listTree(treeRoot), ['package.json']);
+  assert.equal(fs.existsSync(path.join(treeRoot, 'node_modules')), false, 'partial node_modules removed on timeout');
+  assert.equal(fs.existsSync(path.join(treeRoot, 'package-lock.json')), false, 'partial lockfile removed on timeout');
 });
 
 // Also assert a custom installTimeoutMs is threaded through (thread-through is
@@ -321,13 +374,69 @@ test('INSTALL-TIMEOUT: a custom installTimeoutMs is threaded to exec as timeoutM
   assert.equal(res.code, 'INSTALL_TIMEOUT');
 });
 
+// ------------------------------------------------ NO-PARTIAL-DEPS: only install-created artifacts are cleaned
+
+test('INSTALL-FAILURE: a PRE-EXISTING node_modules is preserved — only artifacts the install created are cleaned', async (t) => {
+  const { layout, treeRoot, manifestPath } = freshLayout(t);
+  const prior = seedManifest(manifestPath, PRIOR_MANIFEST);
+
+  // The Builder_Agent already had a node_modules with an existing dep BEFORE
+  // this install. The failed install then adds a NEW package's files + a
+  // lockfile. Cleanup must remove ONLY what this install created, never the
+  // pre-existing node_modules content.
+  const existingDir = path.join(treeRoot, 'node_modules', 'already-here');
+  fs.mkdirSync(existingDir, { recursive: true });
+  fs.writeFileSync(path.join(existingDir, 'index.js'), 'module.exports = 1;\n', 'utf8');
+
+  const manager = fakeManager(
+    {
+      exitCode: 1,
+      denied: false,
+      stderr: 'npm ERR! 404 Not Found',
+    },
+    {
+      onExec: () => {
+        // The install materializes a NEW package into the same node_modules and
+        // writes a fresh lockfile.
+        const newDir = path.join(treeRoot, 'node_modules', 'does-not-exist');
+        fs.mkdirSync(newDir, { recursive: true });
+        fs.writeFileSync(path.join(newDir, 'index.js'), 'module.exports = 2;\n', 'utf8');
+        fs.writeFileSync(path.join(treeRoot, 'package-lock.json'), '{"lockfileVersion":3}\n', 'utf8');
+      },
+    },
+  );
+  const guard = createCommandGuard({ manager });
+  const pm = createPackageManager({ layout, commandGuard: guard });
+
+  const res = await pm.install({ projectId: PROJECT_ID, packageSpec: 'does-not-exist' });
+
+  assert.equal(res.code, 'INSTALL_FAILED');
+  assert.equal(readManifest(manifestPath), prior, 'manifest restored on failure');
+  // The PRE-EXISTING node_modules content survives (node_modules pre-existed the
+  // install, so it is not one of the paths the install created).
+  assert.equal(
+    fs.existsSync(path.join(treeRoot, 'node_modules', 'already-here', 'index.js')),
+    true,
+    'pre-existing node_modules content preserved',
+  );
+  // The lockfile did NOT exist before the install, so it is removed.
+  assert.equal(fs.existsSync(path.join(treeRoot, 'package-lock.json')), false, 'install-created lockfile removed');
+});
+
 // ---------------------------------------------------------------- (5) SUCCESS
 
 test('SUCCESS (Req 17.1/17.2): allow-class command, exit 0 — new manifest kept, exec ran once through the guard', async (t) => {
   const { layout, treeRoot, manifestPath } = freshLayout(t);
   seedManifest(manifestPath, PRIOR_MANIFEST);
 
-  const manager = fakeManager({ exitCode: 0, denied: false, stdout: 'added 1 package' });
+  // On SUCCESS the install's node_modules + lockfile MUST persist to the
+  // exportable tree so the dependency is resolvable to the build/Dev_Server with
+  // no extra step (Req 17.1/17.2). Model the successful install writing them and
+  // assert the cleanup does NOT run on the success path.
+  const manager = fakeManager(
+    { exitCode: 0, denied: false, stdout: 'added 1 package' },
+    { onExec: () => writePartialDeps(treeRoot, 'right-pad') },
+  );
   const guard = createCommandGuard({ manager });
   const pm = createPackageManager({
     layout,
@@ -353,8 +462,11 @@ test('SUCCESS (Req 17.1/17.2): allow-class command, exit 0 — new manifest kept
   const parsed = JSON.parse(onDisk);
   assert.equal(parsed.dependencies['right-pad'], '^2.0.0');
   assert.equal(parsed.dependencies['left-pad'], '^1.0.0'); // prior dep preserved
-  // still only the manifest in the exportable tree (no partial deps written).
-  assert.deepEqual(listTree(treeRoot), ['package.json']);
+  // On success the installed deps PERSIST (Req 17.1/17.2 — resolvable with no
+  // extra step): the success path must NOT run the non-success cleanup.
+  assert.equal(fs.existsSync(path.join(treeRoot, 'node_modules', 'right-pad', 'index.js')), true, 'installed node_modules kept on success');
+  assert.equal(fs.existsSync(path.join(treeRoot, 'package-lock.json')), true, 'lockfile kept on success');
+  assert.deepEqual(listTree(treeRoot), ['node_modules', 'package-lock.json', 'package.json']);
 });
 
 // ---------------------------------------------------------------- ROUTING (Req 17.4)
