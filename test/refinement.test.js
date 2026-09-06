@@ -58,6 +58,8 @@ import fs from 'node:fs';
 
 import { createRefinementRouter, DIFF_SLO_MS } from '../src/project/index.js';
 import { editFileTool, computeDiff } from '../src/engine/plumby.js';
+import { createStorageLayout } from '../src/storage/layout.js';
+import { createPersistenceStore } from '../src/persistence/index.js';
 
 // ---------------------------------------------------------------- test harness
 
@@ -365,5 +367,70 @@ test('batch atomicity: a later missing-file edit fails the whole refinement and 
     assert.equal(fs.readFileSync(path.join(root, 'src/a.js'), 'utf8'), fileAOriginal);
   } finally {
     cleanup();
+  }
+});
+
+// -------- audit C3: a partial refinement must NOT delete the rest of the tree
+
+/**
+ * REGRESSION for audit C3 (data loss). A refinement that edits ONE file, with no
+ * caller-supplied full projectTree, must leave every OTHER persisted file intact
+ * on disk. Drives the REAL RefinementRouter + REAL PersistenceStore + REAL
+ * StorageLayout + REAL plumby editFileTool against a real 5-file project tree.
+ *
+ * MUTATION SENSITIVITY: revert the fix (call persistenceStore.persist(projectId,
+ * {only the changed file}) — the pre-fix behaviour) and persist()'s pruneStale
+ * deletes the four unedited files, so `readPersistedTree` returns only the edited
+ * file and this test fails. It also fails if persistPartial were made to prune.
+ */
+test('C3: a single-file refinement with no full tree leaves the other files intact on disk', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'aab-refine-c3-'));
+  const projectId = 'proj-c3';
+  const layout = createStorageLayout(base);
+  // debounceMs 0 makes persist/persistPartial durable immediately (no timer).
+  const persistenceStore = createPersistenceStore({ layout, ownerId: 'owner-c3', debounceMs: 0 });
+  try {
+    const treeRoot = layout.exportableProjectTree(projectId);
+
+    // Seed a 5-file project and persist it as the COMPLETE tree (the full write).
+    const fullTree = {
+      'README.md': '# demo\n',
+      'index.js': 'export const version = 1;\n',
+      'lib/util.js': 'export const util = () => 42;\n',
+      'package.json': '{ "name": "demo" }\n',
+      'src/app.js': 'export const app = "start";\n',
+    };
+    const full = persistenceStore.persist(projectId, fullTree);
+    assert.equal(full.ok, true);
+    assert.deepEqual(
+      Object.keys(persistenceStore.readPersistedTree(projectId)).sort(),
+      ['README.md', 'index.js', 'lib/util.js', 'package.json', 'src/app.js'],
+    );
+
+    // A follow-up refinement edits ONE line of ONE file, supplying NO projectTree.
+    const router = createRefinementRouter({ editFileTool, computeDiff, persistenceStore });
+    const res = await router.applyRefinement({
+      treeRoot,
+      projectId,
+      edit: { path: 'index.js', oldString: 'export const version = 1;', newString: 'export const version = 2;' },
+    });
+    assert.equal(res.ok, true, 'the single-file refinement succeeds');
+    assert.equal(res.persisted, true, 'the change is persisted');
+    assert.deepEqual(res.changedPaths, ['index.js']);
+
+    // THE INVARIANT: all five files still exist on disk; only index.js changed.
+    const after = persistenceStore.readPersistedTree(projectId);
+    assert.deepEqual(
+      Object.keys(after).sort(),
+      ['README.md', 'index.js', 'lib/util.js', 'package.json', 'src/app.js'],
+      'the four unedited files are NOT deleted by a partial refinement',
+    );
+    assert.equal(after['index.js'], 'export const version = 2;\n', 'the edited file has the new content');
+    assert.equal(after['README.md'], '# demo\n', 'an unedited file is byte-for-byte intact');
+    assert.equal(after['lib/util.js'], 'export const util = () => 42;\n');
+    assert.equal(after['package.json'], '{ "name": "demo" }\n');
+    assert.equal(after['src/app.js'], 'export const app = "start";\n');
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
   }
 });

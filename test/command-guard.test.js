@@ -109,6 +109,79 @@ test(propertyTag(5, 'Permission classifier never allows refuse-class commands'),
   );
 });
 
+// --- W3: assert against an INDEPENDENT corpus, not classifier-filtered inputs ---
+
+/**
+ * Audit W3: Property 5 uses `fc.pre(classifyCommand(command).outcome ===
+ * 'refuse')`, which FILTERS its inputs through the very classifier under test —
+ * so any command the classifier wrongly rates non-refuse is silently EXCLUDED
+ * from the property rather than failing it. That can only ever prove "the guard
+ * routes a verdict it already computed", never "a destructive command cannot
+ * reach exec".
+ *
+ * This corpus is curated INDEPENDENTLY of classifyCommand: each entry pins the
+ * verdict the guard MUST reach, decided by a human from the command's meaning,
+ * not by asking the classifier. A regression that makes the guard mis-route any
+ * of these (or reach exec for a refuse / an unapproved confirm) fails HERE, even
+ * though Property 5's `fc.pre` would have hidden it.
+ *
+ * (Scope note: the plumby classifier itself is out of this repo's control — its
+ * own bypass findings H2-H5 are fixed in plumby. This corpus therefore lists
+ * commands whose verdicts the SHIPPED classifier already computes, and asserts
+ * the GUARD's routing/no-exec contract against them independently.)
+ */
+const INDEPENDENT_CORPUS = [
+  // Destructive => refuse, must NEVER execute regardless of consent.
+  { command: 'rm -rf /', expected: 'refuse' },
+  { command: 'git filter-branch --tree-filter x HEAD', expected: 'refuse' },
+  { command: ':(){ :|:& };:', expected: 'refuse' },
+  { command: 'mkfs.ext4 /dev/sda', expected: 'refuse' },
+  { command: 'dd if=/dev/zero of=/dev/sda', expected: 'refuse' },
+  // Sensitive => confirm, must NOT execute without consent.
+  { command: 'git push --force origin main', expected: 'confirm' },
+  { command: 'rails db:migrate', expected: 'confirm' },
+  // Ordinary => allow, executes.
+  { command: 'ls', expected: 'allow' },
+  { command: 'npm test', expected: 'allow' },
+];
+
+test('W3: an INDEPENDENT command corpus routes to the pinned verdict; refuse/unapproved-confirm never exec', async () => {
+  for (const { command, expected } of INDEPENDENT_CORPUS) {
+    // (i) refuse: consent is irrelevant, exec is never reached.
+    if (expected === 'refuse') {
+      const manager = stubManager({ throwOnExec: true });
+      const guard = createCommandGuard({ manager, onConfirmRequest: () => true });
+      const res = await guard.run('p', command, { onConfirmRequest: () => true });
+      assert.equal(res.outcome, 'refuse', `${command} must be refuse`);
+      assert.equal(res.executed, false, `${command} must never execute`);
+      assert.equal(manager.calls.length, 0, `${command} must not reach exec`);
+      continue;
+    }
+    // (ii) confirm WITHOUT consent: blocked, exec never reached.
+    if (expected === 'confirm') {
+      const denyManager = stubManager({ throwOnExec: true });
+      const denyGuard = createCommandGuard({ manager: denyManager, onConfirmRequest: () => false });
+      const denied = await denyGuard.run('p', command, { onConfirmRequest: () => false });
+      assert.equal(denied.outcome, 'confirm', `${command} must be confirm`);
+      assert.equal(denied.executed, false, `${command} must not execute without consent`);
+      assert.equal(denyManager.calls.length, 0, `${command} must not reach exec without consent`);
+      // WITH consent it executes (the gate genuinely gates, not blanket-denies).
+      const okManager = stubManager({ result: { stdout: 'ok', exitCode: 0 } });
+      const okGuard = createCommandGuard({ manager: okManager, onConfirmRequest: () => true });
+      const approved = await okGuard.run('p', command, { onConfirmRequest: () => true });
+      assert.equal(approved.executed, true, `${command} executes once consented`);
+      continue;
+    }
+    // (iii) allow: executes without any prompt.
+    const manager = stubManager({ result: { stdout: 'ok', exitCode: 0 } });
+    const guard = createCommandGuard({ manager });
+    const res = await guard.run('p', command);
+    assert.equal(res.outcome, 'allow', `${command} must be allow`);
+    assert.equal(res.executed, true, `${command} must execute`);
+    assert.equal(manager.calls.length, 1, `${command} reaches exec exactly once`);
+  }
+});
+
 // --- 6.3* (a) fail-closed: classify throws / unavailable -----------------
 
 test('(a) fail closed to refuse when classify throws', async () => {

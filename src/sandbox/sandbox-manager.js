@@ -35,9 +35,19 @@
  * interface. Keeping the method present now fixes the stable shape.
  */
 
+import crypto from 'node:crypto';
+
 import { requireString, requireArray, fail } from '../model/validate.js';
 import { computeEgressAllowlist, DEFAULT_PACKAGE_REGISTRY_HOSTS } from './egress.js';
 import { WORKSPACE_MOUNT_PATH, NETWORK_DENY_ALL, NETWORK_FILTERED } from './container-backend.js';
+
+/**
+ * Default ceiling on how many project boundaries the manager will hold in memory
+ * at once (audit H15). Beyond this, the LEAST-recently-used idle boundary is
+ * evicted (released) so the map cannot grow without bound when exec() is called
+ * for an unbounded stream of caller-supplied project ids.
+ */
+export const DEFAULT_MAX_SANDBOXES = 256;
 
 /**
  * Map an egress allowlist to the network policy the backend must enforce.
@@ -59,6 +69,22 @@ function networkPolicyFor(egress) {
 }
 
 /**
+ * Detect a container-runtime NAME-COLLISION reported through a non-zero exit
+ * result rather than a thrown launch error (audit H16). Docker/Podman print
+ * "The container name ... is already in use" (and a non-zero exit) when
+ * `--name` is taken. We match that phrasing conservatively so a real command
+ * that merely happens to print similar text is not misclassified — we require
+ * BOTH a non-zero/absent exit code AND the runtime's own collision phrasing.
+ */
+function isNameCollision(result) {
+  if (!result) return false;
+  const code = typeof result.code === 'number' ? result.code : null;
+  if (code === 0) return false;
+  const stderr = String(result.stderr ?? '');
+  return /name .*is already in use|already in use by container|Conflict\. The container name/i.test(stderr);
+}
+
+/**
  * Validate a projectId as a single safe path segment (same rule as the storage
  * layout): no separators, no traversal. A sandbox is keyed by projectId and its
  * name/mount are derived from it, so an unsafe id could escape or collide.
@@ -77,9 +103,52 @@ function requireSafeProjectId(projectId) {
   return projectId;
 }
 
-/** Derive the container name for a project (also the reap label value). */
-function containerNameFor(projectId) {
+/**
+ * The stable per-project LABEL value (audit H16): every container we launch for
+ * a project carries this label, so release()/reapOrphans() can find and reap
+ * ALL of a project's containers regardless of their unique run names.
+ */
+function labelValueFor(projectId) {
   return `aab-sbx-${projectId}`;
+}
+
+/**
+ * A UNIQUE per-invocation container name (audit H16): `aab-sbx-<id>-<nonce>`.
+ * A fixed name meant two concurrent exec() runs for the same project collided
+ * on `docker run --name`, and the loser's launch failure was misreported as the
+ * command's own non-zero exit code. A unique name per run removes the collision;
+ * the stable label (labelValueFor) is still attached for reaping.
+ */
+function uniqueContainerNameFor(projectId) {
+  return `${labelValueFor(projectId)}-${crypto.randomBytes(6).toString('hex')}`;
+}
+
+/**
+ * A tiny per-key async mutex (audit H16). runExclusive(key, fn) serializes calls
+ * sharing a key by chaining them onto a per-key promise tail, so two exec() runs
+ * for the SAME project cannot race the shared boundary record. Different keys run
+ * concurrently. When a key's chain fully drains it is dropped from the map so it
+ * does not grow unbounded.
+ */
+function createKeyedMutex() {
+  const tails = new Map();
+  return function runExclusive(key, fn) {
+    const prev = tails.get(key) ?? Promise.resolve();
+    // The result of THIS critical section, run after the previous one settles.
+    const run = prev.then(fn, fn);
+    // The tail others chain onto: settles when THIS section finishes (never
+    // rejects, so a failed section does not wedge the queue).
+    const tail = run.then(
+      () => {},
+      () => {},
+    );
+    tails.set(key, tail);
+    // Drop the key once this tail is the last one and has drained.
+    tail.then(() => {
+      if (tails.get(key) === tail) tails.delete(key);
+    });
+    return run;
+  };
 }
 
 /**
@@ -121,9 +190,19 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
       ? config.execTimeoutMs
       : 30_000;
 
+  const maxSandboxes =
+    typeof config.maxSandboxes === 'number' && config.maxSandboxes > 0
+      ? Math.floor(config.maxSandboxes)
+      : DEFAULT_MAX_SANDBOXES;
+
   // The live per-project boundary records. Keyed by projectId. A record is the
-  // manager's memory of a provisioned Isolation_Boundary.
+  // manager's memory of a provisioned Isolation_Boundary. A Map preserves
+  // insertion/refresh order, which we use for LRU eviction (audit H15).
   const sandboxes = new Map();
+
+  // Per-project serialization of exec() so two runs cannot race the shared
+  // boundary record or collide launching a container (audit H16).
+  const execMutex = createKeyedMutex();
 
   /** Resolve a project's bindings via the injected resolver (default: none). */
   function resolveBindings(projectId) {
@@ -182,11 +261,17 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
     // fails closed on (see exec) rather than granting unfiltered access.
     const network = networkPolicyFor(egress);
 
-    const name = containerNameFor(projectId);
+    // The STABLE per-project label (attached to every run for reaping). The
+    // actual `docker run --name` is UNIQUE per invocation (see exec, audit H16).
+    const labelValue = labelValueFor(projectId);
 
     const record = {
       projectId,
-      name,
+      name: labelValue,
+      labelValue,
+      // How many exec() runs are currently in-flight for this project. LRU
+      // eviction (audit H15) must never release a boundary with a live run.
+      inflight: 0,
       mountSource,
       workspacePath: WORKSPACE_MOUNT_PATH,
       egress,
@@ -216,12 +301,51 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
       get limitsApplied() {
         return sandboxes.get(projectId)?.record.limitsApplied ?? null;
       },
-      /** Internal container name (also the orphan-reap label value). */
-      containerName: name,
+      /** Stable per-project reap label value (unique run names derive from it). */
+      containerName: labelValue,
     });
 
     sandboxes.set(projectId, { record, handle });
+    // Enforce the max-size policy AFTER inserting, so the just-acquired project
+    // is the most-recently-used and never the eviction victim (audit H15).
+    evictIfOverCapacity(projectId);
     return handle;
+  }
+
+  /**
+   * LRU eviction (audit H15): if the live-boundary map exceeds maxSandboxes,
+   * release the least-recently-used IDLE boundary (no in-flight exec) other than
+   * `keepId`. Map iteration order is insertion/refresh order, so the first
+   * eligible entry is the LRU. release() is fire-and-forget here (it reaps the
+   * container out of band); the record is dropped synchronously so the map stays
+   * bounded. A boundary with an in-flight run is skipped, never torn down mid-exec.
+   */
+  function evictIfOverCapacity(keepId) {
+    while (sandboxes.size > maxSandboxes) {
+      let victim = null;
+      for (const [id, entry] of sandboxes) {
+        if (id === keepId) continue;
+        if (entry.record.inflight > 0) continue;
+        victim = id;
+        break;
+      }
+      if (victim === null) return; // nothing evictable (all busy) — give up.
+      // Drop the record now (bounds the map) and reap the container out of band.
+      sandboxes.delete(victim);
+      Promise.resolve()
+        .then(() => release(victim))
+        .catch(() => {
+          /* best-effort reap; never throw from eviction */
+        });
+    }
+  }
+
+  /** Refresh a project's LRU position (most-recently-used) without rebuilding it. */
+  function touch(projectId) {
+    const entry = sandboxes.get(projectId);
+    if (!entry) return;
+    sandboxes.delete(projectId);
+    sandboxes.set(projectId, entry);
   }
 
   /**
@@ -291,91 +415,143 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
    */
   async function exec(projectId, command, opts = {}) {
     requireSafeProjectId(projectId);
-    // Ensure the boundary exists (idempotent). exec never inspects the command's
-    // classification — it only builds an isolated invocation for it.
+    // Serialize exec() runs for the SAME project (audit H16): they share the
+    // boundary record, and concurrent container launches must not race. Runs for
+    // DIFFERENT projects proceed concurrently (each has its own mutex key).
+    return execMutex(projectId, () => execInner(projectId, command, opts));
+  }
+
+  async function execInner(projectId, command, opts = {}) {
+    // Was this project already acquired? If exec auto-acquires it, exec is also
+    // responsible for RELEASING it (audit H15) — otherwise every distinct
+    // caller-supplied id leaks a record + a container for the process lifetime.
+    const preAcquired = sandboxes.has(projectId);
     const handle = acquire(projectId);
     const entry = sandboxes.get(projectId);
     const record = entry.record;
+    record.inflight += 1;
+    touch(projectId); // most-recently-used
+
+    // A UNIQUE container name per invocation (audit H16) so two concurrent runs
+    // (or a stale same-named container) cannot collide on `docker run --name`.
+    // The STABLE label is still attached for reaping.
+    const runName = uniqueContainerNameFor(projectId);
 
     const containerCommand = toContainerCommand(command);
     const timeoutMs =
       typeof opts.timeoutMs === 'number' && opts.timeoutMs > 0 ? opts.timeoutMs : defaultExecTimeoutMs;
 
-    let result;
     try {
-      result = await backend.runOneShot({
-        name: record.name,
-        mountSource: record.mountSource,
-        command: containerCommand,
-        limits: record.limits,
-        network: record.network,
-        readOnlyMount: record.readOnlyMount,
-        // Per-project secret env, injected at runtime ONLY. undefined when no
-        // secret provider is configured — env injection is strictly additive and
-        // does not change the denial contract or signature.
-        env: resolveSecretEnv(projectId),
-        timeoutMs,
-        signal: opts.signal,
-      });
-    } catch (err) {
-      // The boundary actively refused to run the command: the isolated
-      // invocation could not even LAUNCH. Two things reach here:
-      //   - a genuine runtime failure to start the container, and
-      //   - a fail-closed egress refusal (a populated allowlist on a backend
-      //     that cannot enforce per-host filtering — see networkPolicyFor).
-      // Either way NO work escaped the box. We report denied with exitCode:null
-      // and a distinct deniedReason='launch-failure' so Task 6's CommandGuard
-      // can tell a boundary that FAILED TO LAUNCH apart from a command that ran
-      // and exited non-zero inside the box (denied:false, exitCode:number).
+      let result;
+      try {
+        result = await backend.runOneShot({
+          name: runName,
+          labelValue: record.labelValue,
+          mountSource: record.mountSource,
+          command: containerCommand,
+          limits: record.limits,
+          network: record.network,
+          readOnlyMount: record.readOnlyMount,
+          // Per-project secret env, injected at runtime ONLY. undefined when no
+          // secret provider is configured — env injection is strictly additive and
+          // does not change the denial contract or signature.
+          env: resolveSecretEnv(projectId),
+          timeoutMs,
+          signal: opts.signal,
+        });
+      } catch (err) {
+        // The boundary actively refused to run the command: the isolated
+        // invocation could not even LAUNCH. Reaching here:
+        //   - a genuine runtime failure to start the container,
+        //   - a name-collision launch error (audit H16), and
+        //   - a fail-closed egress refusal (a populated allowlist on a backend
+        //     that cannot enforce per-host filtering — see networkPolicyFor).
+        // Either way NO work escaped the box. Report denied with exitCode:null
+        // and deniedReason='launch-failure' so Task 6's CommandGuard can tell a
+        // boundary that FAILED TO LAUNCH apart from a command that ran and
+        // exited non-zero inside the box (denied:false, exitCode:number).
+        return Object.freeze({
+          stdout: '',
+          stderr: String(err?.message ?? err),
+          exitCode: null,
+          denied: true,
+          deniedReason: 'launch-failure',
+          timedOut: false,
+          signal: null,
+          projectId,
+          network: record.network,
+          workspacePath: handle.workspacePath,
+          mountSource: record.mountSource,
+          limitsApplied: record.limitsApplied,
+        });
+      }
+
+      // Record whether cgroup limits actually took effect (only known post-run).
+      if (typeof result.limitsApplied === 'boolean') {
+        record.limitsApplied = result.limitsApplied;
+      }
+
+      // A NAME-COLLISION reported as a non-zero EXIT rather than a throw (audit
+      // H16): the runtime prints "container name ... is already in use" and
+      // returns non-zero. That is an infrastructure collision, NOT the command's
+      // own failure, so map it to denied:true, deniedReason:'launch-failure'
+      // rather than letting the self-healing loop read it as a verification fail.
+      if (isNameCollision(result)) {
+        return Object.freeze({
+          stdout: '',
+          stderr: String(result.stderr ?? 'container name collision'),
+          exitCode: null,
+          denied: true,
+          deniedReason: 'launch-failure',
+          timedOut: false,
+          signal: null,
+          projectId,
+          network: record.network,
+          workspacePath: handle.workspacePath,
+          mountSource: record.mountSource,
+          limitsApplied: record.limitsApplied,
+        });
+      }
+
+      // THE `denied` CONTRACT (consumed by Task 6's CommandGuard):
+      //   denied:true,  exitCode:null,   deniedReason:'launch-failure' — the
+      //     boundary could not launch the isolated invocation (see above).
+      //   denied:true,  exitCode:null,   deniedReason:'timeout'        — the
+      //     wall-clock reaper fired; the boundary killed + reaped the run.
+      //   denied:false, exitCode:<number>, deniedReason:null           — the
+      //     command RAN inside the box and produced this exit code. A non-zero
+      //     exit here is the COMMAND's own failure, NOT a boundary refusal.
+      const timedOut = result.timedOut === true;
+      const denied = timedOut;
+
       return Object.freeze({
-        stdout: '',
-        stderr: String(err?.message ?? err),
-        exitCode: null,
-        denied: true,
-        deniedReason: 'launch-failure',
-        timedOut: false,
-        signal: null,
+        stdout: result.stdout ?? '',
+        stderr: result.stderr ?? '',
+        exitCode: typeof result.code === 'number' ? result.code : null,
+        denied,
+        deniedReason: denied ? 'timeout' : null,
+        timedOut,
+        signal: result.signal ?? null,
         projectId,
         network: record.network,
         workspacePath: handle.workspacePath,
         mountSource: record.mountSource,
         limitsApplied: record.limitsApplied,
       });
+    } finally {
+      record.inflight = Math.max(0, record.inflight - 1);
+      // If exec auto-acquired this boundary (the caller does not manage its
+      // lifecycle) and no other run is in-flight, RELEASE it so the map + any
+      // container do not leak (audit H15). A caller that explicitly acquired the
+      // project keeps it — its lifecycle is the caller's to release().
+      if (!preAcquired && record.inflight === 0 && sandboxes.get(projectId)?.record === record) {
+        try {
+          await release(projectId);
+        } catch {
+          /* best-effort auto-release; never mask the exec result */
+        }
+      }
     }
-
-    // Record whether cgroup limits actually took effect (only known post-run).
-    if (typeof result.limitsApplied === 'boolean') {
-      record.limitsApplied = result.limitsApplied;
-    }
-
-    // THE `denied` CONTRACT (consumed by Task 6's CommandGuard):
-    //   denied:true,  exitCode:null,   deniedReason:'launch-failure' — the
-    //     boundary could not launch the isolated invocation (see catch above).
-    //   denied:true,  exitCode:null,   deniedReason:'timeout'        — the
-    //     wall-clock reaper fired; the boundary killed + reaped the run.
-    //   denied:false, exitCode:<number>, deniedReason:null           — the
-    //     command RAN inside the box and produced this exit code. A non-zero
-    //     exit here is the COMMAND's own failure, NOT a boundary refusal, and
-    //     must never be mistaken for one.
-    // The single `denied` boolean + nullable `exitCode` + `deniedReason` are the
-    // only signals distinguishing "boundary refused" from "command failed".
-    const timedOut = result.timedOut === true;
-    const denied = timedOut;
-
-    return Object.freeze({
-      stdout: result.stdout ?? '',
-      stderr: result.stderr ?? '',
-      exitCode: typeof result.code === 'number' ? result.code : null,
-      denied,
-      deniedReason: denied ? 'timeout' : null,
-      timedOut,
-      signal: result.signal ?? null,
-      projectId,
-      network: record.network,
-      workspacePath: handle.workspacePath,
-      mountSource: record.mountSource,
-      limitsApplied: record.limitsApplied,
-    });
   }
 
   /**
@@ -393,7 +569,10 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
    */
   async function release(projectId) {
     requireSafeProjectId(projectId);
-    const name = containerNameFor(projectId);
+    // The stable per-project label is the reap key: remove + reapOrphans by it
+    // catches every container we launched for the project (each has a unique
+    // run name but the same label, audit H16).
+    const name = labelValueFor(projectId);
     const errors = [];
     let reaped = [];
 

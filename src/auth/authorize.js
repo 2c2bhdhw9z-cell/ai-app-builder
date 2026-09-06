@@ -54,12 +54,23 @@ function isLiveReadGrant(link, resource, now) {
   if (!link || typeof link !== 'object') return false;
   if (link.access !== 'read-only') return false;
   if (link.revoked) return false;
-  // The grant must target this resource (by projectId for Projects).
+  // The grant must target this resource (by projectId for Projects). Both sides
+  // must be non-empty strings BEFORE comparing (audit H7): otherwise a grant
+  // with no projectId (undefined) matches a resource with no id (undefined),
+  // since `undefined !== undefined` is false, and the targeting check fails
+  // open. Require a concrete, matching id on both sides — fail closed.
   const targetId = resource && (resource.id ?? resource.projectId);
+  if (typeof link.projectId !== 'string' || link.projectId === '') return false;
+  if (typeof targetId !== 'string' || targetId === '') return false;
   if (link.projectId !== targetId) return false;
-  if (link.expiresAt) {
+  // Expiry must be a PARSEABLE date, and it must be in the future. An
+  // unparseable expiresAt (Date.parse -> NaN) previously skipped the expiry
+  // branch entirely, turning a bad date into a PERMANENT grant (audit H8).
+  // Fail closed: any present-but-unparseable expiry, or a reached expiry,
+  // denies the grant.
+  if (link.expiresAt !== undefined && link.expiresAt !== null) {
     const exp = Date.parse(link.expiresAt);
-    if (Number.isFinite(exp) && now >= exp) return false;
+    if (!Number.isFinite(exp) || now >= exp) return false;
   }
   return true;
 }

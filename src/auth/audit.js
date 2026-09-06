@@ -28,6 +28,11 @@ export const AUDIT_EVENTS = Object.freeze({
   SESSION_ROTATED: 'session.rotated',
   SESSION_EXPIRED: 'session.expired',
   SESSION_REJECTED: 'session.rejected',
+  SESSION_REVOKED: 'session.revoked',
+  // A valid-signature token presenting a STALE rotation (rot < current) is the
+  // canonical signal that a token was copied/replayed. High severity: the whole
+  // session family is killed in response.
+  SESSION_REUSE_DETECTED: 'session.reuse_detected',
   AUTHZ_DECISION: 'authz.decision',
   AUTHN_SUCCESS: 'authn.success',
   AUTHN_DENIED: 'authn.denied',

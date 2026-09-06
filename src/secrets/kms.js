@@ -79,12 +79,15 @@ export function createLocalKms({ masterKey } = {}) {
    * with a fresh random IV, returning the opaque framing iv || tag || ciphertext.
    * The auth tag makes tampering with a wrapped key detectable on unwrap.
    */
-  function wrapDataKey(dataKey) {
+  function wrapDataKey(dataKey, aad) {
     if (!Buffer.isBuffer(dataKey) && !(dataKey instanceof Uint8Array)) {
       throw new TypeError('wrapDataKey: dataKey must be a Buffer/Uint8Array');
     }
     const iv = crypto.randomBytes(IV_BYTES);
-    const cipher = crypto.createCipheriv(ALGO, key, iv);
+    const cipher = crypto.createCipheriv(ALGO, key, iv, { authTagLength: TAG_BYTES });
+    // Bind the SAME identity AAD the envelope codec uses (audit H9), when
+    // supplied, so a wrapped data key cannot be lifted across secrets/projects.
+    if (aad !== undefined && aad !== null) cipher.setAAD(Buffer.from(aad));
     const ciphertext = Buffer.concat([cipher.update(Buffer.from(dataKey)), cipher.final()]);
     const tag = cipher.getAuthTag();
     return Buffer.concat([iv, tag, ciphertext]);
@@ -96,7 +99,7 @@ export function createLocalKms({ masterKey } = {}) {
    * returns the recovered data key. Throws if the master key is wrong or the
    * wrapped bytes were tampered with (GCM auth-tag failure).
    */
-  function unwrapDataKey(wrapped) {
+  function unwrapDataKey(wrapped, aad) {
     const buf = Buffer.from(wrapped);
     if (buf.length < IV_BYTES + TAG_BYTES) {
       throw new Error('unwrapDataKey: wrapped data key is too short to be valid');
@@ -104,7 +107,8 @@ export function createLocalKms({ masterKey } = {}) {
     const iv = buf.subarray(0, IV_BYTES);
     const tag = buf.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
     const ciphertext = buf.subarray(IV_BYTES + TAG_BYTES);
-    const decipher = crypto.createDecipheriv(ALGO, key, iv);
+    const decipher = crypto.createDecipheriv(ALGO, key, iv, { authTagLength: TAG_BYTES });
+    if (aad !== undefined && aad !== null) decipher.setAAD(Buffer.from(aad));
     decipher.setAuthTag(tag);
     return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   }

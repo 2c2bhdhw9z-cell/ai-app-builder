@@ -91,10 +91,13 @@ function requireSecretName(model, name) {
  * encryption happens here — that is Task 12.4, which replaces this codec.
  */
 export const identityCodec = Object.freeze({
-  encode(value) {
+  // The `ctx` ({ ownerId, projectId, name }) is part of the codec seam so an
+  // AAD-aware codec can bind a blob to its identity (audit H9); the identity
+  // passthrough ignores it.
+  encode(value, _ctx) {
     return Buffer.from(String(value), 'utf8');
   },
-  decode(bytes) {
+  decode(bytes, _ctx) {
     return Buffer.from(bytes).toString('utf8');
   },
 });
@@ -168,7 +171,10 @@ export function createSecretStore({ layout, ownerId = 'default', codec = identit
     }
     const p = pathFor(projectId, name);
     fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(p, codec.encode(value));
+    // Thread the secret IDENTITY into the codec (audit H9): an AAD-aware codec
+    // binds the on-disk blob to exactly (ownerId, projectId, name) so it cannot
+    // be substituted across secrets/projects. The identity codec ignores ctx.
+    fs.writeFileSync(p, codec.encode(value, { ownerId, projectId, name }));
     return { projectId, name, path: p };
   }
 
@@ -204,7 +210,9 @@ export function createSecretStore({ layout, ownerId = 'default', codec = identit
       if (err && err.code === 'ENOENT') return null;
       throw err;
     }
-    const value = codec.decode(bytes);
+    // Pass the SAME identity context so an AAD-aware codec authenticates the
+    // blob against (ownerId, projectId, name) — a cross-secret blob fails here.
+    const value = codec.decode(bytes, { ownerId, projectId, name });
     // A secret VALUE is being read for runtime injection — the one moment that
     // is auditable (Req 25.1 'Secret access'). Record NAME only, never value.
     emitAudit({

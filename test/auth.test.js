@@ -229,6 +229,67 @@ test('(c) resolveAccess: an expired Share_Link grants no access', async () => {
   );
 });
 
+// --- (c) authorize fail-open regressions (audit H7, H8) ----------------------
+
+test('(c/H7) a grant with no projectId does NOT match a resource with no id (fail closed)', async () => {
+  const { service } = makeService();
+  const { account: userB } = await service.authenticate({ idToken: 'goog-token-B' });
+
+  // A grant-shaped object with NO projectId, and a resource with NO id/ownerId.
+  // Pre-fix, `undefined !== undefined` is false, so the targeting check passed
+  // and this returned Allowed/granted. The fix requires both sides to be
+  // non-empty strings, so this must be denied.
+  const looseGrant = { access: 'read-only', revoked: false, expiresAt: '2099-01-01T00:00:00.000Z' };
+  const resourceNoId = { description: 'no id, no ownerId' };
+  const decision = service.resolveAccess(userB, { resource: resourceNoId, grants: [looseGrant] });
+  assert.equal(decision.decision, 'AccessDenied', 'a projectId-less grant must not match an id-less resource');
+  assert.equal(decision.relation, 'none');
+});
+
+test('(c/H7) a grant with a projectId does not match a DIFFERENT resource id', async () => {
+  const { service } = makeService();
+  const { account: userA } = await service.authenticate({ idToken: 'gh-token-A' });
+  const { account: userB } = await service.authenticate({ idToken: 'goog-token-B' });
+
+  const projectOfA = projectOwnedBy(userA.id, 'p-real');
+  const grantForOther = {
+    access: 'read-only', revoked: false, projectId: 'p-other', expiresAt: '2099-01-01T00:00:00.000Z',
+  };
+  const decision = service.resolveAccess(userB, { resource: projectOfA, grants: [grantForOther] });
+  assert.equal(decision.decision, 'AccessDenied');
+});
+
+test('(c/H8) a grant with an UNPARSEABLE expiresAt is denied (fail closed)', async () => {
+  const { service, clock } = makeService();
+  const { account: userA } = await service.authenticate({ idToken: 'gh-token-A' });
+  const { account: userB } = await service.authenticate({ idToken: 'goog-token-B' });
+
+  const projectOfA = projectOwnedBy(userA.id, 'p-badexp');
+  // A grant naming the right project but with an expiry Date.parse cannot read.
+  // Pre-fix, Number.isFinite(NaN) is false so the expiry branch was skipped and
+  // the grant was PERMANENT. The fix fails closed on any unparseable expiry.
+  for (const bad of ['never', 'not-a-date', '2024-13-45', '']) {
+    const grant = { access: 'read-only', revoked: false, projectId: 'p-badexp', expiresAt: bad };
+    const decision = service.resolveAccess(userB, { resource: projectOfA, grants: [grant] });
+    assert.equal(decision.decision, 'AccessDenied', `expiresAt ${JSON.stringify(bad)} must not grant access`);
+  }
+
+  // Sanity: a valid future ISO expiry on the same project still grants (control).
+  clock.advance(0);
+  const good = { access: 'read-only', revoked: false, projectId: 'p-badexp', expiresAt: '2099-01-01T00:00:00.000Z' };
+  assert.equal(service.resolveAccess(userB, { resource: projectOfA, grants: [good] }).relation, 'granted');
+});
+
+test('(H8) createShareLink rejects an unparseable expiresAt at the model edge', () => {
+  assert.throws(
+    () => createShareLink({
+      token: 't', projectId: 'p1', access: 'read-only',
+      createdAt: '2024-01-01T00:00:00.000Z', expiresAt: 'never', revoked: false,
+    }),
+    /expiresAt must be a parseable ISO-8601 date/,
+  );
+});
+
 // --- (d) session scoping isolates users --------------------------------------
 
 test('(d) a session bound to user A cannot enumerate user B resources', async () => {
@@ -339,6 +400,77 @@ test('(e) session issuance and rotation are audited as security events', async (
   assert.ok(audit.ofType(AUDIT_EVENTS.AUTHZ_DECISION).length >= 1);
 });
 
+// --- (H18) session lifetime cap, reuse detection, revoke ownership, reaping --
+
+test('(H18) rotation cannot extend a session past its absolute lifetime cap', () => {
+  const clock = fakeClock();
+  // ttl 1000ms (rolling), but absolute cap 5000ms from issue.
+  const mgr = createSessionManager({
+    signingKey: 'k', ttlMs: 1000, maxLifetimeMs: 5000, now: clock.now,
+  });
+  let s = mgr.issue({ id: 'u1' });
+
+  // Rotate every 900ms; pre-fix the rolling ttl let this verify forever.
+  for (let i = 0; i < 4; i += 1) {
+    clock.advance(900);
+    s = mgr.rotate(s.token); // still within the 5000ms cap
+    assert.equal(mgr.verify(s.token).accountId, 'u1');
+  }
+
+  // Advance past the absolute cap (issued at 0, cap at 5000; now ~3600 + 1500).
+  clock.advance(1500); // total ~5100ms
+  assert.throws(() => mgr.verify(s.token), /invalid session/, 'a token past the absolute cap is rejected');
+  assert.throws(() => mgr.rotate(s.token), /invalid session/, 'rotation past the cap is refused');
+});
+
+test('(H18) a replayed STALE-rotation token kills the whole session family', () => {
+  const clock = fakeClock();
+  const audit = createCollectorSink();
+  const mgr = createSessionManager({ signingKey: 'k', ttlMs: 100000, now: clock.now, auditSink: audit });
+  const s0 = mgr.issue({ id: 'u1' });
+  const s1 = mgr.rotate(s0.token); // s0 is now stale (rot 0 < current 1)
+
+  // The current token verifies.
+  assert.equal(mgr.verify(s1.token).accountId, 'u1');
+
+  // Presenting the STALE token (valid signature, rot < current) is reuse: it
+  // must kill the family and emit a high-severity event — NOT merely reject.
+  assert.throws(() => mgr.verify(s0.token), /invalid session/);
+  const reuse = audit.ofType(AUDIT_EVENTS.SESSION_REUSE_DETECTED);
+  assert.equal(reuse.length, 1, 'reuse is detected and audited');
+  assert.equal(reuse[0].severity, 'high');
+
+  // The newest token is now dead too (the family was revoked).
+  assert.throws(() => mgr.verify(s1.token), /invalid session/, 'the live token is killed after reuse');
+});
+
+test('(H18) revoke enforces ownership and audits SESSION_REVOKED', () => {
+  const clock = fakeClock();
+  const audit = createCollectorSink();
+  const mgr = createSessionManager({ signingKey: 'k', now: clock.now, auditSink: audit });
+  const s = mgr.issue({ id: 'u1' });
+
+  // A different account cannot revoke this session.
+  assert.equal(mgr.revoke(s.sessionId, 'attacker'), false, 'ownership mismatch refuses revoke');
+  assert.equal(mgr.verify(s.token).accountId, 'u1', 'the session survives a foreign revoke attempt');
+
+  // The owner can, and it is audited.
+  assert.equal(mgr.revoke(s.sessionId, 'u1'), true);
+  assert.equal(audit.ofType(AUDIT_EVENTS.SESSION_REVOKED).length, 1);
+  assert.throws(() => mgr.verify(s.token), /invalid session/);
+});
+
+test('(H18) reapExpired removes sessions past their absolute lifetime', () => {
+  const clock = fakeClock();
+  const mgr = createSessionManager({ signingKey: 'k', ttlMs: 1000, maxLifetimeMs: 2000, now: clock.now });
+  mgr.issue({ id: 'u1' });
+  mgr.issue({ id: 'u2' });
+  assert.equal(mgr.reapExpired(), 0, 'nothing to reap yet');
+  clock.advance(3000); // both past the 2000ms cap
+  assert.equal(mgr.reapExpired(), 2, 'both expired sessions are reaped');
+  assert.equal(mgr.reapExpired(), 0, 'idempotent after reaping');
+});
+
 // --- (f) no password stored on User_Account ----------------------------------
 
 test('(f) the platform stores no password field; only authIdentity is recorded', async () => {
@@ -358,6 +490,69 @@ test('(f) re-authenticating the same identity returns the same account (no new s
   const second = await service.authenticate({ idToken: 'gh-token-A' });
   assert.equal(first.account.id, second.account.id);
   assert.equal(first.account.authIdentity, second.account.authIdentity);
+});
+
+// --- (H17) the account store seam is treated as ASYNC ------------------------
+
+/**
+ * An account store whose methods return PROMISES, like a real persistence
+ * layer. Pre-fix, identity.authenticate did not await findByAuthIdentity/save,
+ * so `!account` was false for the truthy pending Promise, NO account was
+ * created, and the caller got a Promise where a User_Account was required —
+ * scopeSession then threw. This asserts the async seam works end-to-end.
+ */
+function asyncAccountStore() {
+  const byIdentity = new Map();
+  return {
+    saveCalls: 0,
+    async findByAuthIdentity(authIdentity) {
+      await Promise.resolve();
+      return byIdentity.get(authIdentity) ?? null;
+    },
+    async save(account) {
+      this.saveCalls += 1;
+      await Promise.resolve();
+      byIdentity.set(account.authIdentity, account);
+      return account;
+    },
+    all() {
+      return [...byIdentity.values()];
+    },
+  };
+}
+
+test('(H17) an ASYNC account store yields a real User_Account, not a Promise', async () => {
+  const store = asyncAccountStore();
+  const { service } = makeService({ accountStore: store });
+
+  const first = await service.authenticate({ idToken: 'gh-token-A' });
+  assert.equal(first.denied, undefined, 'authentication succeeds against an async store');
+  assert.equal(typeof first.account, 'object');
+  assert.equal(first.account.authIdentity, 'github:gh|A');
+  // The returned account is a real record: scopeSession must not throw.
+  const session = service.scopeSession(first.account);
+  assert.equal(session.accountId, first.account.id);
+  assert.equal(store.saveCalls, 1, 'a new identity created exactly one account');
+
+  // Re-authenticating the same identity finds the existing account (no new save).
+  const second = await service.authenticate({ idToken: 'gh-token-A' });
+  assert.equal(second.account.id, first.account.id);
+  assert.equal(store.saveCalls, 1, 'an existing identity is found, not re-created');
+});
+
+test('(H17) a store returning a MISMATCHED identity fails closed', async () => {
+  const bad = {
+    async findByAuthIdentity() {
+      // Returns a record for a DIFFERENT identity than the one requested.
+      return { id: 'evil', authIdentity: 'github:someone-else', createdAt: NOW };
+    },
+    async save(a) { return a; },
+    all() { return []; },
+  };
+  const { service } = makeService({ accountStore: bad });
+  const res = await service.authenticate({ idToken: 'gh-token-A' });
+  assert.equal(res.denied, true, 'a mismatched account record must not bind a session');
+  assert.equal(res.account, undefined);
 });
 
 // --- OUT OF SCOPE note --------------------------------------------------------

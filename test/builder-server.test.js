@@ -15,9 +15,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
 import { createBuilderServer } from '../src/server/index.js';
 import { createAuthService } from '../src/auth/index.js';
 import { createCommandGuard } from '../src/sandbox/index.js';
+import { createScriptedProvider } from '../src/engine/plumby.js';
 
 // ---------------------------------------------------------------- test harness
 
@@ -450,5 +455,56 @@ test('POST /confirm without auth is denied with no disclosure', async () => {
     assert.deepEqual(await res.json(), { error: 'access denied' });
   } finally {
     await close();
+  }
+});
+
+// -------------------------------------------------- audit H13: default agent path
+
+test('H13: constructing with neither agentFactory nor provider fails fast', () => {
+  const authService = createAuthService({ idpVerifier: fakeIdp() });
+  assert.throws(
+    () => createBuilderServer({ authService }),
+    /requires either an agentFactory or a provider/,
+    'the default agent path needs a provider; failing at construction, not mid-request',
+  );
+});
+
+test('H13: with a REAL provider the DEFAULT agent factory builds a real plumby agent and /message works', async () => {
+  const { authService, token } = await authWithToken();
+  // A REAL plumby provider (scripted) through the boundary — NOT an injected
+  // agentFactory. Pre-fix, defaultAgentFactory called createAgent with no
+  // provider, which threw, so the default /message path always 500'd. This
+  // exercises the REAL defaultAgentFactory -> real createAgent -> real loop.
+  const provider = createScriptedProvider([{ text: 'built it' }]);
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'aab-bs-h13-'));
+  const { base, close } = await startServer({
+    authService,
+    provider,
+    // Resolve the project cwd to a real temp dir so the agent has a workspace.
+    layout: { exportableProjectTree: () => cwd },
+  });
+  try {
+    const events = await openEvents(base, 'proj-h13', token);
+    assert.equal(events.status, 200);
+    const framesP = readFramesUntil(events, (f) => f.some((x) => x.type === 'turn_done'));
+
+    const msgRes = await fetch(`${base}/message`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+      body: JSON.stringify({ projectId: 'proj-h13', text: 'make an app' }),
+    });
+    // The real default path no longer 500s: it accepts and streams the turn.
+    assert.equal(msgRes.status, 202);
+
+    const frames = await framesP;
+    assert.ok(frames.some((f) => f.type === 'turn_start'), 'turn_start streamed');
+    assert.ok(frames.some((f) => f.type === 'turn_done' && f.ok === true), 'turn completed OK via the real agent');
+    assert.ok(
+      frames.some((f) => f.type === 'assistant_text' && /built it/.test(f.text ?? '')),
+      'the real scripted provider drove the loop to a text frame',
+    );
+  } finally {
+    await close();
+    fs.rmSync(cwd, { recursive: true, force: true });
   }
 });

@@ -148,10 +148,16 @@ test('(a) normalizeHost + isForbiddenEgressHost helpers behave', () => {
 test(propertyTag(1, 'Isolation_Boundary invariant'), async () => {
   const layout = createStorageLayout(BASE);
   // A projectId arbitrary that is always a single safe path segment.
+  // Reserved object keys are no longer valid ids (audit L7): the storage layout
+  // rejects '__proto__' / 'constructor' / 'prototype' so they cannot poison a
+  // plain-object index, so the id generator must not emit them either.
+  const RESERVED_ID_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
   const safeSegment = fc
     .string({ minLength: 1, maxLength: 24 })
     .map((s) => s.replace(/[^a-zA-Z0-9._-]/g, ''))
-    .filter((s) => s.length > 0 && s !== '.' && s !== '..' && !s.includes('..'));
+    .filter(
+      (s) => s.length > 0 && s !== '.' && s !== '..' && !s.includes('..') && !RESERVED_ID_KEYS.has(s),
+    );
 
   // An arbitrary endpoint host that may be safe OR a lateral/host target.
   const hostArb = fc.oneof(
@@ -934,4 +940,122 @@ test('(FEAT-003) per-command overhead path returns a finite numeric measurement'
     await manager.release('projA');
     fs.rmSync(baseDir, { recursive: true, force: true });
   }
+});
+
+// -------------------------------------- audit H15: exec auto-acquire must release
+
+test('(H15) exec auto-acquires and RELEASES per project, so the map does not leak', async () => {
+  const layout = createStorageLayout(BASE);
+  const backend = createFakeBackend();
+  const manager = createSandboxManager({ layout, backend, config: { packageRegistryHosts: REGISTRY } });
+
+  // exec() for a project that was NEVER explicitly acquired must not leave a
+  // live boundary behind — pre-fix, every distinct id leaked a record forever.
+  for (const id of ['p1', 'p2', 'p3', 'p4', 'p5']) {
+    const res = await manager.exec(id, 'echo hi');
+    assert.equal(res.projectId, id);
+  }
+  assert.deepEqual(manager.activeProjectIds(), [], 'no boundary leaks after auto-acquired exec');
+  // Each auto-acquired exec released its boundary (remove + reapOrphans by label).
+  assert.ok(backend.calls.remove.length >= 5, 'each auto-acquired exec released its container');
+});
+
+test('(H15) an EXPLICITLY acquired project is NOT auto-released by exec', async () => {
+  const layout = createStorageLayout(BASE);
+  const backend = createFakeBackend();
+  const manager = createSandboxManager({ layout, backend, config: { packageRegistryHosts: REGISTRY } });
+
+  manager.acquire('kept'); // caller manages the lifecycle
+  await manager.exec('kept', 'echo hi');
+  assert.deepEqual(manager.activeProjectIds(), ['kept'], 'an explicitly acquired boundary stays until release()');
+  await manager.release('kept');
+  assert.deepEqual(manager.activeProjectIds(), []);
+});
+
+test('(H15) the live-boundary map is bounded by maxSandboxes (LRU eviction of idle boundaries)', () => {
+  const layout = createStorageLayout(BASE);
+  const backend = createFakeBackend();
+  const manager = createSandboxManager({
+    layout, backend, config: { packageRegistryHosts: REGISTRY, maxSandboxes: 3 },
+  });
+  for (const id of ['a', 'b', 'c', 'd', 'e']) manager.acquire(id);
+  // Never exceeds the cap; the most recent acquisitions survive.
+  assert.ok(manager.activeProjectIds().length <= 3, 'map size is capped at maxSandboxes');
+  assert.ok(manager.get('e'), 'the most-recently-acquired boundary is retained');
+});
+
+// ----------------------- audit H16: unique run name + collision -> launch-failure
+
+test('(H16) each exec uses a UNIQUE container name but a STABLE reap label', async () => {
+  const layout = createStorageLayout(BASE);
+  const backend = createFakeBackend();
+  const manager = createSandboxManager({ layout, backend, config: { packageRegistryHosts: REGISTRY } });
+
+  manager.acquire('p1');
+  await manager.exec('p1', 'echo one');
+  await manager.exec('p1', 'echo two');
+  const specs = backend.calls.runOneShot;
+  assert.equal(specs.length, 2);
+  assert.notEqual(specs[0].name, specs[1].name, 'run names are unique per invocation (no --name collision)');
+  assert.ok(specs[0].name.startsWith('aab-sbx-p1-'), 'run name derives from the stable per-project prefix');
+  assert.equal(specs[0].labelValue, 'aab-sbx-p1', 'the reap LABEL is stable across runs');
+  assert.equal(specs[1].labelValue, 'aab-sbx-p1');
+  await manager.release('p1');
+});
+
+test('(H16) a name-collision reported as a non-zero exit maps to denied:launch-failure', async () => {
+  const layout = createStorageLayout(BASE);
+  // A backend that simulates the runtime rejecting a taken --name with a
+  // non-zero exit + the collision phrasing (NOT a throw). Pre-fix this was
+  // misreported as the command's own exitCode.
+  const backend = {
+    calls: { runOneShot: [], remove: [], reapOrphans: [] },
+    async isAvailable() { return true; },
+    async runOneShot(spec) {
+      this.calls.runOneShot.push(spec);
+      return {
+        code: 125,
+        stdout: '',
+        stderr: `docker: Error response from daemon: Conflict. The container name "/${spec.name}" is already in use by container "abc".`,
+        timedOut: false,
+        limitsApplied: false,
+      };
+    },
+    async remove(n) { this.calls.remove.push(n); return { removed: true }; },
+    async reapOrphans(l) { this.calls.reapOrphans.push(l); return { reaped: [] }; },
+  };
+  const manager = createSandboxManager({ layout, backend, config: { packageRegistryHosts: REGISTRY } });
+  const res = await manager.exec('p1', 'echo hi');
+  assert.equal(res.denied, true, 'a name collision is a boundary launch failure, not a command failure');
+  assert.equal(res.deniedReason, 'launch-failure');
+  assert.equal(res.exitCode, null, 'the collision exit code is NOT reported as the command exit code');
+});
+
+test('(H16) concurrent exec for the SAME project is serialized (no shared-record race)', async () => {
+  const layout = createStorageLayout(BASE);
+  let concurrent = 0;
+  let maxConcurrent = 0;
+  const backend = {
+    calls: { runOneShot: [], remove: [], reapOrphans: [] },
+    async isAvailable() { return true; },
+    async runOneShot(spec) {
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      await new Promise((r) => setTimeout(r, 5));
+      concurrent -= 1;
+      this.calls.runOneShot.push(spec);
+      return { code: 0, stdout: '', stderr: '', timedOut: false, limitsApplied: false };
+    },
+    async remove(n) { this.calls.remove.push(n); return { removed: true }; },
+    async reapOrphans(l) { this.calls.reapOrphans.push(l); return { reaped: [] }; },
+  };
+  const manager = createSandboxManager({ layout, backend, config: { packageRegistryHosts: REGISTRY } });
+  manager.acquire('p1');
+  await Promise.all([
+    manager.exec('p1', 'a'),
+    manager.exec('p1', 'b'),
+    manager.exec('p1', 'c'),
+  ]);
+  assert.equal(maxConcurrent, 1, 'same-project execs never overlap (per-project mutex)');
+  await manager.release('p1');
 });

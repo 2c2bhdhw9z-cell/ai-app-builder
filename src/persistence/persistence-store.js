@@ -98,7 +98,7 @@ function normalizeTree(model, projectTree) {
  *     which converts it into a structured error WITHOUT having deleted the prior
  *     good tree first (we only rename-in new content; pruning happens last).
  */
-function defaultWriteTree(treeRoot, entries) {
+function defaultWriteTree(treeRoot, entries, { prune = true } = {}) {
   fs.mkdirSync(treeRoot, { recursive: true });
 
   const written = new Set();
@@ -121,7 +121,12 @@ function defaultWriteTree(treeRoot, entries) {
   // Prune stale files (present on disk but not in the new tree). Done LAST so a
   // failure above cannot leave us having deleted good state. The project's Git
   // repo (.git) is never pruned — it is the SnapshotStore's, not a tree file.
-  pruneStale(treeRoot, treeRoot, written);
+  //
+  // Pruning is ONLY safe when `entries` is the project's COMPLETE tree. A
+  // PARTIAL write (a refinement that touched one file) must NEVER prune, or it
+  // silently deletes every file it did not name (audit C3). persistPartial()
+  // therefore threads prune:false through this seam; persist() keeps prune:true.
+  if (prune) pruneStale(treeRoot, treeRoot, written);
 }
 
 /** Recursively delete files under `dir` whose resolved path is not in `keep`. */
@@ -233,7 +238,7 @@ export function createPersistenceStore({
     }
     const root = treeRootFor(projectId);
     try {
-      writeTree(root, state.entries);
+      writeTree(root, state.entries, { prune: state.prune !== false });
     } catch (err) {
       // Req 19.2: retain the last successfully persisted state unchanged and
       // return a structured persistence error. We keep the pending state so a
@@ -260,17 +265,68 @@ export function createPersistenceStore({
    * write completes on flush()/persistNow() or when the debounce timer fires.
    */
   function persist(projectId, projectTree) {
+    return schedule(projectId, projectTree, { prune: true });
+  }
+
+  /**
+   * persistPartial(projectId, changedEntries): durably write ONLY the named
+   * files, MERGING them onto whatever is already persisted on disk and NEVER
+   * pruning anything else (audit C3). This is the correct primitive for a
+   * refinement, which knows only the files it edited and must not delete the
+   * rest of the project tree. `changedEntries` is the same { relPath: contents }
+   * shape persist() accepts, but it is treated as a partial overlay, not a
+   * complete tree. Same idle-debounce + coalescing semantics as persist().
+   *
+   * Coalescing note: persist() (full, pruning) and persistPartial() (overlay,
+   * non-pruning) MUST NOT silently merge into one another via the pending map.
+   * If a pending write of the OTHER kind exists we flush it first so each write
+   * keeps its own prune semantics; then this write starts a fresh pending state.
+   */
+  function persistPartial(projectId, changedEntries) {
+    requireString(model, 'projectId', projectId);
+    const existing = pending.get(projectId);
+    if (existing && existing.prune === true) {
+      // A full (pruning) write is queued; do not let a partial overlay coalesce
+      // onto it (that would prune). Flush the full write first.
+      persistNow(projectId);
+    }
+    return schedule(projectId, changedEntries, { prune: false });
+  }
+
+  /**
+   * Shared scheduler for persist()/persistPartial(): normalize the tree, cancel
+   * any coalescable pending timer, set the pending state (carrying the prune
+   * flag), and either fire immediately (debounceMs === 0) or schedule the idle
+   * debounce timer. Returns the scheduled/immediate result object.
+   */
+  function schedule(projectId, projectTree, { prune }) {
     requireString(model, 'projectId', projectId);
     const entries = normalizeTree(model, projectTree);
 
-    const existing = pending.get(projectId);
+    let existing = pending.get(projectId);
+    // If a pending write of a DIFFERENT prune-kind exists, flush it first so we
+    // never blend pruning and non-pruning semantics into a single write.
+    if (existing && existing.prune !== prune) {
+      persistNow(projectId);
+      existing = pending.get(projectId);
+    }
     if (existing && existing.timer !== undefined && existing.timer !== null) {
       clearTimer(existing.timer);
     }
     const deadline = now() + debounceMs;
     const state = existing ?? {};
-    state.entries = entries;
+    // A full write REPLACES the pending tree (it is authoritative and prunes).
+    // A partial overlay MERGES onto any coalesced partial entries so several
+    // refinements inside one idle window all land, keyed by relative path.
+    if (prune || !existing || !Array.isArray(existing.entries)) {
+      state.entries = entries;
+    } else {
+      const merged = new Map(existing.entries);
+      for (const [rel, contents] of entries) merged.set(rel, contents);
+      state.entries = [...merged];
+    }
     state.deadline = deadline;
+    state.prune = prune;
     // The timer flushes the durable write once the change has been idle. Unlike
     // the explicit persist/flush/persistNow paths, NO caller observes this
     // result, so we route it to the optional sinks: onPersist for every timer
@@ -388,6 +444,7 @@ export function createPersistenceStore({
     ownerId,
     debounceMs,
     persist,
+    persistPartial,
     persistNow,
     flush,
     hasPending,

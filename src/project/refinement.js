@@ -298,19 +298,33 @@ export function createRefinementRouter({
 
     const result = { ok: true, changedPaths, diffs, diffMs };
 
-    // Persist the applied change durably when a PersistenceStore is injected,
-    // mirroring how project-manager.populateOrigin persists (persist + flush).
-    // Build the updated { relPath: contents } map from the files we just changed
-    // (merged onto any caller-supplied projectTree so the persisted tree stays
-    // complete). Persistence is OPTIONAL — its absence leaves the refinement
-    // working (codebase idiom).
-    if (persistenceStore && typeof persistenceStore.persist === 'function' && typeof projectId === 'string') {
-      const tree = { ...(projectTree && typeof projectTree === 'object' ? projectTree : {}) };
+    // Persist the applied change durably when a PersistenceStore is injected.
+    // CRITICAL (audit C3): a refinement knows ONLY the files it just edited, not
+    // the whole project tree. It MUST persist those files as a PARTIAL OVERLAY
+    // that never prunes — persist() prunes every file not in the map, so calling
+    // it here with only the edited files silently deletes the rest of the
+    // project. We build the changed-files map and write it via persistPartial(),
+    // which merges onto the existing on-disk tree and NEVER prunes. Persistence
+    // is OPTIONAL — its absence leaves the refinement working (codebase idiom).
+    if (persistenceStore && typeof projectId === 'string') {
+      const changed = {};
       for (const t of targets) {
         const rel = path.relative(root, t.resolved).split(path.sep).join('/');
-        tree[rel] = fs.readFileSync(t.resolved, 'utf8');
+        changed[rel] = fs.readFileSync(t.resolved, 'utf8');
       }
-      persistenceStore.persist(projectId, tree);
+      if (typeof persistenceStore.persistPartial === 'function') {
+        persistenceStore.persistPartial(projectId, changed);
+      } else if (typeof persistenceStore.persist === 'function') {
+        // Fallback for a store without persistPartial: merge the edits onto the
+        // CURRENT persisted tree first (read-modify-write) so persist()'s prune
+        // cannot delete files the refinement did not touch. Never persist only
+        // the changed files against a pruning persist().
+        const base =
+          typeof persistenceStore.readPersistedTree === 'function'
+            ? persistenceStore.readPersistedTree(projectId)
+            : {};
+        persistenceStore.persist(projectId, { ...base, ...changed });
+      }
       const flushed = typeof persistenceStore.flush === 'function' ? persistenceStore.flush(projectId) : { ok: true };
       result.persisted = !(flushed && flushed.ok === false);
     }

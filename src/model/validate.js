@@ -28,6 +28,24 @@ export function requireStringAllowEmpty(model, field, value) {
   return value;
 }
 
+/**
+ * Require a PARSEABLE ISO-8601 date string and return it normalized to the
+ * canonical ISO form (`new Date(x).toISOString()`), so a record can never store
+ * a date the authorizer will silently fail to parse (audit H8). Rejects empty
+ * strings, non-strings, and anything Date.parse cannot read (NaN). This is the
+ * one validator that guarantees `Date.parse(record.field)` is finite downstream.
+ */
+export function requireIsoDate(model, field, value) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    fail(model, `${field} must be a non-empty ISO-8601 date string`);
+  }
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) {
+    fail(model, `${field} must be a parseable ISO-8601 date, got ${JSON.stringify(value)}`);
+  }
+  return new Date(ms).toISOString();
+}
+
 /** Optional string: undefined passes through, otherwise must be a string. */
 export function optionalString(model, field, value) {
   if (value === undefined || value === null) return undefined;
