@@ -860,6 +860,79 @@ same secret-redaction filter, so Req 24.4 holds uniformly and there is no log pa
 
 **Satisfies:** Req 25 (with secret redaction shared with Req 24.4).
 
+### 18. Workspace Experiences, Work Modes, and Themes (presentation / surface layer)
+
+**Responsibility:** let a user shape *how the builder is presented and how they interact with it* —
+layout (Workspace_Experience), interaction flow (Work_Mode), and visual appearance (Theme) — **without ever
+mutating Project data or agent state.** This is a **new builder-layer component that sits entirely on the
+existing surfaces**: it reads and writes per-user presentation settings and re-parametrizes the surface, and
+it never touches the loop's file mutations, Snapshots, Secrets, Connectors, models, Skills, permissions, or
+Project_Origin. The invariant that unifies all three features is **non-mutation**: they are presentation and
+interaction preferences, not project changes.
+
+These three live in the **Builder Server surface** (Architecture §1) and are persisted in the **control-plane
+storage split** (out of the exported Project tree, alongside the Project registry and Connector bindings —
+see Data Models), scoped to the owning `User_Account` (Architecture §0). They ride the **existing SSE surface**
+(`GET /events` / `POST /message` / `POST /confirm` from `src/web/server.js`): the Session_Header state, a
+Workspace_Experience selection, a Theme selection, and a Work_Mode switch are surface events on the same
+stream that already carries the Activity_Stream and Preview frames — none of them enqueue a loop turn or a
+file mutation.
+
+- **Workspace_Experience (Req 27).** A `Workspace_Experience` is a **saved layout**: the arrangement,
+  visibility, and sizing of the surfaces the Builder Server already renders — the Activity_Stream (§1/§5
+  reasoning + tool feed), the Preview (§4), the chat/compose area, file and tool panels, and the
+  Session_Header. Five are offered by name, backed by a closed enum: **"Kiro-style Workspace"**
+  (`kiro-style`), **"Vibe-first Workspace"** (`vibe-first`), **"Technical Workbench"**
+  (`technical-workbench`), **"Mobile Command Center"** (`mobile-command-center`), and **"Custom Workspace"**
+  (`custom`). Selecting one applies **layout/organization only** (Req 27.2) and **never** changes the Theme,
+  Work_Mode, source code, agent state, Project data, models, Skills, Connectors, permissions, or
+  Project_Origin (Req 27.3, Property 20) — the platform simply re-parametrizes which surfaces are shown and
+  where. `custom` is a **user-arrangeable** layout the user composes and the platform persists per user (Req
+  27.4). The selection is persisted per `User_Account` and re-applied to later Sessions (Req 27.5); a user
+  with no selection gets a documented default applied without touching any Project data (Req 27.6); an
+  out-of-enum value is rejected with the current experience left in effect (Req 27.7). Because a
+  Workspace_Experience is pure presentation, it is orthogonal to the "Vibe-first" **layout** and the `vibe`
+  **Work_Mode** — the shared word is intentional but they are different axes (layout vs. interaction flow).
+  The **Mobile Command Center** layout reuses the same mobile-oriented rendering the phone surface already
+  needs (§4 Expo Preview, README phone-reconnect frames); it does not create a new runtime.
+
+- **Work_Mode (Req 28).** A `Work_Mode` changes **interaction flow**, not project state. Three are offered,
+  backed by a closed enum: **`vibe`** (describe-and-build — the user describes intent and the Builder_Agent
+  builds directly, the current default flow), **`spec`** (plan/requirements-first — the Builder_Agent
+  produces a plan/requirements the user reviews before building), and **`hybrid`** (a blend). All three are
+  **clearly offered at Session creation** (Req 28.2) and **`vibe` is the default** for a new Session with no
+  explicit choice (Req 28.3, decision D4). The **Session_Header always shows the active Work_Mode** while a
+  Session is active (Req 28.4) and offers a switch control; a switch requires an **explicit user
+  confirmation** on the existing `POST /confirm` surface path before it takes effect (Req 28.5) — reusing the
+  same confirm-gating discipline the command path already uses, but here gating a *presentation/flow*
+  change, not a command. A confirmed switch **changes only the interaction flow** and **preserves all Project
+  state** — source code, agent state, Project data, Snapshots, models, Skills, Connectors, permissions,
+  Project_Origin, Theme, and Workspace_Experience (Req 28.6, Property 21). An out-of-enum Work_Mode is
+  rejected with the current mode left in effect (Req 28.7). Mechanically, the Work_Mode only shapes how the
+  Builder Server frames the *next* turn's prompt/flow (e.g., whether it asks the agent to plan first); it
+  never rewrites history or mutates the tree, so switching mid-Session is safe.
+
+- **Theme (Req 29).** A `Theme` is a **persisted visual preference** — at minimum `light` and `dark`, a
+  **closed but extensible enum** — selectable by the user and stored per `User_Account` in the control-plane
+  settings (Req 29.1–29.2). It is re-applied to later Sessions until changed (Req 29.3) and is **independent
+  of both the Workspace_Experience and the Work_Mode**: changing a layout or a mode does not change the Theme,
+  and changing the Theme does not change either of them (Req 29.4, decision D2's "must never change the
+  theme" restated as independence). Changing the Theme **never** alters source code, agent state, Project
+  data, models, Skills, Connectors, permissions, Work_Mode, or Project_Origin (Req 29.5, Property 22); an
+  out-of-enum value is rejected with the current Theme left in effect (Req 29.6).
+
+**Closed-enum conventions.** Consistent with `src/model/enums.js`, three new frozen closed enums are added
+and validated at the edges (API input, control-plane storage reads): a `Workspace_Experience` enum of the
+five names (`kiro-style`, `vibe-first`, `technical-workbench`, `mobile-command-center`, `custom`); a
+`Work_Mode` enum of `vibe | spec | hybrid` (default `vibe`); and a `Theme` enum whose initial members are
+`light` and `dark` and which is documented as **extensible by a spec change** (new members added to the
+frozen list, never open-ended input). Each ships an `isValidX` predicate mirroring the existing enums; an
+invalid value is rejected at the edge and the current setting is left in effect.
+
+**Satisfies:** Req 27, Req 28, Req 29, Properties 20–22. Sits on Architecture §1 (Builder Server SSE
+surface + Session_Header), §4 (Preview surface, including the mobile surface), §5 (Activity_Stream), and §0
+ownership (per-`User_Account` control-plane settings); mutates nothing owned by the loop.
+
 ---
 
 ## Components and Interfaces
@@ -1104,6 +1177,23 @@ MemoryStoreMeta
   capBytes: number               # default 65536 (decision (a))
   capEntries: number             # default 200 (decision (a))
 
+UserPresentationSettings          # per-User_Account, control-plane only, NEVER exported; pure presentation
+  userAccountId: string          # → User_Account.id; scoped to the owner (Req 7.3, 7.6)
+  workspaceExperience: 'kiro-style' | 'vibe-first' | 'technical-workbench'
+                     | 'mobile-command-center' | 'custom'   # closed enum, default applied if unset (Req 27.1, 27.5, 27.6)
+  customLayout?: LayoutSpec       # surface arrangement for 'custom'; persisted per user (Req 27.4)
+  theme: 'light' | 'dark'         # closed but EXTENSIBLE enum, persisted per user (Req 29.1–29.3)
+  # Presentation-only: selecting/switching any of these mutates NO Project data, agent state, models,
+  # Skills, Connectors, permissions, Project_Origin — and each stays independent of the others
+  # (Req 27.3, 29.4, 29.5; Properties 20, 22)
+
+SessionPresentation               # per-Session view state carried on the SSE surface (Req 28.4)
+  sessionId: string
+  workMode: 'vibe' | 'spec' | 'hybrid'   # closed enum, default 'vibe' for a new Session (Req 28.1, 28.3)
+  # Session_Header ALWAYS shows workMode while the Session is active (Req 28.4); a switch is applied only
+  # after explicit user confirmation on POST /confirm and preserves ALL Project state (Req 28.5, 28.6,
+  # Property 21). Changing workMode reshapes only the next turn's flow, never the tree or history.
+
 DeploymentArtifact
   targetKind: 'web'|'backend'|'mobile'|'shared'
   path: string                   # build output in Sandbox
@@ -1168,9 +1258,11 @@ no value (Req 11.8), the same shape `detect-lockin.sh` already understands as `.
 system — essentially, a formal statement about what the system should do. Properties serve as the bridge
 between human-readable specifications and machine-verifiable correctness guarantees.*
 
-The 19 properties below are carried directly from the requirements document and confirmed non-redundant by
+The 22 properties below are carried directly from the requirements document and confirmed non-redundant by
 the prework analysis (each is a distinct pattern — invariant, round-trip, idempotence, metamorphic, or
-model-based — over a distinct subsystem). Property 4 (fidelity of a single persist→restore) and Property 6
+model-based — over a distinct subsystem). Properties 20–22 are the presentation-layer non-mutation
+invariants for Workspace_Experiences, Work_Modes, and Themes (Architecture §18). Property 4 (fidelity of a
+single persist→restore) and Property 6
 (stability under repeated restore) are related but retained separately; Properties 8 and 9 target different
 credential sources (user Secrets vs captured Connector credentials) and are both retained. Each property is
 implemented by a single property-based test (≥100 iterations) tagged
@@ -1276,6 +1368,27 @@ action.
 SKILL.md with `name` and `description` frontmatter) that can be exported and loaded by another Agent
 Skills-compatible tool.
 **Validates: Requirements 12.13, 13.8**
+
+### Property 20: Workspace_Experience switching preserves everything but layout
+*For all* Workspace_Experience selections among the five defined values, switching the Workspace_Experience
+SHALL change only surface layout/organization and SHALL leave the Theme, Work_Mode, Project source code,
+agent state, Project data, models, Skills, Connectors, permissions, and Project_Origin byte-for-byte
+unchanged.
+**Validates: Requirements 27.2, 27.3**
+
+### Property 21: Work_Mode is always observable and switching is confirmed and state-preserving
+*For all* active Sessions the active Work_Mode SHALL be observable in the Session_Header; and *for all*
+Work_Mode switch requests, the switch SHALL be applied only after explicit user confirmation and SHALL leave
+all Project state — source code, agent state, Project data, Snapshots, models, Skills, Connectors,
+permissions, Project_Origin, Theme, and Workspace_Experience — unchanged.
+**Validates: Requirements 28.4, 28.5, 28.6**
+
+### Property 22: Theme change preserves state and is independent
+*For all* Theme selections among the defined values, changing the Theme SHALL alter only visual appearance
+and SHALL leave source code, agent state, Project data, models, Skills, Connectors, permissions, Work_Mode,
+Workspace_Experience, and Project_Origin unchanged; and the persisted Theme SHALL be independent of the
+Workspace_Experience and Work_Mode.
+**Validates: Requirements 29.4, 29.5**
 
 ---
 
@@ -1388,6 +1501,14 @@ Empty/too-short description, unsupported `Target_Category`, or unsupported `Proj
   (Req 25.1, 24.4).
 - **Platform-level error → user-facing error indication plus a correlated operational log entry** (Req 25.3).
 
+### Presentation settings (Req 27–29)
+- **Unsupported Workspace_Experience → reject, current experience left in effect, error naming it as
+  unsupported** (Req 27.7); a selection changes layout only and never Theme/Work_Mode/Project data (Req 27.3).
+- **Unsupported Work_Mode → reject, current mode left in effect, error naming it** (Req 28.7); a switch is
+  applied **only after explicit confirmation** and leaves all Project state unchanged (Req 28.5–28.6).
+- **Unsupported Theme → reject, current Theme left in effect, error naming it** (Req 29.6); a Theme change
+  alters visuals only and stays independent of Workspace_Experience and Work_Mode (Req 29.4–29.5).
+
 ---
 
 ## Testing Strategy
@@ -1416,7 +1537,10 @@ requirement clauses it validates.
   Property 17 (generated store; export completeness), Property 18 (off-mode add sequences), Property 19
   (generated valid skills; frontmatter round-trip), Property 3 (modeled publish transition over
   commit/edit sequences), Property 10 (fork/mutate/compare), Property 15 (generated clean projects → audit
-  reports nothing).
+  reports nothing), Property 20 (generated Workspace_Experience switch sequences over a snapshot of
+  Theme/Work_Mode/Project state; assert only layout changed), Property 21 (modeled Work_Mode switch over a
+  Session; assert header observability + confirm-gated + state preserved), Property 22 (generated Theme
+  switch sequences; assert visuals-only + independence from experience/mode).
 - **Toolchain-backed via eval/ pattern (bounded generators, scripted provider):** Property 7 (each Template
   → instantiate → `verify` PASS), Property 11 (blank → Sandbox + Dev_Server start), Property 12 (remove
   platform markers → baseline build still passes), Property 13 (export → build in a no-network,
@@ -1439,6 +1563,11 @@ requirement clauses it validates.
   with no runtime fetch (build/release-time copy step) — Req 12.1, 12.15.
 - Share_Link state machine: valid/expired/revoked/malformed; revoke-then-access; revoke nonexistent — Req
   26.
+- Presentation settings: the five Workspace_Experiences (including `custom` arrange + persist) apply
+  layout-only and reject an out-of-enum value; Work_Mode offered at creation with `vibe` default, header
+  always shows active mode, switch requires confirmation and preserves state, out-of-enum rejected; Theme
+  `light`/`dark` persists per user, independent of experience/mode, out-of-enum rejected — Req 27, 28, 29,
+  validating against the new closed enums the same way as `src/model/enums.js`.
 
 ### Integration tests (external wiring + timing bounds; 1–3 examples each, not PBT)
 - Creation **begins ≤10s** (Project recorded + Sandbox allocated, available for streaming); Template
