@@ -80,6 +80,31 @@ export {
   BASELINE_BUILD_SLO_MS,
 } from './templates.js';
 
+// The Build + Deploy service for NON-`mobile` Targets (Task 26.1, Req 18.1,
+// 18.3-18.8): builds a `web`/`backend`/`shared` Target into a REAL
+// Deployment_Artifact within the 300s build SLO, and deploys an artifact to a
+// hosting destination within the 120s deploy SLO — routing a confirm-classified
+// deploy through the CommandGuard/plumby classifier (60s consent), rejecting a
+// nonexistent artifact, and leaving prior deployed state unchanged on failure.
+// Every SLO is measured against an injected clock (offline SEAM boundaries).
+export {
+  createBuildService,
+  BUILD_SLO_MS,
+  DEPLOY_SLO_MS,
+} from './build-service.js';
+
+// The Mobile (Expo/RN) scaffold + build service (Task 26.2, Req 15.1, 15.4-15.7,
+// 18.2-18.3): scaffolds the `mobile` Target within 30s and builds the mobile
+// Deployment_Artifact bounded by a CONFIGURABLE execution timeout (default
+// 1800s) measured from build-execution START and EXCLUDING queue time (queue and
+// execution modeled as separate injected-clock phases). Names a missing
+// toolchain component without claiming success and leaving prior state unchanged.
+export {
+  createMobileBuildService,
+  SCAFFOLD_SLO_MS,
+  DEFAULT_MOBILE_BUILD_EXECUTION_TIMEOUT_MS,
+} from './mobile-build-service.js';
+
 import { createProjectOrigin as createProjectOriginImpl } from './project-origins.js';
 import { createTemplateProvider as createTemplateProviderImpl } from './templates.js';
 
