@@ -109,6 +109,12 @@ export const DEFAULT_IMAGE = 'node:22-slim';
 export const OWNER_LABEL = 'aab.sandbox';
 
 /**
+ * The ONLY runtime verbs `rawExec` will run: read-only inspection and network
+ * plumbing. Deliberately an allowlist — see rawExec.
+ */
+export const RAW_EXEC_VERBS = Object.freeze(['network', 'inspect', 'ps', 'version']);
+
+/**
  * A cgroup-rejection error looks like one of these in Podman/crun/conmon when
  * nested delegation is unavailable. Used to decide whether to retry WITHOUT
  * limits (graceful degrade) vs. surface a real failure.
@@ -261,6 +267,7 @@ export function buildRunArgs(spec) {
     cgroupFlags = [],
     command = [],
     labelValue,
+    labels,
     env,
     detach = false,
     autoRemove = true,
@@ -289,6 +296,14 @@ export function buildRunArgs(spec) {
   }
   if (name) args.push('--name', name);
   if (labelValue) args.push('--label', `${OWNER_LABEL}=${labelValue}`);
+  // Extra labels, sorted for a deterministic argv. Used to record policy a running
+  // container was started with (e.g. the egress allowlist fingerprint) so it can be
+  // compared before the container is adopted rather than trusted on its name.
+  if (labels && typeof labels === 'object') {
+    for (const key of Object.keys(labels).sort()) {
+      args.push('--label', `${key}=${labels[key]}`);
+    }
+  }
   // (b) ONLY this project's tree, mounted at the fixed workspace path.
   if (mountSource) {
     const mode = readOnlyMount ? ':ro' : '';
@@ -363,7 +378,35 @@ export async function containerRuntimeAvailable({
  * @param {(bin:string,args:string[],o?:object)=>Promise<object>} [opts.exec]  injectable CLI runner (tests)
  * @returns {object} backend
  */
-export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, exec = runCli } = {}) {
+export function createContainerBackend({
+  bin = 'docker',
+  image = DEFAULT_IMAGE,
+  exec = runCli,
+  permittedNetworks = CLI_ENFORCEABLE_NETWORKS,
+  isNetworkPermitted,
+} = {}) {
+  // The set of network modes THIS instance will launch into. Defaults to the
+  // CLI-enforceable set ('none' only), so a plain backend keeps failing closed on
+  // everything else. A filtering-capable composition (see
+  // filtering-container-backend.js) permits exactly its OWN internal network name
+  // here — never a general-purpose network, and never the 'filtered' SENTINEL,
+  // which stays refused below because no plain CLI backend can honor it.
+  const permitted = Object.freeze([...permittedNetworks]);
+  if (permitted.includes(NETWORK_FILTERED)) {
+    throw new TypeError(
+      'createContainerBackend: the FILTERED sentinel cannot be a permitted network — ' +
+        'it names a capability, not a network. Permit the concrete network that implements it.',
+    );
+  }
+  // A composition that creates networks DYNAMICALLY (one per project) cannot list
+  // them up front, so it supplies a predicate over the set it actually created.
+  // The predicate still cannot admit the sentinel.
+  if (isNetworkPermitted !== undefined && typeof isNetworkPermitted !== 'function') {
+    throw new TypeError('createContainerBackend: isNetworkPermitted must be a function');
+  }
+  const networkAllowed = (network) =>
+    network !== NETWORK_FILTERED &&
+    (typeof isNetworkPermitted === 'function' ? isNetworkPermitted(network) === true : permitted.includes(network));
   /**
    * Detect whether the runtime is usable at all (binary present + `version`
    * succeeds). Cached-free; callers gate live-container work behind it.
@@ -398,6 +441,7 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
    */
   async function runOneShot({
     name,
+    labelValue,
     mountSource,
     command = [],
     limits = {},
@@ -413,7 +457,7 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
     // container with unfiltered networking (that would fail open and break the
     // deny-by-default promise). We refuse the launch with an explicit reason —
     // never emit an unusable/ambiguous `--network <sentinel>` flag to docker.
-    if (!CLI_ENFORCEABLE_NETWORKS.includes(network)) {
+    if (!networkAllowed(network)) {
       throw new Error(EGRESS_FILTERING_UNSUPPORTED);
     }
 
@@ -433,7 +477,13 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
       mountSource,
       network,
       readOnlyMount,
-      labelValue: name,
+      // HONOR THE CALLER'S LABEL VALUE. The SandboxManager passes the STABLE
+      // per-project label (`aab-sbx-<projectId>`) while `name` is a per-run unique
+      // name. Labelling with `name` meant every one-shot container carried a label
+      // value nothing could predict, so `reapOrphans(labelValueFor(projectId))` —
+      // the per-project orphan cleanup release() performs — matched NOTHING. It
+      // falls back to `name` only when no label value was supplied.
+      labelValue: labelValue ?? name,
       command,
       env: hasEnv ? env : undefined,
     };
@@ -466,6 +516,39 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
       requestedLimits,
       degraded,
     };
+  }
+
+  /**
+   * Run an arbitrary runtime CLI command through this backend's injected runner.
+   *
+   * The narrow, explicit escape hatch for runtime plumbing that is NOT a container
+   * launch — `network create`, `network connect` — used by the filtering backend to
+   * build its enforcement plane. It deliberately does NOT accept a container `run`:
+   * every launch must go through runOneShot/startService so the isolation flags and
+   * the fail-closed network checks cannot be bypassed.
+   *
+   * @param {string[]} args
+   * @returns {Promise<{code, stdout, stderr, timedOut, signal}>}
+   */
+  async function rawExec(args, { timeoutMs = 30_000, signal } = {}) {
+    if (!Array.isArray(args) || args.length === 0) {
+      throw new TypeError('rawExec: args must be a non-empty array');
+    }
+    // AN ALLOWLIST, NOT A DENYLIST. Denying `run`/`create`/`exec` looked sufficient
+    // and was not: docker's management form (`container run ...`) sails past it, as
+    // do `start` and `cp` (which is arbitrary host-filesystem access as the daemon
+    // user). Since this is on the backend's PUBLIC surface, the guard has to mean
+    // what it says, so only read-only/plumbing verbs are permitted and every
+    // container launch must go through runOneShot/startService where the isolation
+    // flags and the fail-closed network checks are applied.
+    if (!RAW_EXEC_VERBS.includes(args[0])) {
+      throw new TypeError(
+        `rawExec refuses '${args[0]}': only [${RAW_EXEC_VERBS.join(', ')}] are permitted. ` +
+          'Container launches must go through runOneShot/startService so the isolation flags ' +
+          'and the fail-closed network checks cannot be bypassed.',
+      );
+    }
+    return exec(bin, args, { timeoutMs, signal });
   }
 
   /**
@@ -533,6 +616,7 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
   async function startService({
     name,
     labelValue,
+    labels,
     mountSource,
     workspacePath = WORKSPACE_MOUNT_PATH,
     command = [],
@@ -571,6 +655,7 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
       network,
       readOnlyMount,
       labelValue: labelValue ?? name,
+      ...(labels ? { labels } : {}),
       command,
       publish: publishList,
       env: hasEnv ? env : undefined,
@@ -669,6 +754,7 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
     runOneShot,
     remove,
     reapOrphans,
+    rawExec,
     // Long-running service containers (the Dev_Server behind a Preview).
     startService,
     serviceStatus,
@@ -680,6 +766,8 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
     supportsEgressFiltering: false,
     // Capability flag: this backend CAN run detached, port-publishing containers.
     supportsServices: true,
+    // The network modes this instance will launch a one-shot command into.
+    permittedNetworks: permitted,
     // Exposed for tests / introspection.
     buildRunArgs,
     buildServiceArgs,

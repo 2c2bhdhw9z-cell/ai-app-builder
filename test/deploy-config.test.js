@@ -178,8 +178,12 @@ test('DEPLOY.md documents every environment variable the code actually reads', (
 test('DEPLOY.md states the fail-closed posture and the honest limits', () => {
   // These are the claims a reader most needs to be true.
   assert.match(deployDoc, /fail-closed/i);
-  // Product limits this wiring pass must not imply away.
-  assert.match(deployDoc, /package installs cannot work/i);
+  // The package-install follow-up is DONE, so the doc must no longer claim installs
+  // are impossible — but it must still be honest about how the posture is enforced,
+  // that the restrictive default is unchanged, and about the platform-wide caveat.
+  assert.match(deployDoc, /AAB_SANDBOX_EGRESS_HOSTS/, 'the allowlist knob must be documented');
+  assert.match(deployDoc, /--internal/, 'the enforcement primitive must be stated, not just claimed');
+  assert.match(deployDoc, /platform-wide, not per-project/i, 'the allowlist scope caveat must stay visible');
   // The Preview follow-up is DONE, so the doc must no longer claim otherwise —
   // but it must still be honest about the two things that replaced that claim:
   // the default is still the inert placeholder, and the live path is a decision

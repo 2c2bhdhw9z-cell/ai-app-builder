@@ -47,6 +47,7 @@ import {
 } from '../src/server/compose-runtime.js';
 import { composePlatformOps } from '../src/ops/index.js';
 import { DEFAULT_MAX_SANDBOXES } from '../src/sandbox/sandbox-manager.js';
+import { createFilteringContainerBackend } from '../src/sandbox/filtering-container-backend.js';
 
 // ---------------------------------------------------------------- test helpers
 
@@ -118,6 +119,75 @@ function fakeBackend() {
   };
 }
 
+/**
+ * A FAKE FILTERING backend, mirroring src/sandbox/filtering-container-backend.js.
+ *
+ * Same rule as fakeBackend above: it must succeed and fail exactly where production
+ * does. So it ACCEPTS the 'filtered' network (that is the whole point of the
+ * filtering path — the plain backend's refusal is what made `AAB_SANDBOX_EGRESS=
+ * registry` deny every command), declares supportsEgressFiltering:true, and records
+ * the allowlist it was constructed with so composition can be asserted.
+ */
+function fakeFilteringBackend(opts = {}) {
+  const runs = [];
+  const cli = [];
+  /**
+   * A tiny stateful model of the runtime CLI, so the REAL filtering backend's own
+   * plane setup and translation run. Only `exec` is faked — nothing here
+   * re-implements a production decision, which is the point: an earlier version of
+   * this fake hand-coded the accept-`filtered` rule, so the wiring tests would have
+   * kept passing if the real backend had lost its translation entirely.
+   */
+  const containers = new Map();
+  const ok = (stdout = '') => ({ code: 0, stdout, stderr: '', timedOut: false, signal: null });
+  const real = createFilteringContainerBackend({
+    ...opts,
+    sleep: async () => {},
+    exec: async (bin, args) => {
+      cli.push(args);
+      const verb = args[0] === 'network' ? `network ${args[1]}` : args[0];
+      if (verb === 'run' && args.includes('-d')) {
+        const name = args[args.indexOf('--name') + 1];
+        const labels = {};
+        for (let i = 0; i < args.length - 1; i += 1) {
+          if (args[i] === '--label') {
+            const [k, ...v] = args[i + 1].split('=');
+            labels[k] = v.join('=');
+          }
+        }
+        containers.set(name, { running: true, exitCode: 0, labels });
+        return ok(`cid-${name}\n`);
+      }
+      if (verb === 'rm') {
+        containers.delete(args.at(-1));
+        return ok();
+      }
+      if (verb === 'inspect') {
+        const c = containers.get(args.at(-1));
+        if (!c) return { code: 1, stdout: '', stderr: 'no such object', timedOut: false, signal: null };
+        const format = args[args.indexOf('--format') + 1] ?? '';
+        const label = Object.keys(c.labels).find((k) => format.includes(k));
+        return ok(label ? `${c.labels[label]}\n` : `${c.running} ${c.exitCode}\n`);
+      }
+      if (verb === 'network inspect') return { code: 1, stdout: '', stderr: 'no such network', timedOut: false, signal: null };
+      if (verb === 'logs') return ok('aab-egress proxy listening on 0.0.0.0:3128\n');
+      return ok('cid\n');
+    },
+  });
+  return {
+    ...real,
+    bin: 'fake-docker',
+    image: 'fake:latest',
+    runs,
+    cli,
+    containers,
+    async runOneShot(spec) {
+      runs.push(spec);
+      return real.runOneShot(spec);
+    },
+  };
+}
+
 /** A composed runtime over a temp dir with a fake container backend. */
 function makeRuntime({ dir, clock = fakeClock(), env = {} } = {}) {
   const composed = composePlatformOps({ secretProvider: platformSecretSet(env) });
@@ -126,6 +196,7 @@ function makeRuntime({ dir, clock = fakeClock(), env = {} } = {}) {
     env: { AAB_DATA_DIR: dir, ...env },
     now: clock.now,
     createBackend: fakeBackend,
+    createFilteringBackend: fakeFilteringBackend,
   });
   return { composed, runtime, clock };
 }
@@ -809,21 +880,82 @@ test('the composed sandbox runs with NO network by default, so commands actually
   }
 });
 
-test("AAB_SANDBOX_EGRESS='registry' opts into the filtered mode the CLI backend cannot enforce", async () => {
+test("AAB_SANDBOX_EGRESS='registry' now composes a backend that can ENFORCE it, so commands run", async () => {
+  // THE BEHAVIOR CHANGE. This mode used to select the NETWORK_FILTERED sentinel
+  // that the plain CLI backend refuses, so choosing it denied EVERY command in
+  // every sandbox — which is why `npm install` was impossible in any posture.
+  // Composition now picks the filtering-capable backend for this mode.
   const { dir, cleanup } = tempDataDir();
   const { runtime } = makeRuntime({ dir, env: { AAB_SANDBOX_EGRESS: 'registry' } });
   try {
     assert.equal(runtime.egressMode, 'registry');
+    assert.equal(runtime.backend.supportsEgressFiltering, true, 'this posture requires a backend that can enforce it');
+    assert.deepEqual(runtime.backend.allowedHosts, ['registry.npmjs.org'], 'registry-only by default');
+    // Construction does NO I/O, so a host with no runtime still boots — the plane is
+    // built lazily on the first filtered command (asserted below).
+    assert.deepEqual(runtime.backend.cli, []);
+
     const created = runtime.projectManager.createProject({
       accountId: 'owner-1', description: 'x', targetCategory: 'web', origin: 'blank',
     });
     const handle = runtime.sandboxManager.acquire(created.project.id);
-    assert.ok(handle.egress.allowedHosts.length > 0, 'registry hosts are allowed in this mode');
+    assert.ok(handle.egress.allowedHosts.includes('registry.npmjs.org'));
+    assert.equal(handle.egress.denyByDefault, true, 'deny-by-default is not weakened by allowing the registry');
 
-    // ...and with a backend that cannot filter (the real CLI one), that is
-    // fail-CLOSED: the exec is refused rather than silently unfiltered.
-    const result = await runtime.sandboxManager.exec(created.project.id, ['echo', 'hi']);
-    assert.equal(result.denied, true, 'a filtering-incapable backend must refuse, not run unfiltered');
+    const result = await runtime.sandboxManager.exec(created.project.id, ['npm', 'install']);
+    assert.notEqual(result.denied, true, `the command must RUN, got ${JSON.stringify(result)}`);
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.network, 'filtered', 'the manager requests filtered egress and the backend honors it');
+
+    // The REAL backend built a real plane through the faked CLI: an internal network
+    // for this project, and one allowlisting proxy container.
+    assert.ok(
+      runtime.backend.cli.some((a) => a[0] === 'network' && a[1] === 'create' && a.includes('--internal')),
+      'the enforcement plane must actually be built',
+    );
+    assert.ok(runtime.backend.containers.has('aab-egress-proxy'), 'the allowlisting proxy must be running');
+  } finally {
+    cleanup();
+  }
+});
+
+test('the default posture still composes the PLAIN backend, which cannot filter', () => {
+  const { dir, cleanup } = tempDataDir();
+  try {
+    const { runtime } = makeRuntime({ dir });
+    assert.equal(runtime.egressMode, 'none');
+    assert.equal(runtime.backend.supportsEgressFiltering, false, 'no egress plane is built for a no-network posture');
+    assert.equal(runtime.backend.allowedHosts, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test('AAB_SANDBOX_EGRESS_HOSTS extends the allowlist, and only in a mode that has a network', () => {
+  const { dir, cleanup } = tempDataDir();
+  try {
+    const { runtime } = makeRuntime({
+      dir,
+      env: { AAB_SANDBOX_EGRESS: 'registry', AAB_SANDBOX_EGRESS_HOSTS: 'npm.internal.example.com, api.stripe.com' },
+    });
+    // Sanitized: normalized, de-duplicated and sorted, so the policy is deterministic.
+    assert.deepEqual(runtime.backend.allowedHosts, ['api.stripe.com', 'npm.internal.example.com', 'registry.npmjs.org']);
+    // The project's own allowlist reflects it too, so the manager and the proxy agree.
+    const created = runtime.projectManager.createProject({
+      accountId: 'owner-1', description: 'x', targetCategory: 'web', origin: 'blank',
+    });
+    const hosts = runtime.sandboxManager.acquire(created.project.id).egress.allowedHosts;
+    assert.ok(hosts.includes('npm.internal.example.com'));
+
+    // In 'none' there is no network to allow anything on, so the extra hosts are
+    // NOT honored — they must not quietly re-enable egress.
+    const off = makeRuntime({ dir, env: { AAB_SANDBOX_EGRESS_HOSTS: 'evil.example.com' } });
+    assert.equal(off.runtime.egressMode, 'none');
+    assert.equal(off.runtime.backend.supportsEgressFiltering, false);
+    const p2 = off.runtime.projectManager.createProject({
+      accountId: 'owner-2', description: 'x', targetCategory: 'web', origin: 'blank',
+    });
+    assert.deepEqual(off.runtime.sandboxManager.acquire(p2.project.id).egress.allowedHosts, [], 'no host is allowed with no network');
   } finally {
     cleanup();
   }
