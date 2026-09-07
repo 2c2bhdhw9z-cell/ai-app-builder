@@ -38,6 +38,7 @@ const SHARE_LINKS_DIR = 'share-links'; // ShareLink records, keyed by ownerId
 const BINDINGS_DIR = 'connector-bindings'; // ConnectorBinding records
 const SECRETS_DIR = 'secrets'; // Secret ciphertext (out-of-tree only)
 const SNAPSHOTS_DIR = 'snapshots'; // Snapshot registry/metadata (out-of-tree only)
+const USER_SKILLS_DIR = 'user-skills'; // per-owner User_Skill library (out-of-tree)
 
 /**
  * Create a storage layout rooted at `baseDir`. `exportRoot` and `controlRoot`
@@ -163,6 +164,25 @@ class StorageLayout {
     return this.assertOutsideExportTrees(
       path.join(this.controlRoot, SNAPSHOTS_DIR, ownerId, `${projectId}.json`),
       'controlSnapshotRegistryPath',
+    );
+  }
+
+  /**
+   * The per-owner User_Skill library ROOT (control-plane, out of every tree).
+   * User_Skills are per-User_Account (Req 13.3) — not per-project — so they are
+   * keyed by ownerId here and made available to all of the owner's Projects by
+   * the Skill Library, rather than living inside any single exportable tree.
+   * Each skill is stored as an open Agent Skills SKILL.md dir beneath this root
+   * (`<root>/<dirName>/SKILL.md`), so the tree stays loadable by plumby's
+   * loader (Req 13.9) and portable to other Agent Skills tools (Property 19).
+   * It resolves OUT-OF-TREE (asserted) so a User_Skill library can never leak
+   * into an exported project tree.
+   */
+  controlUserSkillsRoot(ownerId) {
+    requireId('ownerId', ownerId);
+    return this.assertOutsideExportTrees(
+      path.join(this.controlRoot, USER_SKILLS_DIR, ownerId),
+      'controlUserSkillsRoot',
     );
   }
 

@@ -1,0 +1,5 @@
+{
+  "name": "web-app-keeps-platform-runtime",
+  "paths": "src/app.tsx",
+  "must": { "importFrom": ["@acme/website-runtime"] }
+}

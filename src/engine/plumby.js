@@ -23,6 +23,13 @@ export { buildSystemPrompt } from 'plumby/src/core/prompt.js';
 // The scripted (fake) provider that replays canned turns — the hermetic test seam.
 export { createScriptedProvider } from 'plumby/src/providers/scripted.js';
 
+// The zero-dependency frontmatter parser. Re-exported so the skill vendoring
+// step (and later the Skill Library) can validate a SKILL.md's `name` +
+// `description` header through the boundary instead of importing plumby
+// internals directly. plumby ships NO serializer, so writers emit SKILL.md
+// text themselves and round-trip it through this parser.
+export { parseFrontmatter } from 'plumby/src/core/frontmatter.js';
+
 // LIVE provider factories. Re-exported so the Builder Server can construct a
 // real provider without importing plumby directly (audit H13): createAgent
 // throws without a provider, so the default agent path was dead until the
@@ -45,9 +52,15 @@ export { verifyTool } from 'plumby/src/tools/verify.js';
 export { loadSkillTool } from 'plumby/src/tools/load_skill.js';
 export { editFileTool } from 'plumby/src/tools/edit_file.js';
 
-// Skill discovery: the surface loader and the core indexer.
+// Skill discovery: the surface loader, the core indexer, the startup listing
+// block renderer (500-char description clip + 16 KiB listing cap live here),
+// and the available-name lister used for error messages.
 export { loadSkills } from 'plumby/src/cli/project_context.js';
-export { indexSkills } from 'plumby/src/core/skills.js';
+export {
+  indexSkills,
+  buildSkillsBlock,
+  skillNames,
+} from 'plumby/src/core/skills.js';
 
 // Web surface helpers: event projection and diff computation.
 export { toViewEvent, RESULT_PREVIEW_CHARS } from 'plumby/src/web/events.js';
