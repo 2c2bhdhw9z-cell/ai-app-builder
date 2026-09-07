@@ -18,6 +18,11 @@ export {
 } from './export.js';
 
 export {
+  createLockinAudit,
+  AUDIT_SLO_MS,
+} from './lockin-audit.js';
+
+export {
   DEFAULT_FILE_COUNT_LIMIT,
   requireFileCountLimit,
   countTreeFiles,
