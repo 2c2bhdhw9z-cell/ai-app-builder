@@ -12,7 +12,9 @@
  *   (2) CONTROL-PLANE — out-of-tree metadata that must NEVER enter an exported
  *       tree: the project registry, share links, connector bindings, secret
  *       values (ciphertext), the per-owner User_Skill library, and the per-owner
- *       Global_Memory store. Rooted under `controlRoot/` and keyed/filterable by
+ *       Global_Memory store, and the per-owner UserPresentationSettings
+ *       (Workspace_Experience selection + custom layout, Req 27). Rooted under
+ *       `controlRoot/` and keyed/filterable by
  *       ownerId (three-axis isolation, Req 7.6). NOTE: Project_Memory is NOT
  *       control-plane — it lives INSIDE the exportable project tree
  *       (exportableMemoryPath) so it persists/exports with the Project (Req
@@ -44,6 +46,7 @@ const SECRETS_DIR = 'secrets'; // Secret ciphertext (out-of-tree only)
 const SNAPSHOTS_DIR = 'snapshots'; // Snapshot registry/metadata (out-of-tree only)
 const USER_SKILLS_DIR = 'user-skills'; // per-owner User_Skill library (out-of-tree)
 const GLOBAL_MEMORY_DIR = 'global-memory'; // per-owner Global_Memory store (out-of-tree)
+const PRESENTATION_DIR = 'presentation'; // per-owner UserPresentationSettings (out-of-tree)
 
 /**
  * Create a storage layout rooted at `baseDir`. `exportRoot` and `controlRoot`
@@ -208,6 +211,24 @@ class StorageLayout {
     return this.assertOutsideExportTrees(
       path.join(this.controlRoot, GLOBAL_MEMORY_DIR, ownerId),
       'controlGlobalMemoryRoot',
+    );
+  }
+
+  /**
+   * The per-owner UserPresentationSettings file (control-plane, out of every
+   * tree). Holds a user's pure-presentation preferences — the selected
+   * Workspace_Experience and, for `custom`, the saved layout (Req 27.4/27.5).
+   * These settings are per-User_Account (Req 27.5), NEVER exported and NEVER
+   * inside a Project tree — a Workspace_Experience selection touches no Project
+   * data (Req 27.3, Property 20) — so it is keyed by ownerId here and resolves
+   * OUT-OF-TREE (asserted), exactly like the registry/skills/global-memory
+   * paths. A Theme (Req 29) will share this document in a later task.
+   */
+  controlPresentationSettingsPath(ownerId) {
+    requireId('ownerId', ownerId);
+    return this.assertOutsideExportTrees(
+      path.join(this.controlRoot, PRESENTATION_DIR, ownerId, 'presentation.json'),
+      'controlPresentationSettingsPath',
     );
   }
 
