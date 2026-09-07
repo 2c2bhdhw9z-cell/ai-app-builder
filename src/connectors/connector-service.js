@@ -36,9 +36,13 @@
  *     the guard.
  *
  * NO-PARTIAL-STATE DISCIPLINE (Req 10.6): on capture fail/cancel/deny, NOTHING is
- * written — no Secret, no binding, no steering. The function returns a structured
- * failure and leaves the Project's existing Connectors and Secrets byte-for-byte
- * unchanged.
+ * written — no Secret, no binding, no steering. And on the SUCCESS path, the
+ * secret writes and the binding write live inside ONE guarded scope: if EITHER
+ * throws, every credential written so far is rolled back (and the binding, if
+ * any, dropped), so a partial state — an orphaned out-of-tree Secret with no
+ * binding, still injectable via envForProject — can never be left behind. The
+ * function returns a structured failure and leaves the Project's existing
+ * Connectors and Secrets byte-for-byte unchanged.
  *
  * THE ai-model DISTINCTION (Req 10.1): an `ai-model` Connector is a service the
  * GENERATED APP calls; it is DISTINCT from the builder's own model provider
@@ -258,18 +262,30 @@ export function createConnectorService({
     }
 
     // (2) SUCCESS — store each captured credential as a Secret (value out-of-
-    // tree; NAME only surfaces), then persist the ACTIVE binding, then refresh
-    // the steering surface. Order matters: if a secret write throws we have not
-    // yet created a binding, so the failure path (below) removes any secret we
-    // did write, leaving no partial state.
+    // tree; NAME only surfaces), then persist the ACTIVE binding. Both writes
+    // live inside ONE guarded scope with a rollback of everything committed so
+    // far: if the secret write throws we remove any secret already written; if
+    // the BINDING write throws we ALSO remove the just-written secrets so an
+    // orphaned, still-injectable credential can never be left behind (Req 10.6
+    // "stores nothing partial"). This mirrors the snapshot-and-restore rollback
+    // discipline of package-manager.js / database-service.js.
     const written = [];
+    let binding;
     try {
       for (const name of secretRefs) {
         secretStore.put(projectId, name, credentials[name]);
         written.push(name);
       }
+      binding = bindingStore.put(projectId, {
+        connector,
+        secretRefs,
+        status: 'active',
+        hosts: [...entry.hosts],
+      });
     } catch (err) {
-      // Roll back any secret we wrote so nothing partial remains (Req 10.6).
+      // Roll back EVERYTHING committed on this path so nothing partial remains:
+      // the secrets we wrote AND (defensively) the binding, whether the failure
+      // came from a secret write or the binding write (Req 10.6).
       for (const name of written) {
         try {
           secretStore.remove(projectId, name);
@@ -277,24 +293,46 @@ export function createConnectorService({
           /* best-effort rollback */
         }
       }
+      try {
+        bindingStore.remove(projectId, service);
+      } catch {
+        /* best-effort rollback — a binding may not have been written */
+      }
+      const code = binding === undefined && written.length === secretRefs.length ? 'BINDING_STORE_FAILED' : 'SECRET_STORE_FAILED';
+      emitAudit({ type: 'connector.add.failed', projectId, service, code });
+      emitObservability({ type: 'connector.add', projectId, service, ok: false, code });
       return Object.freeze({
         ok: false,
-        code: 'SECRET_STORE_FAILED',
+        code,
         service,
-        message: `failed to store captured credential: ${err?.message ?? String(err)}; rolled back, existing connectors and secrets unchanged`,
+        message: `failed to persist connector ${JSON.stringify(service)}: ${err?.message ?? String(err)}; rolled back, existing connectors and secrets unchanged`,
       });
     }
 
-    const binding = bindingStore.put(projectId, {
-      connector,
-      secretRefs,
-      status: 'active',
-      hosts: [...entry.hosts],
-    });
-
     // Surface to the Builder_Agent + recompute egress from the current bindings.
-    refreshSurfaces(projectId);
-    const steeringPath = steeringWriter.manifestPathFor(projectId);
+    // This runs AFTER the secret+binding are committed. It writes NAMEs only (no
+    // credential value), so a failure here cannot leak — but to honor the
+    // module's "never throw on a handled path" contract, a surface-refresh error
+    // is caught and reported as a structured DEGRADED success: the connector IS
+    // active and injectable (secret+binding committed), only the steering/egress
+    // surface failed to refresh (recomputed lazily from bindingsFor at acquire).
+    let steeringPath;
+    try {
+      refreshSurfaces(projectId);
+      steeringPath = steeringWriter.manifestPathFor(projectId);
+    } catch (err) {
+      emitAudit({ type: 'connector.add.degraded', projectId, service, secretRefs });
+      emitObservability({ type: 'connector.add', projectId, service, ok: true, code: 'ADDED_DEGRADED' });
+      return Object.freeze({
+        ok: true,
+        degraded: true,
+        connector,
+        binding,
+        secretRefs: Object.freeze([...secretRefs]),
+        code: 'SURFACE_REFRESH_FAILED',
+        message: `connector ${JSON.stringify(service)} added and injected, but surface refresh (steering/egress) failed: ${err?.message ?? String(err)}; the allowlist is recomputed from bindingsFor at sandbox acquire`,
+      });
+    }
 
     emitAudit({ type: 'connector.add.succeeded', projectId, service, secretRefs });
     emitObservability({ type: 'connector.add', projectId, service, ok: true, code: 'ADDED' });

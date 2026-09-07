@@ -202,6 +202,131 @@ test('a capture seam that THROWS is treated as a failure, nothing stored (Req 10
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// Req 10.6 — SUCCESS-path rollback: a binding-store write failure AFTER the
+// secret is written must roll the secret back (no orphaned out-of-tree Secret
+// left injectable via envForProject with no binding). REGRESSION for the v1
+// partial-write window.
+// ─────────────────────────────────────────────────────────────────────────
+
+test('a binding-store put() failure after a successful secret write rolls back the secret — no partial state (Req 10.6)', async () => {
+  const { base, secretStore, bindingStore, steeringWriter } = harness();
+  try {
+    // A REAL binding store, wrapped so ONLY put() throws (the boundary we are
+    // exercising). Every other method delegates to the real store, so list/get/
+    // bindingsFor reflect genuine on-disk state. This is a real object that
+    // genuinely throws — not an over-mock.
+    let putCalls = 0;
+    const throwingBindingStore = {
+      ...bindingStore,
+      put() {
+        putCalls += 1;
+        throw new Error('binding disk write failed');
+      },
+    };
+
+    const service = 'stripe';
+    const [envName] = defaultConnectorCatalog.get(service).envNames;
+
+    // Sanity: existing state is empty before the attempt.
+    assert.deepEqual(secretStore.list(PROJECT), []);
+    assert.deepEqual(bindingStore.list(PROJECT), []);
+
+    const svc = createConnectorService({
+      secretStore,
+      bindingStore: throwingBindingStore,
+      steeringWriter,
+      capture: successCapture('secret'),
+      catalog: defaultConnectorCatalog,
+    });
+
+    const res = await svc.addConnector({ projectId: PROJECT, service });
+
+    // addConnector NEVER throws on a handled path — it REPORTS a structured
+    // failure. MUTATION-CHECK: if the binding write were outside the rollback
+    // scope (the v1 bug), the throw would still be caught here but the secret
+    // assertions below would FLIP (the secret would remain).
+    assert.equal(putCalls, 1, 'the binding put was actually attempted');
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'BINDING_STORE_FAILED');
+    assert.equal(res.service, service);
+
+    // NO secret remains — the just-written credential was rolled back. These are
+    // the assertions that FLIP if the rollback is reverted.
+    assert.equal(secretStore.get(PROJECT, envName), null, 'the written secret was rolled back');
+    assert.equal(secretStore.has(PROJECT, envName), false);
+    assert.deepEqual(secretStore.list(PROJECT), [], 'secret list unchanged — nothing orphaned');
+    // envForProject (the runtime injection seam) must not materialize the NAME.
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(secretStore.envForProject(PROJECT), envName),
+      false,
+      'no orphaned credential is injectable via envForProject',
+    );
+
+    // NO binding was persisted (the real store is still empty).
+    assert.deepEqual(bindingStore.list(PROJECT), []);
+    assert.equal(bindingStore.get(PROJECT, service), null);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('a binding put() failure leaves a PRE-EXISTING connector byte-for-byte unchanged (Req 10.6)', async () => {
+  const { base, layout, secretStore, bindingStore, steeringWriter } = harness();
+  try {
+    // Establish an existing, successful connector with the REAL store.
+    const ok = createConnectorService({
+      secretStore,
+      bindingStore,
+      steeringWriter,
+      capture: successCapture('existing'),
+      catalog: defaultConnectorCatalog,
+    });
+    const first = await ok.addConnector({ projectId: PROJECT, service: 'stripe' });
+    assert.equal(first.ok, true);
+    const [existingName] = defaultConnectorCatalog.get('stripe').envNames;
+
+    const bindingPath = layout.controlConnectorBindingPath(OWNER, PROJECT);
+    const secretPath = layout.controlSecretPath(OWNER, PROJECT, existingName);
+    const before = {
+      secretNames: secretStore.list(PROJECT),
+      secretValue: secretStore.get(PROJECT, existingName),
+      bindingBytes: readBytes(bindingPath),
+      secretBytes: readBytes(secretPath),
+    };
+
+    // Now attempt a SECOND connector whose binding write throws.
+    const throwingBindingStore = {
+      ...bindingStore,
+      put() {
+        throw new Error('binding disk write failed');
+      },
+    };
+    const svc = createConnectorService({
+      secretStore,
+      bindingStore: throwingBindingStore,
+      steeringWriter,
+      capture: successCapture('new'),
+      catalog: defaultConnectorCatalog,
+    });
+    const res = await svc.addConnector({ projectId: PROJECT, service: 'neon' });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, 'BINDING_STORE_FAILED');
+
+    // The failed connector's secret is not present, and the pre-existing
+    // connector is byte-for-byte intact.
+    for (const failedName of defaultConnectorCatalog.get('neon').envNames) {
+      assert.equal(secretStore.get(PROJECT, failedName), null, `${failedName} must not remain`);
+    }
+    assert.deepEqual(secretStore.list(PROJECT), before.secretNames);
+    assert.equal(secretStore.get(PROJECT, existingName), before.secretValue);
+    assert.deepEqual(readBytes(secretPath), before.secretBytes);
+    assert.deepEqual(readBytes(bindingPath), before.bindingBytes);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // Req 10.7 — removal revokes injection and reports it.
 // ─────────────────────────────────────────────────────────────────────────
 
