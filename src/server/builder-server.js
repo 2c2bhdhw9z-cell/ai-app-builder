@@ -55,6 +55,7 @@ import { createActivityStream } from './activity-stream.js';
 import {
   workspaceExperienceLayouts,
   defaultCustomLayout,
+  createWorkModeSession,
 } from '../presentation/index.js';
 
 /** Cap on a POST body we will buffer, so a client cannot exhaust memory. */
@@ -242,6 +243,50 @@ export function workspaceExperienceFrame({ experience, layout, attribution } = {
     frame.attribution = layout.attribution;
   }
   return frame;
+}
+
+/**
+ * Project a per-Session Work_Mode onto a SAFE, broadcastable `work_mode` frame
+ * (spec Task 32, Req 28, Property 21). PURE, so the exact shape is unit-testable
+ * and cannot drift between the GET/POST /work-mode responses, the SSE broadcast,
+ * and the /events reconnection frame — mirrors how workspaceExperienceFrame is
+ * written and re-exported.
+ *
+ * The frame carries ONLY interaction-flow data: the active `mode` and the three
+ * offerable `choices` at Session creation (Req 28.2/28.4). There is structurally
+ * NOTHING here that could change source code, agent state, Project data,
+ * Snapshots, models, Skills, Connectors, permissions, Project_Origin, Theme, or
+ * Workspace_Experience (Req 28.6) — it re-parametrizes the next turn's flow only.
+ *
+ * @param {{ mode:string, choices?:string[] }} args
+ * @returns {{ type:'work_mode', mode:string, choices:string[] }}
+ */
+export function workModeFrame({ mode, choices } = {}) {
+  return {
+    type: 'work_mode',
+    mode,
+    choices: Array.isArray(choices) ? [...choices] : [],
+  };
+}
+
+/**
+ * Project a Session's observable header onto a SAFE, broadcastable
+ * `session_header` frame (spec Task 32, Req 28.4). PURE. WHILE a Session is
+ * active, the ACTIVE Work_Mode is ALWAYS present on the Session_Header so a
+ * (re)connecting client can always render it. Carries only the active `mode` and
+ * the offerable `choices` — no Project state. Kept alongside workModeFrame so the
+ * header shape cannot drift between the POST /work-mode response, the SSE
+ * broadcast, and the /events reconnection frame.
+ *
+ * @param {{ mode:string, choices?:string[] }} args
+ * @returns {{ type:'session_header', workMode:string, workModeChoices:string[] }}
+ */
+export function sessionHeaderFrame({ mode, choices } = {}) {
+  return {
+    type: 'session_header',
+    workMode: mode,
+    workModeChoices: Array.isArray(choices) ? [...choices] : [],
+  };
 }
 
 /**
@@ -433,6 +478,14 @@ export function createBuilderServer(opts = {}) {
       pendingConfirms: new Map(),
       /** Display payloads for pending confirms, re-broadcast on reconnect. */
       pendingConfirmPayloads: new Map(),
+      /**
+       * The per-Session active Work_Mode (spec Task 32, Req 28). A NEW Session
+       * defaults to 'vibe' (Req 28.3). This is pure interaction-FLOW state that
+       * shapes only the NEXT turn's prompt/flow and holds ONLY the mode string
+       * (+ a pending switch target) — it has NO path to any Project state
+       * (Req 28.6). It persists NO Project data.
+       */
+      workMode: createWorkModeSession({ now: () => new Date(now()) }),
     };
 
     /** Send a raw view payload to every SSE client of THIS session. */
@@ -715,6 +768,19 @@ export function createBuilderServer(opts = {}) {
     if (workspaceExperienceStore && req.method === 'POST' && pathname === '/workspace-experience') {
       return handleSelectWorkspaceExperience(req, res);
     }
+    // The per-Session Work_Mode surface (spec Task 32, Req 28). Work_Mode is a
+    // CORE Session capability (every Session has one, defaulting to 'vibe'), so
+    // these routes are always available — unlike the per-account
+    // Workspace_Experience surface behind an injected store. They are STRICTLY
+    // ADDITIVE: no existing route byte changes, and both gate on FULL auth for a
+    // projectId (a Session is (accountId, projectId)) exactly like
+    // /events/message/confirm.
+    if (req.method === 'GET' && pathname === '/work-mode') {
+      return handleGetWorkMode(req, res);
+    }
+    if (req.method === 'POST' && pathname === '/work-mode') {
+      return handleSwitchWorkMode(req, res);
+    }
 
     res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'GET, POST' });
     res.end('method not allowed');
@@ -991,6 +1057,123 @@ export function createBuilderServer(opts = {}) {
     return sendJson(res, 200, { ...frame });
   }
 
+  // -------- Work_Mode surface (spec Task 32, Req 28) — a core Session capability
+
+  /**
+   * GET /work-mode — return the current Session's active Work_Mode + the three
+   * creation choices as a work_mode frame (Req 28.2/28.4). Work_Mode is
+   * per-Session, so this gates on FULL auth for the projectId via the EXISTING
+   * gate(req, projectId) (a Session is (accountId, projectId)) — identical
+   * non-disclosing 401 on denial. Requires the projectId query param exactly as
+   * handleEvents does (400 when missing). Read-only: touches NO Project state,
+   * enqueues NO turn.
+   */
+  async function handleGetWorkMode(req, res) {
+    const url = new URL(req.url, 'http://localhost');
+    const projectId = url.searchParams.get('projectId');
+    if (!projectId) return sendJson(res, 400, { error: "a 'projectId' query parameter is required" });
+
+    const result = await gate(req, projectId);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const session = sessionFor(result.account.id, projectId);
+    return sendJson(res, 200, {
+      ...workModeFrame({
+        mode: session.workMode.current(),
+        choices: session.workMode.creationChoices(),
+      }),
+    });
+  }
+
+  /**
+   * POST /work-mode — request a Work_Mode switch for a Session (Req 28.5/28.6/
+   * 28.7). Body { projectId, mode }. Gates on FULL auth for the projectId via the
+   * EXISTING gate(req, projectId).
+   *
+   * An out-of-enum `mode` is rejected 400 { code:'unsupported_work_mode',
+   * current } with the current mode LEFT IN EFFECT and NO confirm minted
+   * (Req 28.7). A valid target does NOT apply immediately: it routes through the
+   * EXISTING confirm surface — session.onConfirmRequest broadcasts a
+   * confirm_request frame keyed by the same requestId POST /confirm settles, and
+   * we await it under the fail-closed <=60s ceiling. There is NO second confirm
+   * mechanism. When the awaited promise resolves TRUE, we call
+   * session.workMode.applySwitch(mode) — the ONLY mutator, which holds only the
+   * mode string and CANNOT touch any Project state (Req 28.6) — and broadcast the
+   * updated work_mode + session_header frames so every client sees the new active
+   * mode. When it resolves FALSE (denied) or fail-closed (timeout/no client), we
+   * DO NOT apply: the current mode stays in effect and we respond that the switch
+   * was not applied.
+   */
+  async function handleSwitchWorkMode(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    const projectId = typeof body?.projectId === 'string' ? body.projectId : '';
+    if (!projectId) return sendJson(res, 400, { error: "a 'projectId' field is required" });
+
+    const result = await gate(req, projectId);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const session = sessionFor(result.account.id, projectId);
+    const mode = typeof body?.mode === 'string' ? body.mode : '';
+
+    // Validate the requested target. An out-of-enum mode is rejected WITHOUT
+    // minting a confirm; the current mode stays in effect (Req 28.7).
+    const requested = session.workMode.requestSwitch(mode);
+    if (!requested.ok) {
+      return sendJson(res, 400, {
+        error: requested.message ?? 'unsupported Work_Mode',
+        code: requested.code,
+        current: workModeFrame({
+          mode: session.workMode.current(),
+          choices: session.workMode.creationChoices(),
+        }),
+      });
+    }
+
+    // A valid target routes through the EXISTING confirm surface: broadcast a
+    // confirm_request frame keyed by the SAME requestId POST /confirm settles,
+    // and await it under the fail-closed <=60s ceiling. No second mechanism.
+    const approved = await session.onConfirmRequest({
+      requestId: requested.requestId,
+      command: `work-mode switch to ${mode}`,
+      category: 'work_mode_switch',
+      reason: `Switch the Session Work_Mode to '${mode}'`,
+    });
+
+    if (approved === true) {
+      // Confirmed: apply the switch (the ONLY mutator) and broadcast the new
+      // active mode on the Session_Header so every client re-renders it.
+      const applied = session.workMode.applySwitch(mode);
+      const frame = workModeFrame({
+        mode: session.workMode.current(),
+        choices: session.workMode.creationChoices(),
+      });
+      session.broadcast(frame);
+      session.broadcast(
+        sessionHeaderFrame({
+          mode: session.workMode.current(),
+          choices: session.workMode.creationChoices(),
+        }),
+      );
+      return sendJson(res, 200, { applied: true, ...frame, at: applied.at });
+    }
+
+    // Denied / timed-out / no client: leave the current mode in effect and
+    // report the switch was not applied (Req 28.5). Broadcast the still-current
+    // mode so any observer confirms nothing changed.
+    const frame = workModeFrame({
+      mode: session.workMode.current(),
+      choices: session.workMode.creationChoices(),
+    });
+    session.broadcast(frame);
+    return sendJson(res, 200, { applied: false, ...frame });
+  }
+
   // -------- GET /events (SSE)
 
   async function handleEvents(req, res) {
@@ -1046,6 +1229,24 @@ export function createBuilderServer(opts = {}) {
         }),
       );
     }
+    // A (re)connecting client ALWAYS learns the CURRENT active Work_Mode in the
+    // Session_Header (spec Task 32, Req 28.4). This is per-Session (keyed off the
+    // session, not the account), unlike the per-account workspace_experience
+    // frame. Both the work_mode and session_header frames are pushed so a client
+    // can render the observable header immediately. Work_Mode is a core Session
+    // capability, so this is always present.
+    frames.push(
+      workModeFrame({
+        mode: session.workMode.current(),
+        choices: session.workMode.creationChoices(),
+      }),
+    );
+    frames.push(
+      sessionHeaderFrame({
+        mode: session.workMode.current(),
+        choices: session.workMode.creationChoices(),
+      }),
+    );
     for (const payload of session.pendingConfirmPayloads.values()) frames.push(payload);
     for (const payload of frames) {
       try {

@@ -25,6 +25,14 @@
  * Project state and enqueues no loop turn; strictly additive and behind the
  * injected store.
  *
+ * Every Project Session also carries a per-Session Work_Mode (Req 28), a CORE
+ * capability defaulting to `vibe`: GET /work-mode reads the active mode + the
+ * three creation choices, POST /work-mode requests a switch that routes through
+ * the EXISTING POST /confirm consent seam (a switch applies only after explicit
+ * confirmation) and reshapes only the NEXT turn's flow — it preserves ALL
+ * Project state and enqueues no loop turn. The active mode is always observable
+ * in the Session_Header, including the /events reconnection frames.
+ *
  * The Builder_Agent behind each Project Session reaches plumby ONLY through the
  * boundary module (src/engine/plumby.js); this subsystem never imports the
  * plumby package directly.
@@ -37,5 +45,7 @@ export {
   restartStatusFrame,
   safePreviewCause,
   workspaceExperienceFrame,
+  workModeFrame,
+  sessionHeaderFrame,
 } from './builder-server.js';
 export { createActivityStream, toActivityFrame } from './activity-stream.js';
