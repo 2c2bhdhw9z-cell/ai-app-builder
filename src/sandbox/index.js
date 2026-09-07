@@ -47,6 +47,25 @@ export {
 } from './container-backend.js';
 
 export {
+  createFilteringContainerBackend,
+  DEFAULT_EGRESS_NETWORK_PREFIX,
+  DEFAULT_PROXY_CONTAINER,
+  EGRESS_PLANE_UNAVAILABLE,
+} from './filtering-container-backend.js';
+
+export {
+  EGRESS_PROXY_SRC,
+  proxyCommand,
+  proxyContainerEnv,
+  proxyEnvFor,
+  sanitizeProxyAllowlist,
+  allowlistFingerprint,
+  ALLOWLIST_LABEL,
+  DEFAULT_PROXY_PORT,
+  ALLOWED_CONNECT_PORTS,
+} from './egress-proxy.js';
+
+export {
   computeEgressAllowlist,
   normalizeHost,
   isForbiddenEgressHost,

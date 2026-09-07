@@ -58,7 +58,36 @@ valid. Anything else logs `identity: LOGIN DISABLED — <reason>` and leaves
 |---|---|---|
 | `CONTAINER_BIN` | `docker` | Container CLI. Set to `podman` on a podman host. Not probed at boot, so the server still starts (and `/healthz` still answers) on a host with no runtime — the failure surfaces as a `503` from `POST /projects` instead. One consequence of not probing: containers left behind by a crashed previous process are **not** reaped at startup (per-project orphan cleanup still happens on release). Run `docker ps -a --filter label=aab.sandbox` after an unclean restart if you want to check. |
 | `SANDBOX_IMAGE` | `node:22-slim` | Image each Project sandbox runs. |
-| `AAB_SANDBOX_EGRESS` | `none` | Sandbox network posture. `none` = no network at all: commands run, but nothing can reach the network (so **`npm install` cannot work**). `registry` = allow the package-registry hosts, which requires per-host egress filtering that the CLI container backend **cannot** enforce — it fails closed, refusing every command. Only choose `registry` with a filtering-capable backend. Any unrecognized value falls back to `none`. |
+| `AAB_SANDBOX_EGRESS` | `none` | Sandbox network posture. `none` (default) = `--network none`: commands run, but there is no network at all, so **`npm install` cannot work**. `registry` = the sandbox may reach the package-registry hosts and **nothing else**, which makes `npm install` work without opening general egress; see *Registry-only egress* below for how that is enforced. Any unrecognized value falls back to `none`. |
+| `AAB_SANDBOX_EGRESS_HOSTS` | unset | Extra hosts added to the sandbox allowlist, comma-separated (a private registry mirror, or a connector endpoint a build genuinely needs). **Only honored in `registry` mode** — in `none` there is no network to allow anything on, so these are ignored rather than quietly re-enabling egress. Host-local *literals* (loopback, RFC1918, link-local, `169.254.169.254`, `host.docker.internal`, and alternate encodings like `2130706433`) are stripped at configuration time, and a *name* that resolves to such an address is refused at connection time — the proxy is the one component with real egress, so allowlisting a metadata address through it would be a credential-exfiltration path. **This allowlist is platform-wide, not per-project** — see the caveat below. |
+| `AAB_EGRESS_ALLOW_PRIVATE_ADDRESSES` | off | Read by the **egress proxy container**. Allows allowlisted names to resolve to private/loopback addresses, for a registry mirror that genuinely lives on one. This gives up the SSRF protection described below, so it is off unless you set it. |
+
+### Registry-only egress (how `registry` is enforced)
+
+The posture is enforced by the runtime, not asserted by us:
+
+1. **One container network per project**, created `--internal` — it has **no route out at all**. That is the deny-by-default primitive. Per project, not shared, so sandboxes cannot reach *each other* either (containers on a shared user-defined network reach each other on every port, and the runtime's embedded DNS resolves peer container names).
+2. One **allowlisting proxy** container, attached to every one of those internal networks *and* to a normal egress-capable one, making it the only path out. It matches on hostname and forwards only allowlisted hosts.
+3. The sandbox container joins **its own internal network only**, with `HTTP_PROXY` / `HTTPS_PROXY` / `npm_config_proxy` pointed at the proxy. Those variables are applied *over* any project secret of the same name — they are an enforcement control, not a default.
+
+A package install script that ignores the proxy variables gets no bypass: on an internal network there is no route, and no external DNS to find one with.
+
+The proxy **does not terminate TLS**. An `https://` fetch arrives as `CONNECT host:443`; the host is checked and, if allowed, raw bytes are piped. So npm's certificate validation and integrity hashes stay end-to-end exactly as without a proxy, and the filtering unit is a hostname — the same granularity the allowlist is written in. An absolute-form `https://` proxy request (which no normal client sends) is **refused** rather than serviced, so a URL that asked for TLS is never downgraded to cleartext. The proxy is a stdlib-only Node program running in the **same image the sandbox already uses**, so this adds no image to pull and no dependency.
+
+Fail-closed throughout:
+
+- an empty allowlist refuses everything (a config that failed to arrive must not mean allow-all);
+- hostname matching is **exact** — no suffix rules, so `evil-registry.npmjs.org` is not the registry;
+- **both** the CONNECT and the plain-HTTP path are limited to ports 443/80, so an allowlisted host cannot be reached on some other service port;
+- an allowlisted name that **resolves** to loopback, an RFC1918 range, CGNAT, multicast or `169.254.169.254` is refused *at connection time*, so a split-horizon or hijacked record cannot turn the one component with real egress into an SSRF path. Set `AAB_EGRESS_ALLOW_PRIVATE_ADDRESSES=1` (default off) only if your registry mirror genuinely lives on a private address — it gives up that protection;
+- an existing network of the expected name is **inspected and required to be internal** before it is used. `--internal` is a *creation* flag, so adopting a pre-existing routable network of the same name would have silently restored full egress;
+- an already-running proxy is adopted **only if its allowlist fingerprint matches** the current configuration (it is recorded as a container label). Otherwise it is replaced — so removing a host actually revokes it, and a container is not trusted merely for having the right name;
+- the proxy must be **observed listening** before any sandbox that depends on it is launched;
+- if any of that cannot be established, the command is **denied** rather than run with whatever networking happens to exist, and a transient failure is retried on the next command rather than cached.
+
+Every decision is logged by the proxy, so a denial is diagnosable: `docker logs aab-egress-proxy`.
+
+Two caveats worth knowing. The allowlist is **platform-wide, not per-project**: in `registry` mode every sandbox shares the same allowed hosts, so a connector host added via `AAB_SANDBOX_EGRESS_HOSTS` is reachable from *every* project. Deny-by-default against the open internet still holds, and projects remain isolated from each other; per-project allowlists would need a proxy per project and are a remaining follow-up. And **nothing tears the proxy or the per-project networks down today** — they are labelled `aab.sandbox`, so a reaper *can* collect them, but per-project cleanup on release is scoped to that project's label and never matches the proxy. If the proxy is removed by hand, the next filtered command detects it and rebuilds it.
 
 ### Preview (the served dev server)
 
@@ -341,11 +370,42 @@ register exactly that URL with your identity provider.
   `AAB_PREVIEW_NETWORK=aab-preview`, create a project and run a turn, then
   `GET /preview?projectId=...` and fetch the returned URL — it must serve the app,
   and `docker ps --filter label=aab.sandbox` must show the dev-server container.
-- **`AAB_SANDBOX_EGRESS=none` means package installs cannot work.** The CLI
-  container backend cannot enforce per-host egress filtering, so the only postures
-  available are "no network" (commands run) or "filtered" (which that backend
-  refuses outright). A build that needs `npm install` needs a filtering-capable
-  backend behind the existing `createContainerBackend` seam.
+- ~~**`AAB_SANDBOX_EGRESS=none` means package installs cannot work.**~~ **Done** — a
+  filtering-capable backend now sits behind the same `createContainerBackend` seam
+  (`src/sandbox/filtering-container-backend.js` + `src/sandbox/egress-proxy.js`), so
+  `AAB_SANDBOX_EGRESS=registry` is genuinely enforceable instead of denying every
+  command: an `--internal` network with no route out, plus one allowlisting proxy
+  that is the only way out. `npm install` works without opening general egress. The
+  default is still `none`, and deny-by-default is unchanged — the registry is an
+  *allowlist entry*, not an exception to the posture. See *Registry-only egress*.
+
+  What is proven without a container, by running the proxy as a **real process**
+  driven with **real HTTP** and a **real CONNECT tunnel** against a real upstream:
+  every allow/deny decision, the exact-match rule against near-miss names, the port
+  bound on *both* paths, the refusal of an allowlisted name that resolves to a
+  non-public address, the refusal of absolute-form `https://`, that a forged `Host`
+  header cannot redirect the connection and that hop-by-hop headers are stripped,
+  the empty-allowlist refusal, and survival of a malformed request. Against the real
+  backend with only the CLI faked: the emitted argv; a **network per project** (so
+  sandboxes cannot reach each other); setup ordering and its idempotence under
+  concurrency; that an existing network is adopted only when verified internal; that
+  a proxy is adopted only when its allowlist fingerprint matches; stale/exited/dead
+  proxy replacement; that a proxy which never listens denies the command; every
+  fail-closed path launching **nothing**; that a half-built plane is torn down;
+  that a transient failure — including a **thrown** one — is retried rather than
+  cached; that the delegate is permitted only total-deny plus its own internal
+  networks; that caller secrets survive the translation while the proxy settings
+  win; and — through the **real** `SandboxManager` — that a populated allowlist now
+  runs a command where the plain backend still denies it.
+
+  **What only a real container host can prove:** that `--internal` truly severs the
+  route, that the runtime's embedded DNS resolves the proxy's container name on an
+  internal network, and that a real `npm install` completes through the proxy while
+  an off-allowlist host stays unreachable. To check it on a container host: start
+  with `AAB_SANDBOX_EGRESS=registry`, run a turn that installs a dependency, and
+  confirm `docker logs aab-egress-proxy` shows `ALLOW registry.npmjs.org` — then
+  exec `curl https://example.com` in the sandbox and confirm it fails while the
+  install succeeded.
 - **Orphan containers are not reaped at startup.** Deliberate: probing the
   container runtime during boot would stop `/healthz` from answering on a host
   without one. Per-project cleanup still happens on release.

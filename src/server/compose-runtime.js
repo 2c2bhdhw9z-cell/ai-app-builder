@@ -67,6 +67,8 @@ import { createPreviewController } from '../project/preview-controller.js';
 import { createProjectOriginWithTemplates } from '../project/index.js';
 import { createSandboxManager } from '../sandbox/sandbox-manager.js';
 import { createContainerBackend } from '../sandbox/container-backend.js';
+import { createFilteringContainerBackend } from '../sandbox/filtering-container-backend.js';
+import { DEFAULT_PACKAGE_REGISTRY_HOSTS } from '../sandbox/egress.js';
 import { createCommandGuard } from '../sandbox/command-guard.js';
 import { createQuotaManager } from '../ops/quota-manager.js';
 import { createSecretStore } from '../secrets/secret-store.js';
@@ -306,11 +308,19 @@ export function resolveQuotaConfig(env = process.env) {
 export function resolveEgressConfig(env = process.env) {
   const mode = (env.AAB_SANDBOX_EGRESS ?? '').trim().toLowerCase();
   const selected = SANDBOX_EGRESS_MODES.includes(mode) ? mode : 'none';
+  // Extra hosts the operator deliberately adds to the sandbox allowlist (e.g. a
+  // private registry mirror, or a connector endpoint a build genuinely needs).
+  // Only meaningful in 'registry' mode; in 'none' there is no network to allow on.
+  const extra = (env.AAB_SANDBOX_EGRESS_HOSTS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s !== '');
   return {
     mode: selected,
     // 'none' => empty allowlist => the SandboxManager asks for network `none`.
     // 'registry' => leave the manager's own default hosts in place (filtered).
     ...(selected === 'none' ? { packageRegistryHosts: [] } : {}),
+    ...(selected !== 'none' && extra.length > 0 ? { extraHosts: extra } : {}),
   };
 }
 
@@ -337,6 +347,7 @@ export function composeProjectRuntime({
   env = process.env,
   now = () => Date.now(),
   createBackend = createContainerBackend,
+  createFilteringBackend = createFilteringContainerBackend,
   createLayout = createStorageLayout,
 } = {}) {
   if (!composed || !composed.auditLog || typeof composed.commandGuardOptions !== 'function') {
@@ -519,20 +530,48 @@ export function composeProjectRuntime({
   // project orphan cleanup still happens on release. See docs/DEPLOY.md.
   const containerBin = (env.CONTAINER_BIN ?? '').trim() || undefined;
   const containerImage = (env.SANDBOX_IMAGE ?? '').trim() || undefined;
-  const backend = createBackend({
-    ...(containerBin ? { bin: containerBin } : {}),
-    ...(containerImage ? { image: containerImage } : {}),
-  });
 
   // The egress posture is stated EXPLICITLY rather than inherited: the manager's
-  // own default allowlist selects a network mode the real CLI backend refuses,
+  // own default allowlist selects a network mode the plain CLI backend refuses,
   // which denies every command in every sandbox. See SANDBOX_EGRESS_MODES.
   const egress = resolveEgressConfig(env);
+
+  /**
+   * WHICH BACKEND ENFORCES THE POSTURE.
+   *
+   * 'none' -> the plain CLI backend. It enforces total-deny (`--network none`)
+   * genuinely, and refuses anything it cannot enforce.
+   *
+   * 'registry' -> the FILTERING backend, which can actually honor a populated
+   * allowlist: an `--internal` network with no route out, plus one allowlisting
+   * proxy that is the only path out. Before this existed, 'registry' selected a
+   * mode the plain backend refused, so choosing it denied EVERY command — the
+   * posture was unusable, which is why `npm install` could not work in any posture.
+   *
+   * Construction still does no I/O (the network/proxy come up lazily on the first
+   * filtered exec), so a host with no runtime still boots and answers /healthz.
+   */
+  const egressAllowedHosts = [...DEFAULT_PACKAGE_REGISTRY_HOSTS, ...(egress.extraHosts ?? [])];
+  const backend =
+    egress.mode === 'registry'
+      ? createFilteringBackend({
+          allowedHosts: egressAllowedHosts,
+          ...(containerBin ? { bin: containerBin } : {}),
+          ...(containerImage ? { image: containerImage } : {}),
+        })
+      : createBackend({
+          ...(containerBin ? { bin: containerBin } : {}),
+          ...(containerImage ? { image: containerImage } : {}),
+        });
+
   const baseSandboxManager = createSandboxManager({
     layout,
     backend,
     secretStore,
-    config: { ...(egress.packageRegistryHosts ? { packageRegistryHosts: egress.packageRegistryHosts } : {}) },
+    config: {
+      ...(egress.packageRegistryHosts ? { packageRegistryHosts: egress.packageRegistryHosts } : {}),
+      ...(egress.mode === 'registry' ? { packageRegistryHosts: egressAllowedHosts } : {}),
+    },
   });
 
   /**
