@@ -12,6 +12,7 @@
 
 export { createWorkspaceExperienceStore } from './workspace-experience-store.js';
 export { createWorkModeSession } from './work-mode-session.js';
+export { createThemeStore } from './theme-store.js';
 export {
   workspaceExperienceLayouts,
   defaultCustomLayout,

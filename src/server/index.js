@@ -47,5 +47,6 @@ export {
   workspaceExperienceFrame,
   workModeFrame,
   sessionHeaderFrame,
+  themeFrame,
 } from './builder-server.js';
 export { createActivityStream, toActivityFrame } from './activity-stream.js';
