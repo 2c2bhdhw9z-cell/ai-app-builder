@@ -46,6 +46,12 @@ export const AUDIT_EVENTS = Object.freeze({
   RATE_LIMIT_EXCEEDED: 'ratelimit.exceeded',
   ABUSE_MITIGATED: 'abuse.mitigated',
   OPERATIONAL_ERROR: 'operational.error',
+  // Task-29 Share_Link lifecycle (Req 26). Emitted on generation and
+  // revocation of a read-only Share_Link. Per the audit rule above, an event
+  // carries only ids/decisions (accountId, projectId, ownerId) — NEVER the
+  // Share_Link token itself, which is secret capability material.
+  SHARE_LINK_CREATED: 'sharelink.created',
+  SHARE_LINK_REVOKED: 'sharelink.revoked',
 });
 
 /**
