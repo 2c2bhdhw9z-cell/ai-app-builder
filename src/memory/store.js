@@ -49,13 +49,19 @@
  *                (2) keep the newest KEEP_RECENT (default 20) verbatim,
  *                (3) structured-summarize the oldest overflow,
  *                (4) replace them with ONE synthetic 'summary' entry,
- *                (5) if still over EITHER bound, evict the oldest summarized
- *                    content first (NEVER the recent verbatim tail),
+ *                (5) if still over EITHER bound, fold the OLDEST verbatim-tail
+ *                    entries into the summary (they are SUMMARIZED, never
+ *                    dropped unsummarized) until BOTH bounds hold,
  *                (6) persist. Store is then <= capBytes AND <= capEntries
  *                    (Property 16). The user is notified eviction happened.
- * CONSTRUCTION INVARIANTS (design.md §11) that keep "never evict the verbatim
- * tail" and "must end within both caps" consistent, so the degenerate
- * evict-into-the-tail branch is UNREACHABLE on the auto path:
+ * RECONCILING "never evict the verbatim tail unsummarized" with "must end
+ * within both caps": the recent verbatim tail is retained as-is WHENEVER it
+ * fits; when the tail alone still busts capBytes, its OLDEST entries are moved
+ * into the summarized set (folded into the single synthetic gist) one at a time
+ * until the store fits, so a gist always represents any content that left the
+ * verbatim tail — nothing is ever dropped without being summarized first.
+ * CONSTRUCTION INVARIANTS (design.md §11) that guarantee this terminates within
+ * both caps:
  *   - keepRecent is clamped strictly < capEntries (resolveCaps), so an add over
  *     the entry cap ALWAYS leaves at least one overflow entry to summarize — a
  *     synthetic gist is produced whenever eviction happens (no gist-less
@@ -64,6 +70,11 @@
  *     returning { ok:false, code:'entry_too_large', preserved:true,
  *     notified:true } instead of forcing it in by destroying the protected
  *     verbatim tail (which could silently drop a user-origin entry with no gist).
+ *   - the minimal state (the newest single entry + a summary of everything
+ *     else) is within both bounds in every realistic case the property test
+ *     generates; if even that cannot fit, addAuto returns a structured
+ *     { ok:false, code:'cap_unsatisfiable', preserved:true } and does NOT fire
+ *     an eviction-occurred notification while the store is over a cap.
  * SAFEGUARD (never destroy history on a bad summary): if the summarizer returns
  * empty/blank/garbage, NOTHING is evicted or replaced — prior entries are left
  * unchanged, the incoming entry is not added if it cannot fit, the user is
@@ -381,59 +392,79 @@ export function createMemoryStore({
    */
   function summarizeAndEvict(addr, meta, candidate) {
     const ordered = sortedOldestFirst(candidate);
-    const keepRecentN = Math.min(caps.keepRecent, ordered.length);
-    const recentTail = keepRecentN > 0 ? ordered.slice(ordered.length - keepRecentN) : [];
-    const overflow = ordered.slice(0, ordered.length - keepRecentN);
+    const initialKeepRecentN = Math.min(caps.keepRecent, ordered.length);
 
-    // (3) structured-summarize the oldest overflow.
-    let gist = '';
-    if (overflow.length > 0) {
-      try {
-        gist = summarizeFn(overflow);
-      } catch {
-        gist = '';
-      }
-    }
-    const gistText = typeof gist === 'string' ? gist.trim() : '';
-
-    // SAFEGUARD: a bad/empty summary must NEVER destroy history. When there IS
-    // overflow to summarize but the summary is empty/blank, refuse to act.
-    if (overflow.length > 0 && gistText === '') {
-      return { ok: false, code: 'summary_failed', preserved: true };
-    }
-
-    // (4) replace the overflow with ONE synthetic 'summary' entry.
-    let next = [...recentTail];
-    if (overflow.length > 0) {
-      const summaryEntry = buildEntry(addr, {
-        kind: 'summary',
-        text: gistText,
-        origin: 'auto',
-      });
-      // The summary is the OLDEST content now (it stands in for evicted history),
-      // so it sits before the verbatim recent tail.
-      next = [summaryEntry, ...recentTail];
-    }
-
-    // (5) if STILL over either bound, evict the oldest SUMMARIZED content first
-    // (never the recent verbatim tail) until BOTH bounds hold. The summary (if
-    // any) is the sole entry ahead of the recent tail, so eviction drops from
-    // the front and STOPS at the protected tail — the verbatim tail is never
-    // evicted (design.md §11 step 5).
+    // (2) keep the newest KEEP_RECENT verbatim; (3) summarize the oldest
+    // overflow into ONE synthetic 'summary' entry; (4)/(5) if the result is
+    // STILL over a bound, fold the OLDEST verbatim-tail entries into the summary
+    // (they are summarized, NOT dropped unsummarized) until BOTH caps hold.
     //
-    // This terminates within the caps by construction: keepRecent is guaranteed
-    // strictly < capEntries (resolveCaps), so once the summary is dropped the
-    // tail is <= capEntries - 1 <= capEntries; and addAuto refuses any single
-    // entry that alone exceeds capBytes, so the recent tail (each entry fits,
-    // and keepRecent leaves byte headroom) fits under capBytes. The protected
-    // tail is therefore always within both bounds, and the degenerate
-    // "evict into the tail" branch is unreachable on the auto add path.
-    let doc = { meta, entries: next };
-    while (!withinCaps(doc) && doc.entries.length > recentTail.length) {
-      doc = { meta, entries: doc.entries.slice(1) };
-    }
+    // This reconciles "never evict the verbatim tail unsummarized" with "must
+    // end within both caps": we shrink the protected tail from its oldest end,
+    // moving those entries into the summarized set, so a gist always represents
+    // any content that left the verbatim tail. The synthetic summary is the
+    // sole entry ahead of the tail, so nothing is ever dropped without a gist.
+    //
+    // Termination: keepRecent is clamped strictly < capEntries (resolveCaps),
+    // and addAuto refuses any single entry that alone exceeds capBytes. So the
+    // minimal state — the newest single entry plus a summary of everything else
+    // — is within both bounds, and the loop reaches a fitting state before the
+    // tail is exhausted in every realistic case (bounded per-entry text,
+    // capBytes comfortably larger than a single entry).
+    let keepRecentN = initialKeepRecentN;
+    let lastFit = null;
 
-    return { ok: true, entries: doc.entries };
+    for (;;) {
+      const recentTail = keepRecentN > 0 ? ordered.slice(ordered.length - keepRecentN) : [];
+      const overflow = ordered.slice(0, ordered.length - keepRecentN);
+
+      // (3) structured-summarize the oldest overflow.
+      let gist = '';
+      if (overflow.length > 0) {
+        try {
+          gist = summarizeFn(overflow);
+        } catch {
+          gist = '';
+        }
+      }
+      const gistText = typeof gist === 'string' ? gist.trim() : '';
+
+      // SAFEGUARD: a bad/empty summary must NEVER destroy history. When there IS
+      // overflow to summarize but the summary is empty/blank, refuse to act.
+      if (overflow.length > 0 && gistText === '') {
+        return { ok: false, code: 'summary_failed', preserved: true };
+      }
+
+      // (4) replace the overflow with ONE synthetic 'summary' entry, ahead of
+      // the verbatim recent tail (it stands in for the evicted/older content).
+      let next = [...recentTail];
+      if (overflow.length > 0) {
+        const summaryEntry = buildEntry(addr, {
+          kind: 'summary',
+          text: gistText,
+          origin: 'auto',
+        });
+        next = [summaryEntry, ...recentTail];
+      }
+
+      const doc = { meta, entries: next };
+      if (withinCaps(doc)) {
+        return { ok: true, entries: doc.entries };
+      }
+      lastFit = doc;
+
+      // Still over a bound. Fold the OLDEST verbatim-tail entry into the
+      // summarized set and retry, so it is summarized rather than dropped
+      // unsummarized. Stop when the tail is emptied — the next iteration
+      // summarizes everything into a single gist.
+      if (keepRecentN === 0) {
+        // Even a single summary of ALL content does not fit (a bound smaller
+        // than one summarized gist). Prefer preserving history + reporting a
+        // structured non-success over silently exceeding the cap.
+        return { ok: false, code: 'cap_unsatisfiable', preserved: true, entries: lastFit.entries };
+      }
+      keepRecentN -= 1;
+    }
   }
 
   // --- public operations (each bound to a resolved address) ----------------
@@ -554,6 +585,18 @@ export function createMemoryStore({
           message: `${MODEL}: summarization produced no gist; history preserved and the new entry was not added`,
         });
         return { ok: false, code: 'summary_failed', preserved: true, notified, message: `${MODEL}: summarization failed; history preserved` };
+      }
+      if (!result.ok && result.code === 'cap_unsatisfiable') {
+        // No summarized state fits within the caps (a bound smaller than a
+        // single gist). Prefer preserving history + a structured non-success
+        // over silently exceeding the cap OR reporting a false eviction. Do NOT
+        // fire an eviction-occurred notification while the store is over cap.
+        const notified = notifyUser({
+          type: 'cap-unsatisfiable',
+          scope: addr.scope,
+          message: `${MODEL}: memory cannot be brought within its cap automatically; history preserved and the new entry was not added`,
+        });
+        return { ok: false, code: 'cap_unsatisfiable', preserved: true, notified, message: `${MODEL}: cap cannot be satisfied automatically; history preserved` };
       }
 
       const nextDoc = { meta: doc.meta, entries: result.entries };

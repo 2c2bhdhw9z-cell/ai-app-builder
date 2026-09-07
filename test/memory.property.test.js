@@ -12,7 +12,11 @@
  *     store stays at or below BOTH the byte cap and the entry cap, and when
  *     eviction occurred the summarized gist is preserved (a synthetic 'summary'
  *     entry exists). Caps are small so eviction actually binds (non-vacuous);
- *     per-entry text is bounded so no single entry alone exceeds capBytes.
+ *     per-entry text is bounded so no single entry alone exceeds capBytes. Runs
+ *     three arms: entry-cap-bound, byte-cap-bound, and a collectively-oversized
+ *     recent-tail arm (small fixed capBytes + large keepRecent) that forces the
+ *     store to fold the oldest verbatim-tail entries into the gist to stay under
+ *     the byte cap, each with its own non-vacuity guard.
  *
  *   Property 17 (Task 24.4, Req 14.6/14.13) — "Memory is fully exportable":
  *     for all stores (a random sequence of addUser/addAuto/edit/delete under a
@@ -201,6 +205,85 @@ test('Feature: ai-app-builder, Property 16: Memory stays within cap', () => {
     fcConfig,
   );
   assert.equal(sawByteEviction, true, 'Property 16 byte cap is non-vacuous (byte-driven eviction fired)');
+
+  // Third arm: a SMALL FIXED capBytes with a LARGE keepRecent, so the CUMULATIVE
+  // recent verbatim tail (each entry fits under capBytes on its own) is forced
+  // OVER the byte cap. This is the collectively-oversized-tail case: keeping the
+  // full keepRecent tail verbatim would exceed capBytes, so the store must fold
+  // the OLDEST tail entries into the summarized gist until it fits — never
+  // leaving the store over the byte cap and never reporting a false eviction.
+  // The invariant asserted below (byte cap holds, gist preserved on eviction)
+  // FAILS if the fix is reverted: the old loop stopped at recentTail.length and
+  // persisted the over-cap tail with no summary.
+  //
+  // Sizing: capBytes 1600, keepRecent 12. A serialized entry is ~150-230 bytes,
+  // so ~12 entries (~2KB+) busts 1600 while a single entry (plus meta, ~200 B)
+  // fits well under it. Text is bounded (never a single-entry-over-cap case).
+  const tailText = fc
+    .array(fc.constantFrom(...'abcdefghijklmnopqrstuvwxyz '.split('')), { minLength: 30, maxLength: 90 })
+    .map((chars) => {
+      const s = chars.join('');
+      return s.trim() === '' ? `x${s}y` : s;
+    });
+  let sawTailFold = false;
+  fc.assert(
+    fc.property(
+      fc.array(fc.record({ kind: fc.constantFrom(...AUTO_KINDS), text: tailText }), { minLength: 16, maxLength: 60 }),
+      (adds) => {
+        const { base, layout } = tempLayout('aab-mem-p16c-');
+        const capBytes = 1600;
+        const keepRecent = 12; // large enough that the full verbatim tail busts capBytes
+        try {
+          const store = createMemoryStore({
+            layout,
+            now: FIXED_NOW,
+            notify: () => {},
+            capEntries: 1000, // high so the BYTE cap (via the tail) is the binding constraint
+            capBytes,
+            keepRecent,
+          });
+          const ps = store.projectStore('p1');
+          let evicted = false;
+          for (const a of adds) {
+            const r = ps.addAuto(a);
+            if (r.ok && r.evicted) evicted = true;
+            // A successful auto add (evicting or not) must leave the PERSISTED
+            // store within the byte cap — no false "evicted:true" over cap.
+            if (r.ok) {
+              assert.ok(
+                docBytes(ps) <= capBytes,
+                `byte cap holds after every successful add: ${docBytes(ps)} <= ${capBytes}`,
+              );
+            }
+          }
+          // Final state within BOTH bounds regardless of the add outcomes.
+          assert.ok(ps.list().length <= 1000, 'entry cap holds');
+          assert.ok(docBytes(ps) <= capBytes, `byte cap holds: ${docBytes(ps)} <= ${capBytes}`);
+          if (evicted) {
+            assert.ok(
+              ps.list().some((e) => e.kind === 'summary' && e.origin === 'auto'),
+              'tail-fold eviction preserves a synthetic summary gist',
+            );
+            // Non-vacuity for THIS arm: the cumulative tail was actually driven
+            // over the byte cap, forcing the fold-the-tail path — the surviving
+            // verbatim tail is strictly SMALLER than keepRecent (the full tail
+            // could not be kept verbatim under the byte cap).
+            const verbatimTail = ps.list().filter((e) => e.kind !== 'summary').length;
+            if (verbatimTail < keepRecent) sawTailFold = true;
+          }
+          return true;
+        } finally {
+          fs.rmSync(base, { recursive: true, force: true });
+        }
+      },
+    ),
+    fcConfig,
+  );
+  assert.equal(
+    sawTailFold,
+    true,
+    'Property 16 tail-fold arm is non-vacuous (cumulative tail forced over the byte cap, tail folded into the gist)',
+  );
 });
 
 // --- Property 17 -----------------------------------------------------------
