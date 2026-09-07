@@ -11,6 +11,24 @@
 
 export { createAuthService } from './auth-service.js';
 export {
+  createFailClosedIdpVerifier,
+  createGithubOAuthVerifier,
+  createGoogleOidcVerifier,
+  createJwksKeyStore,
+  verifyOidcIdToken,
+  resolveIdpVerifier,
+  IDP_PROVIDERS,
+  OIDC_ENV_VARS,
+  DEFAULT_CLOCK_TOLERANCE_SEC,
+} from './oidc-verifier.js';
+export {
+  createLoginFlow,
+  resolveLoginFlow,
+  LOGIN_STATE_COOKIE,
+  DEFAULT_LOGIN_STATE_TTL_MS,
+  DEFAULT_MAX_CONSUMED_STATES,
+} from './login-flow.js';
+export {
   createIdentityManager,
   createInMemoryAccountStore,
   toAuthIdentity,

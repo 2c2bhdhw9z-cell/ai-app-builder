@@ -33,6 +33,8 @@
 
 import { createBuilderServer } from './builder-server.js';
 import { createAuthService } from '../auth/index.js';
+import { resolveIdpVerifier, createFailClosedIdpVerifier } from '../auth/oidc-verifier.js';
+import { resolveLoginFlow } from '../auth/login-flow.js';
 import { composePlatformOps } from '../ops/index.js';
 import {
   createAnthropicProvider,
@@ -44,22 +46,12 @@ import {
 export const DEFAULT_PORT = 8080;
 
 /**
- * A FAIL-CLOSED default IdP verifier used when no real OIDC verifier is injected.
- *
- * The AuthService (via IdentityManager) requires an idpVerifier at construction,
- * so the process cannot boot without one. A real deployment injects a genuine
- * OIDC verifier; until it does, this placeholder makes every authentication
- * attempt DENY rather than silently authorizing anyone. That is the safe
- * default: the server still boots, the unauthenticated /healthz probe answers,
- * and the auth-gated routes stay closed. It never grants access on its own.
+ * The FAIL-CLOSED IdP verifier, re-exported from the auth subsystem where it now
+ * lives beside the REAL verifiers it is the safe fallback for
+ * (src/auth/oidc-verifier.js). Kept exported here because this entry point is
+ * where "what happens when identity is unconfigured" is decided.
  */
-export function createFailClosedIdpVerifier() {
-  return {
-    async verifyIdToken() {
-      throw new Error('no identity provider configured');
-    },
-  };
-}
+export { createFailClosedIdpVerifier };
 
 /**
  * The default bind host. 0.0.0.0 (all interfaces) so the server is reachable
@@ -125,13 +117,20 @@ export function resolveProvider(env = process.env) {
  * @param {object} [deps]
  * @param {Record<string,string|undefined>} [deps.env=process.env]
  * @param {(opts:object)=>object} [deps.createServer=createBuilderServer]
+ * @param {object} [deps.idpVerifier]  override the env-resolved IdP verifier
+ *        (tests inject a fake); omitted ⇒ resolveIdpVerifier(env), which is
+ *        FAIL-CLOSED unless OIDC_* is fully configured.
+ * @param {object} [deps.loginFlow]  override the env-resolved login flow;
+ *        omitted ⇒ resolveLoginFlow(env), which is null unless OIDC_* is fully
+ *        configured (so /auth/* stays unrouted).
  * @param {{ log: Function }} [deps.logger=console]
  * @returns {Promise<{ api: object, address: {port:number, host:string} }>}
  */
 export async function startPlatformServer({
   env = process.env,
   createServer = createBuilderServer,
-  idpVerifier = createFailClosedIdpVerifier(),
+  idpVerifier,
+  loginFlow,
   logger = console,
 } = {}) {
   const { port, host } = resolveBindConfig(env);
@@ -139,19 +138,46 @@ export async function startPlatformServer({
   // The composition root wires ONE redactor + audit log + observability.
   const composed = composePlatformOps();
 
-  // Auth gates every non-health request. The IdentityManager requires an
-  // idpVerifier at construction; when a real OIDC verifier is not injected the
-  // fail-closed default DENIES every authentication attempt, so the server
-  // boots and /healthz answers while the auth-gated routes stay closed.
+  // IDENTITY. Auth gates every non-health request, so this decides whether the
+  // deployment is usable at all. A real, env-driven OIDC/OAuth verifier is built
+  // from OIDC_* when it is FULLY configured; anything else (unset, unknown
+  // provider, or missing credentials) yields the fail-closed verifier that
+  // DENIES every attempt. The resolution is logged either way so a deploy log
+  // says plainly whether login is open for business and, if not, what is missing.
+  const resolvedIdp = idpVerifier
+    ? { verifier: idpVerifier, configured: true, provider: null, missing: [], reason: 'injected verifier' }
+    : resolveIdpVerifier(env);
+  if (!resolvedIdp.configured) {
+    logger.log(`ai-app-builder identity: LOGIN DISABLED — ${resolvedIdp.reason}`);
+  } else if (resolvedIdp.provider) {
+    logger.log(`ai-app-builder identity: ${resolvedIdp.provider} login enabled`);
+  }
+
   const authService = createAuthService({
-    idpVerifier,
+    idpVerifier: resolvedIdp.verifier,
     auditSink: composed.auditLog,
   });
+
+  // LOGIN SURFACE. Without a flow, nothing on the wire can mint a session token
+  // (authenticate/scopeSession are in-process only), so a configured deploy gets
+  // GET /auth/login + /auth/callback. Unconfigured ⇒ null ⇒ those paths are not
+  // routed at all, rather than advertising a login that cannot succeed.
+  //
+  // GATED ON THE VERIFIER's verdict, not re-derived from env: the two resolvers
+  // would otherwise reach independent conclusions, and a deploy could route
+  // /auth/* while the verifier had failed closed — logging both "LOGIN DISABLED"
+  // and a callback URL, then failing every exchange. Routing a login surface now
+  // IMPLIES a usable verifier.
+  const flow = loginFlow ?? (resolvedIdp.configured ? resolveLoginFlow(env, { authService }) : null);
+  if (flow) {
+    logger.log(`ai-app-builder login callback expects redirect_uri ${flow.redirectUri}`);
+  }
 
   const provider = resolveProvider(env);
 
   const api = createServer({
     authService,
+    ...(flow ? { loginFlow: flow } : {}),
     provider,
     observability: composed.observability,
   });
