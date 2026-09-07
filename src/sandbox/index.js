@@ -34,6 +34,8 @@ export {
   createContainerBackend,
   containerRuntimeAvailable,
   buildRunArgs,
+  buildServiceArgs,
+  renderPublishSpec,
   cgroupFlagsFor,
   WORKSPACE_MOUNT_PATH,
   DEFAULT_IMAGE,
@@ -41,6 +43,7 @@ export {
   NETWORK_DENY_ALL,
   NETWORK_FILTERED,
   EGRESS_FILTERING_UNSUPPORTED,
+  PUBLISH_REQUIRES_ROUTABLE_NETWORK,
 } from './container-backend.js';
 
 export {

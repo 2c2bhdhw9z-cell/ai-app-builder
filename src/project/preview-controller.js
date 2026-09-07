@@ -368,6 +368,13 @@ export function createPreviewController({
     const s = stateFor(projectId);
     const hadServed = s.served !== null;
     s.devServer = null; // the process is gone; served state is preserved.
+    // HONESTY of the served URL, same rule publish() applies: the committed
+    // snapshot is RETAINED (Property 3 is about snapshot identity), but the URL it
+    // was served at no longer answers, so we stop advertising it. servedPreview
+    // therefore reports 'committed' with url:null rather than 'served' — otherwise
+    // a crashed Dev_Server left the surface claiming a live preview forever, which
+    // is exactly the dishonesty the placeholder URL was faulted for.
+    if (s.served) s.served.url = null;
     return {
       ok: true,
       status: 'exited',

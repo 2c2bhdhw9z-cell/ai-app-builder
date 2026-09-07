@@ -178,9 +178,19 @@ test('DEPLOY.md documents every environment variable the code actually reads', (
 test('DEPLOY.md states the fail-closed posture and the honest limits', () => {
   // These are the claims a reader most needs to be true.
   assert.match(deployDoc, /fail-closed/i);
-  // The two product limits this wiring pass must not imply away.
-  assert.match(deployDoc, /No real Preview is served/i);
+  // Product limits this wiring pass must not imply away.
   assert.match(deployDoc, /package installs cannot work/i);
+  // The Preview follow-up is DONE, so the doc must no longer claim otherwise —
+  // but it must still be honest about the two things that replaced that claim:
+  // the default is still the inert placeholder, and the live path is a decision
+  // with an egress consequence that only a container host can confirm.
+  assert.match(deployDoc, /AAB_PREVIEW_NETWORK/, 'the knob that makes a Preview real must be documented');
+  assert.match(deployDoc, /preview\.local/, 'the inert default must still be described as a placeholder');
+  assert.match(
+    deployDoc,
+    /only a real container host can prove/i,
+    'the container-host-only claims must stay separated from what tests prove',
+  );
   // The verified-by-test versus needs-a-real-deploy split.
   assert.match(deployDoc, /require a real deploy/i);
   // The socket mount is a privilege decision, not a checkbox.

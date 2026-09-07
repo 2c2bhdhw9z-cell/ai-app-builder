@@ -75,6 +75,26 @@ export const NETWORK_FILTERED = 'filtered';
  */
 const CLI_ENFORCEABLE_NETWORKS = Object.freeze(['none']);
 
+/**
+ * Message used when a published port is requested on a network mode that cannot
+ * carry inbound traffic.
+ *
+ * WHY THIS IS AN ERROR AND NOT A WARNING. A published port is only reachable if
+ * three things line up: a runtime NAT/DNAT rule (`-p`), a route from the host to
+ * the container (a veth pair on a bridge), and a listener inside the container.
+ * `--network none` gives the container ONLY a loopback interface — there is no
+ * veth and no container IP, so the DNAT rule has no target and the published
+ * port serves nothing. Accepting the combination would hand a caller a preview
+ * URL that can never answer, which is precisely the dishonesty the Dev_Server
+ * seam was faulted for. So we refuse the launch and say why.
+ */
+export const PUBLISH_REQUIRES_ROUTABLE_NETWORK =
+  'published ports require a routable network: `--network none` gives the container ' +
+  'only a loopback interface (no veth, no container IP), so a published port has no ' +
+  'DNAT target and can never be reached. Launching would yield a preview URL that ' +
+  'serves nothing, so the request is DENIED. Configure a concrete container network ' +
+  'that permits inbound traffic for the preview container (see AAB_PREVIEW_NETWORK).';
+
 /** Message used when a populated egress allowlist cannot be enforced. */
 export const EGRESS_FILTERING_UNSUPPORTED =
   'egress filtering not supported by this backend: a populated egress allowlist ' +
@@ -181,7 +201,41 @@ export function cgroupFlagsFor(limits = {}) {
 }
 
 /**
- * Build the `docker run` argument vector for a one-shot command.
+ * Validate + render one port-publish spec into a `-p` value.
+ *
+ * Ports are rendered into the runtime argv, so they are validated as integers in
+ * the legal TCP range and the host IP is restricted to a literal address. This is
+ * belt-and-braces (we never interpolate through a shell — execFile takes an argv
+ * vector) but it keeps a malformed/hostile port from ever reaching the CLI.
+ *
+ * @param {{hostIp?:string, hostPort:number, containerPort:number}} spec
+ * @returns {string} e.g. '127.0.0.1:43001:5173'
+ */
+export function renderPublishSpec(spec) {
+  const { hostIp = '127.0.0.1', hostPort, containerPort } = spec ?? {};
+  for (const [field, value] of [['hostPort', hostPort], ['containerPort', containerPort]]) {
+    if (!Number.isInteger(value) || value < 1 || value > 65_535) {
+      throw new TypeError(`publish.${field} must be an integer in 1..65535, got ${JSON.stringify(value)}`);
+    }
+  }
+  // A literal IPv4 address or a bracketed IPv6 literal only — never a hostname,
+  // which the runtime would resolve at launch time.
+  if (typeof hostIp !== 'string' || !/^(?:\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:]+\])$/.test(hostIp)) {
+    throw new TypeError(`publish.hostIp must be a literal IP address, got ${JSON.stringify(hostIp)}`);
+  }
+  return `${hostIp}:${hostPort}:${containerPort}`;
+}
+
+/**
+ * Build the `docker run` argument vector for a one-shot command, or — with
+ * `detach` — for a LONG-RUNNING service container (the Dev_Server preview).
+ *
+ * The one-shot defaults are unchanged: `detach:false`, `autoRemove:true`, no
+ * published ports produces exactly the argv this builder always produced. The
+ * service flags are additive so BOTH shapes share one definition of the
+ * isolation flags (`--pid private`, `--network`, `--security-opt`, the mount and
+ * the label) — a preview container must not be able to drift into weaker
+ * isolation than an exec container.
  *
  * SECRET ENV INJECTION (spec subtask 7.1): when `env` is a { NAME: value } map,
  * we emit NAME-ONLY `-e NAME` references — NEVER `-e NAME=value` — so the secret
@@ -208,9 +262,17 @@ export function buildRunArgs(spec) {
     command = [],
     labelValue,
     env,
+    detach = false,
+    autoRemove = true,
+    publish = [],
   } = spec;
 
-  const args = ['run', '--rm'];
+  const args = ['run'];
+  // A one-shot run self-cleans. A DETACHED service deliberately does NOT: we keep
+  // the exited container so `logs`/`inspect` can explain WHY a dev server died,
+  // and remove it explicitly on stop (and via the owner-label reaper).
+  if (autoRemove) args.push('--rm');
+  if (detach) args.push('-d');
   // (c) Private PID namespace is the default for a fresh container; being
   // explicit documents the intent and guards against a changed runtime default.
   args.push('--pid', 'private');
@@ -219,6 +281,12 @@ export function buildRunArgs(spec) {
   args.push('--network', network);
   // Never gain privileges beyond the image; drop the ambient set.
   args.push('--security-opt', 'no-new-privileges');
+  // Inbound port publishing (the Dev_Server preview). Bound to an explicit host
+  // IP — defaulting to loopback — so a preview is never published on every host
+  // interface by accident.
+  for (const one of Array.isArray(publish) ? publish : []) {
+    args.push('-p', renderPublishSpec(one));
+  }
   if (name) args.push('--name', name);
   if (labelValue) args.push('--label', `${OWNER_LABEL}=${labelValue}`);
   // (b) ONLY this project's tree, mounted at the fixed workspace path.
@@ -239,6 +307,18 @@ export function buildRunArgs(spec) {
   args.push(image);
   args.push(...command);
   return args;
+}
+
+/**
+ * Build the `docker run` argv for a LONG-RUNNING service container: detached,
+ * NOT auto-removed (so a crash leaves logs to read), otherwise carrying exactly
+ * the same isolation flags as a one-shot run.
+ *
+ * @param {object} spec  same shape as buildRunArgs, plus `publish`
+ * @returns {string[]}
+ */
+export function buildServiceArgs(spec) {
+  return buildRunArgs({ ...spec, detach: true, autoRemove: false });
 }
 
 /**
@@ -420,6 +500,159 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
   }
 
   /**
+   * Start a LONG-RUNNING service container (the Dev_Server behind a Preview) and
+   * return as soon as the runtime has accepted it — the process keeps running
+   * inside the container after this resolves.
+   *
+   * This is the capability the Dev_Server seam was missing: `runOneShot` awaits
+   * completion, so a dev server started through it would block forever (and, being
+   * serialized per project by the manager's mutex, would deadlock every other
+   * command for that project). A service is detached instead, and its readiness is
+   * established by the CALLER probing the published URL.
+   *
+   * FAIL-CLOSED, twice:
+   *   - a network mode this backend cannot honestly enforce (NETWORK_FILTERED) is
+   *     refused, exactly as in runOneShot;
+   *   - a published port on a non-routable network (`none`) is refused, because it
+   *     would produce a preview URL that can never answer.
+   *
+   * @param {object} svc
+   * @param {string} svc.name             container name (used for stop/inspect/logs)
+   * @param {string} [svc.labelValue]     owner-label value (defaults to name) so the
+   *        existing label reaper and per-project release() tear this container down
+   * @param {string} svc.mountSource      host path to bind-mount (this project's tree ONLY)
+   * @param {string[]} svc.command        command vector to run in the container
+   * @param {Array<{hostIp?:string,hostPort:number,containerPort:number}>} [svc.publish]
+   * @param {string} [svc.network]        concrete container network (NOT 'none' when publishing)
+   * @param {object} [svc.limits]         { memoryMb, cpus, pids }
+   * @param {Object<string,string>} [svc.env]  name-only `-e NAME` refs; values via child env
+   * @param {number} [svc.timeoutMs]      wall-clock limit for the LAUNCH call itself
+   * @returns {Promise<{ ok:boolean, containerId:string|null, code, stdout, stderr, timedOut,
+   *                     limitsApplied:boolean, degraded:boolean }>}
+   */
+  async function startService({
+    name,
+    labelValue,
+    mountSource,
+    workspacePath = WORKSPACE_MOUNT_PATH,
+    command = [],
+    publish = [],
+    limits = {},
+    network = NETWORK_DENY_ALL,
+    readOnlyMount = false,
+    env,
+    image: serviceImage = image,
+    timeoutMs = 60_000,
+    signal,
+  } = {}) {
+    if (typeof name !== 'string' || name.trim() === '') {
+      throw new TypeError('startService: name must be a non-empty string');
+    }
+    // Same fail-closed rule as runOneShot: never fake egress enforcement.
+    if (network === NETWORK_FILTERED) {
+      throw new Error(EGRESS_FILTERING_UNSUPPORTED);
+    }
+    const publishList = Array.isArray(publish) ? publish : [];
+    // Never hand back a preview URL that physically cannot answer.
+    if (publishList.length > 0 && network === NETWORK_DENY_ALL) {
+      throw new Error(PUBLISH_REQUIRES_ROUTABLE_NETWORK);
+    }
+
+    const cgroupFlags = cgroupFlagsFor(limits);
+    const requestedLimits = cgroupFlags.length > 0;
+    const hasEnv = env && typeof env === 'object' && Object.keys(env).length > 0;
+    const childEnv = hasEnv ? { ...env } : undefined;
+
+    const baseSpec = {
+      image: serviceImage,
+      name,
+      mountSource,
+      workspacePath,
+      network,
+      readOnlyMount,
+      labelValue: labelValue ?? name,
+      command,
+      publish: publishList,
+      env: hasEnv ? env : undefined,
+    };
+
+    let res = await exec(bin, buildServiceArgs({ ...baseSpec, cgroupFlags }), { timeoutMs, signal, childEnv });
+
+    // Same graceful cgroup degrade as runOneShot. One extra step matters here: a
+    // `run -d` that fails AFTER the container was created still holds the name, so
+    // the retry would fail with a name conflict. Remove it first.
+    let limitsApplied = requestedLimits;
+    let degraded = false;
+    if (requestedLimits && res.code !== 0 && !res.timedOut && looksLikeCgroupRejection(res.stderr)) {
+      degraded = true;
+      limitsApplied = false;
+      await remove(name);
+      res = await exec(bin, buildServiceArgs({ ...baseSpec, cgroupFlags: [] }), { timeoutMs, signal, childEnv });
+    }
+
+    // `run -d` prints the new container id on stdout.
+    const containerId = res.code === 0 ? (res.stdout.trim().split(/\s+/)[0] || null) : null;
+    return {
+      ok: res.code === 0 && res.timedOut !== true,
+      containerId,
+      code: res.code,
+      stdout: res.stdout,
+      stderr: res.stderr,
+      timedOut: res.timedOut,
+      limitsApplied: requestedLimits ? limitsApplied : false,
+      degraded,
+    };
+  }
+
+  /**
+   * Inspect a service container's liveness. Used to distinguish "still starting"
+   * from "already died" while polling readiness, so a crashed dev server is
+   * reported immediately with its exit code instead of after the full timeout.
+   *
+   * A missing container (or an absent runtime) is reported as
+   * `{ ok:false, exists:false }` — never thrown.
+   *
+   * @returns {Promise<{ ok:boolean, exists:boolean, running:boolean, exitCode:number|null }>}
+   */
+  async function serviceStatus(name) {
+    if (!name) return { ok: false, exists: false, running: false, exitCode: null };
+    const res = await exec(bin, ['inspect', '--format', '{{.State.Running}} {{.State.ExitCode}}', name], {
+      timeoutMs: 10_000,
+    });
+    if (res.code !== 0) {
+      return { ok: false, exists: false, running: false, exitCode: null, code: res.code, stderr: res.stderr };
+    }
+    const [runningRaw, exitRaw] = res.stdout.trim().split(/\s+/);
+    const exitCode = Number.isInteger(Number(exitRaw)) ? Number(exitRaw) : null;
+    return { ok: true, exists: true, running: runningRaw === 'true', exitCode };
+  }
+
+  /**
+   * Read the tail of a service container's logs. A dev server writes its listen
+   * banner and its stack traces here, so this is what makes a preview failure
+   * explainable rather than just "it timed out". Never throws.
+   *
+   * @returns {Promise<{ ok:boolean, logs:string }>}
+   */
+  async function serviceLogs(name, { tail = 50 } = {}) {
+    if (!name) return { ok: false, logs: '' };
+    const lines = Number.isInteger(tail) && tail > 0 ? tail : 50;
+    const res = await exec(bin, ['logs', '--tail', String(lines), name], { timeoutMs: 10_000 });
+    // A dev server logs to BOTH streams; the combined tail is what a human wants.
+    const logs = [res.stdout, res.stderr].filter((s) => typeof s === 'string' && s !== '').join('\n');
+    return { ok: res.code === 0, logs };
+  }
+
+  /**
+   * Stop AND remove a service container. `rm -f` does both, and is idempotent —
+   * a container that is already gone is the desired end state.
+   */
+  async function stopService(name) {
+    const res = await remove(name);
+    return { ok: res.removed === true, stopped: res.removed === true, code: res.code, stderr: res.stderr };
+  }
+
+  /**
    * Instance-scoped runtime probe: can this backend actually LAUNCH a
    * container? Delegates to the module-level containerRuntimeAvailable() using
    * this backend's bin/exec, so tests that inject a fake `exec` can drive it.
@@ -436,12 +669,20 @@ export function createContainerBackend({ bin = 'docker', image = DEFAULT_IMAGE, 
     runOneShot,
     remove,
     reapOrphans,
+    // Long-running service containers (the Dev_Server behind a Preview).
+    startService,
+    serviceStatus,
+    serviceLogs,
+    stopService,
     // Capability flag: a plain docker/OCI CLI backend can enforce total-deny
     // ('none') but NOT per-host egress filtering. A future CNI/firewall-capable
     // or gVisor/Firecracker backend sets this true and enforces NETWORK_FILTERED.
     supportsEgressFiltering: false,
+    // Capability flag: this backend CAN run detached, port-publishing containers.
+    supportsServices: true,
     // Exposed for tests / introspection.
     buildRunArgs,
+    buildServiceArgs,
     cgroupFlagsFor,
   });
 }
