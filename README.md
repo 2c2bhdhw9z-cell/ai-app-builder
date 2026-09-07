@@ -9,6 +9,32 @@ Supports four target categories: **web**, **full-stack web**, **mobile** (Expo/R
 Native), and **multi-target** (web + mobile + backend with shared code), each with a
 live preview.
 
+## Running it
+
+```bash
+npm ci
+PORT=8080 HOST=0.0.0.0 npm start
+curl -fsS http://localhost:8080/healthz    # -> {"status":"ok"}
+```
+
+That boots the server, but the auth-gated routes deliberately stay closed until an
+identity provider is configured: the platform is **fail-closed**, so an
+unconfigured deploy answers the health probe, denies every login, and routes no
+`/auth/*` surface at all. Configure `OIDC_PROVIDER` (`github` or `google`) plus its
+client id/secret/redirect URI to open it, and set a model provider key so turns can
+run.
+
+**[`docs/DEPLOY.md`](docs/DEPLOY.md) is the complete guide** — every environment
+variable, provider setup, the login walkthrough, systemd and container recipes
+(note: the container build context is the *parent* directory, because `plumby` is a
+`file:../plumby` sibling), and an explicit list of what is verified by the test
+suite versus what only a real deploy can prove.
+
+Two limits worth knowing before you deploy, both covered in detail there: no real
+Preview is served yet (the DevServer behind the wired preview lifecycle is an inert
+seam), and the default sandbox egress posture is "no network", so package installs
+cannot run inside a Project sandbox.
+
 ## Architecture
 
 Three independent, standalone repositories — each usable on its own:
@@ -48,5 +74,6 @@ The full specification lives under `.kiro/specs/ai-app-builder/`:
   property-based testing.
 - `design.md` — technical design: how it sits on top of plumby, the subsystems, data
   models, testing strategy, and security/isolation model.
+- `tasks.md` — the implementation plan, fully built out.
 
-Implementation tasks are the next step.
+Run the suite with `npm test` (hermetic: no network, no API key, no container).
