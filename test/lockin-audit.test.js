@@ -327,6 +327,42 @@ test('an incremental re-audit does NOT falsely flag unused-env when the sole rea
   assert.equal(orphanFindings[0].evidence, 'ORPHAN_KEY');
 });
 
+test('an incremental re-audit clears a stale unused-env when a CHANGED reader now reads the var (template unchanged)', () => {
+  const audit = createLockinAudit({ now: stepClock(1) });
+  // Prior: a template declares ORPHAN, read NOWHERE — genuinely unused, flagged.
+  const prior = audit.audit(PROJECT, {
+    tree: {
+      '.env.template': 'ORPHAN=\n',
+    },
+  });
+  assert.equal(prior.ok, true);
+  const priorOrphan = prior.findings.filter((f) => f.signal === 'unused-env');
+  assert.equal(priorOrphan.length, 1, 'prior: ORPHAN is genuinely unused');
+  assert.equal(priorOrphan[0].evidence, 'ORPHAN');
+  assert.equal(priorOrphan[0].file, '.env.template');
+
+  // Current: a NEW reader src/r.ts reads process.env.ORPHAN; the template is
+  // UNCHANGED. changedFiles names only the reader. Under the pre-fix
+  // carry-forward the stale unused-env (on the unchanged template's path) would
+  // survive because it is filtered only by the finding's OWN file. The fix
+  // recomputes the cross-file signal over the full tree, so ORPHAN is no longer
+  // reported unused now that it is read.
+  const next = audit.audit(PROJECT, {
+    tree: {
+      '.env.template': 'ORPHAN=\n',
+      'src/r.ts': 'export const k = process.env.ORPHAN;\n',
+    },
+    priorResult: prior,
+    changedFiles: ['src/r.ts'],
+  });
+  assert.equal(next.ok, true);
+  assert.equal(
+    next.findings.filter((f) => f.signal === 'unused-env').length,
+    0,
+    'ORPHAN is now read by the changed src/r.ts — the stale unused-env must NOT carry forward',
+  );
+});
+
 // --- CLEAN generated template positive control (Req 11.1, Property 15 basis) -
 
 test('every clean generated template reports no findings (detectors are not no-ops)', () => {

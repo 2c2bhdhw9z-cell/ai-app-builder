@@ -140,6 +140,16 @@ const SOURCE_EXT_RE = /\.(ts|tsx|js|mjs|cjs|jsx)$/i;
 /** Env-template basenames whose declared-but-unread vars are a signal. */
 const ENV_TEMPLATE_BASENAMES = new Set(['.env.template', '.env.example', '.env.sample']);
 
+/**
+ * WHOLE-TREE / CROSS-FILE signals: their truth depends on files OUTSIDE the
+ * finding's own path (e.g. `unused-env` is a function of whether ANY other file
+ * reads the var), so they CANNOT be carried forward from a prior incremental
+ * result — a carried finding would go stale when an unrelated reader changes.
+ * These are excluded from the carry-forward set and recomputed fresh over the
+ * FULL current tree on every incremental pass. Per-file signals are not here.
+ */
+const CROSS_FILE_SIGNALS = new Set(['unused-env']);
+
 /** A generic outbound URL host literal (for the undeclared-host detector). */
 const OUTBOUND_URL_RE = /https?:\/\/([a-z0-9.-]+)/gi;
 
@@ -637,8 +647,18 @@ export function createLockinAudit({
         fail(model, 'priorResult must be a successful prior audit result with findings[]');
       }
       const changedSet = new Set(changedFiles);
-      // Prior findings/surfaces for files that did NOT change carry forward.
-      const carriedFindings = prior.findings.filter((f) => !changedSet.has(f.file));
+      // Prior findings/surfaces for files that did NOT change carry forward —
+      // EXCEPT whole-tree / cross-file signals, whose truth depends on files
+      // OUTSIDE the finding's own path and so cannot be carried forward safely.
+      // `unused-env` is such a signal: a stale "unused" finding on an UNCHANGED
+      // template must not survive when a CHANGED reader now reads the var (the
+      // reverse of the changed-template/unchanged-reader case). We drop carried
+      // cross-file findings and recompute them fresh over the FULL tree below,
+      // while per-file detector findings (telemetry/badges/…) still carry
+      // forward for unchanged files.
+      const carriedFindings = prior.findings.filter(
+        (f) => !changedSet.has(f.file) && !CROSS_FILE_SIGNALS.has(f.signal),
+      );
       const carriedSurfaces = (prior.unverifiedSurfaces ?? []).filter(
         (s) => !changedSet.has(s.file),
       );
@@ -653,7 +673,20 @@ export function createLockinAudit({
       // cross-file gap). Per-file detectors still run over the changed subset.
       const { textFiles: fullTextFiles } = partition(tree);
       const rescanned = detect(changedTree, fullTextFiles);
-      findings = [...carriedFindings, ...rescanned.findings];
+      // Recompute cross-file signals fresh over EVERY template in the current
+      // tree (not just the changed subset) so both directions are consistent:
+      // a changed reader that now reads a previously-unread var clears the stale
+      // finding, and a genuinely-unread var is still flagged. The env-read index
+      // spans the full tree via the same fullTextFiles.
+      const crossFileFindings = [];
+      scanUnusedEnv(fullTextFiles, buildEnvReadIndex(fullTextFiles), crossFileFindings);
+      // The changed subset's own unused-env findings were computed inside
+      // detect() above; drop them so the whole-tree recompute is the single
+      // source of truth (avoids double-counting a changed template).
+      const rescannedNonCrossFile = rescanned.findings.filter(
+        (f) => !CROSS_FILE_SIGNALS.has(f.signal),
+      );
+      findings = [...carriedFindings, ...rescannedNonCrossFile, ...crossFileFindings];
       unverifiedSurfaces = [...carriedSurfaces, ...rescanned.unverifiedSurfaces];
     } else {
       const detected = detect(tree);
