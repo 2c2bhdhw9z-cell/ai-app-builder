@@ -105,6 +105,24 @@ export {
   DEFAULT_MOBILE_BUILD_EXECUTION_TIMEOUT_MS,
 } from './mobile-build-service.js';
 
+// The Multi-Target coordinator (Task 26.3, Req 16.2-16.8): coordinates the
+// EXACTLY four Targets web/mobile/backend/shared derived from the closed Target
+// enum. Propagates a completed `shared` modification to web/mobile/backend
+// within 5s with ALL-OR-NOTHING / last-good semantics (a failed/over-budget
+// propagation retains the last good `shared` version in ALL Targets and names
+// the failed one(s)). REUSES the PreviewController.selectTarget selector (web
+// default + explicit defaultUsed; INVALID_TARGET rejection) rather than building
+// a second one, and composes the FEAT-002 build service so a build produces
+// exactly one artifact per requested Target and none for unrequested — a failed
+// Target build still completes the others, names the failed Target, produces no
+// artifact for it, and preserves prior artifacts; an invalid requested Target
+// rejects the whole request naming it. The 5s SLO is measured against an
+// injected clock (offline SEAM boundary).
+export {
+  createMultiTargetCoordinator,
+  PROPAGATION_SLO_MS,
+} from './multi-target.js';
+
 import { createProjectOrigin as createProjectOriginImpl } from './project-origins.js';
 import { createTemplateProvider as createTemplateProviderImpl } from './templates.js';
 
