@@ -380,29 +380,53 @@ export function createBuildService({
       }
       const outcome = guardResult?.outcome ?? 'refuse';
       const executed = guardResult?.executed === true;
+      // A boundary-level refusal (launch-failure / timeout) surfaces on the
+      // guard result as `denied === true` on a command that DID reach exec
+      // (`executed === true`) — DISTINCT from a non-zero in-box exit, and DISTINCT
+      // from a declined/timed-out confirm (which is `executed:false, denied:true`
+      // and is handled by the confirm branch below). Even an allow-class command
+      // that reached the boundary can be denied there, so such a denial must NOT
+      // be treated as a permitted gate.
+      const boundaryDenied = guardResult?.denied === true && executed;
       // The guard EXECUTES an allow-class command (or a granted confirm) via the
       // boundary's exec. But our deploy work is done by the deployBoundary seam,
       // not by exec here; the guard's role is purely the classify/consent gate.
       // So we require the gate to have PERMITTED the command:
-      //   - allow: permitted (executed true).
-      //   - confirm + confirmed: permitted (consent granted within 60s).
+      //   - allow: permitted (executed true AND not boundary-denied).
+      //   - confirm + confirmed: permitted (consent granted within 60s AND not
+      //     boundary-denied).
       //   - confirm + denied/timeout: NOT permitted -> do not deploy.
       //   - refuse / failed-closed: NOT permitted -> do not deploy.
+      //   - boundary-denied (launch-failure/timeout): NOT permitted -> do not deploy.
       const permitted =
-        (outcome === 'allow' && executed) ||
-        (outcome === 'confirm' && guardResult?.confirmed === true);
+        !boundaryDenied &&
+        ((outcome === 'allow' && executed) ||
+          (outcome === 'confirm' && guardResult?.confirmed === true));
       if (!permitted) {
-        const code = outcome === 'confirm' ? 'DEPLOY_CONFIRM_DENIED' : 'DEPLOY_REFUSED';
+        let code;
+        let message;
+        if (boundaryDenied) {
+          // The gate command was denied at the Isolation_Boundary (launch-failure
+          // / timeout), not by the classifier. Do not proceed to deploy.
+          code = 'DEPLOY_DENIED';
+          message =
+            guardResult?.deniedReason ??
+            guardResult?.reason ??
+            'deploy command was denied at the isolation boundary';
+        } else if (outcome === 'confirm') {
+          code = 'DEPLOY_CONFIRM_DENIED';
+          message = guardResult?.reason ?? 'deploy confirmation was not granted within the consent ceiling';
+        } else {
+          code = 'DEPLOY_REFUSED';
+          message = guardResult?.reason ?? 'deploy command was refused by the permission classifier';
+        }
         return failDeploy({
           projectId,
           targetKind,
           priorState,
           code,
           outcome,
-          message:
-            outcome === 'confirm'
-              ? (guardResult?.reason ?? 'deploy confirmation was not granted within the consent ceiling')
-              : (guardResult?.reason ?? 'deploy command was refused by the permission classifier'),
+          message,
         });
       }
     }

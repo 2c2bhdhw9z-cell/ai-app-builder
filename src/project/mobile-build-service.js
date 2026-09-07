@@ -242,6 +242,14 @@ export function createMobileBuildService({
 
     const priorArtifact = artifacts.get(projectId) ?? null;
 
+    // Snapshot the injected clock BEFORE the boundary runs so the execution
+    // phase is MEASURED against `now()` (like build/deploy/propagation), not
+    // merely trusted from the boundary's self-report. The boundary remains the
+    // authority on WHERE queue ends and execution begins (it reports queuedMs),
+    // but the total elapsed is a real clock delta, so execution time is
+    // total-elapsed minus the queued portion. A dropped execution clock advance
+    // therefore lowers the measured execution time and is detectable.
+    const startedAt = now();
     let result;
     try {
       result = await mobileBuildBoundary({ projectId, executionTimeoutMs, signal });
@@ -282,8 +290,14 @@ export function createMobileBuildService({
       emitObservability({ type: 'mobile.build', projectId, ok: true, status: 'queued', queuedMs });
     }
 
-    // (c) EXECUTION PHASE — the execution delta ONLY (queue time excluded).
-    const executionMs = typeof result?.executionMs === 'number' ? Math.max(0, result.executionMs) : 0;
+    // (c) EXECUTION PHASE — the execution delta ONLY (queue time excluded),
+    // MEASURED on the injected clock. The total elapsed since the boundary
+    // started is a real `now()` delta; subtracting the boundary-reported queue
+    // time yields the execution time measured against the clock. This is what
+    // the timeout gate compares, so the SLO cannot be defeated by a boundary
+    // that under-reports execution (or by a dropped execution clock advance).
+    const totalElapsedMs = Math.max(0, now() - startedAt);
+    const executionMs = Math.max(0, totalElapsedMs - queuedMs);
     const verdict = classifyExit(result);
 
     // Over the configured execution timeout -> BUILD_TIMEOUT, no artifact (Req 15.7).

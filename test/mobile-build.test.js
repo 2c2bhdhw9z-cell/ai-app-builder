@@ -205,6 +205,65 @@ test('buildMobile: a LONG queue + a SHORT execution SUCCEEDS (queue time is NOT 
   assert.equal(fs.readFileSync(res.artifactPath, 'utf8'), `mobile-artifact:${PROJECT_ID}`);
 });
 
+test('buildMobile: executionMs is MEASURED against the injected clock (not the boundary self-report) (Req 15.4)', async () => {
+  const clock = manualClock();
+  const layout = tempLayout();
+  const queuedMs = 300_000;
+  const executionMs = 120_000;
+  // A boundary that advances the clock for BOTH phases but UNDER-REPORTS its own
+  // executionMs. Because the service measures execution as (clock delta - queue),
+  // it must report the REAL clock-measured execution, not the boundary's number.
+  const underReporting = async ({ projectId }) => {
+    clock.advance(queuedMs);
+    clock.advance(executionMs);
+    return {
+      queuedMs,
+      executionMs: 1, // deliberately wrong / under-reported
+      exitStatus: 0,
+      bytes: `mobile-artifact:${projectId}`,
+      stderr: '',
+    };
+  };
+  const svc = createMobileBuildService({ layout, mobileBuildBoundary: underReporting, now: clock });
+
+  const res = await svc.buildMobile({ projectId: PROJECT_ID });
+  // MUTATION SENSITIVITY: if the service trusted result.executionMs instead of
+  // measuring the clock, res.executionMs would be 1. It measures the clock delta
+  // minus the queued portion, so a dropped/wrong execution advance is detectable.
+  assert.equal(res.ok, true);
+  assert.equal(res.queuedMs, queuedMs);
+  assert.equal(res.executionMs, executionMs);
+  assert.notEqual(res.executionMs, 1);
+});
+
+test('buildMobile: a dropped execution clock advance is DETECTED (execution measured on the clock) (Req 15.4)', async () => {
+  const clock = manualClock();
+  const layout = tempLayout();
+  const queuedMs = 1000;
+  // A buggy boundary that CLAIMS a huge execution but never advances the clock
+  // for it. A clock-measured service sees ~0 execution; a self-reporting one
+  // would (wrongly) time out. This pins that execution is a real clock delta.
+  const droppedAdvance = async ({ projectId }) => {
+    clock.advance(queuedMs); // queue advances...
+    // ...but NO execution advance, despite claiming one past the timeout.
+    return {
+      queuedMs,
+      executionMs: DEFAULT_MOBILE_BUILD_EXECUTION_TIMEOUT_MS + 1,
+      exitStatus: 0,
+      bytes: `mobile-artifact:${projectId}`,
+      stderr: '',
+    };
+  };
+  const svc = createMobileBuildService({ layout, mobileBuildBoundary: droppedAdvance, now: clock });
+
+  const res = await svc.buildMobile({ projectId: PROJECT_ID });
+  // MUTATION SENSITIVITY: trusting the boundary's executionMs would flip this to
+  // BUILD_TIMEOUT. Measuring on the clock, the execution delta is 0 -> success.
+  assert.equal(res.ok, true);
+  assert.equal(res.executionMs, 0);
+  assert.equal(res.queuedMs, queuedMs);
+});
+
 test('buildMobile: execution past the timeout -> BUILD_TIMEOUT, no artifact (Req 15.7)', async () => {
   const clock = manualClock();
   const layout = tempLayout();

@@ -319,6 +319,56 @@ test('buildTargets: a failed target build still completes the others, names the 
   assert.equal(fs.readFileSync(priorWebPath, 'utf8'), priorWebBytes);
 });
 
+test('buildTargets: a FAILED target with its OWN prior artifact preserves that prior artifact across the failed rebuild (Req 16.7)', async () => {
+  const clock = manualClock();
+  const layout = tempLayout();
+  // A boundary we can flip: first build `backend` successfully, then fail it.
+  let failBackend = false;
+  const buildBoundary = async ({ projectId, target }) => {
+    clock.advance(1000);
+    if (failBackend && target === 'backend') {
+      return { exitStatus: 2, stderr: `build failed for ${target}` };
+    }
+    return {
+      exitStatus: 0,
+      artifactPath: `${target}/${projectId}.artifact`,
+      bytes: `bytes:${projectId}:${target}`,
+      stderr: '',
+    };
+  };
+  const buildService = createBuildService({ layout, buildBoundary, now: clock });
+  const coord = createMultiTargetCoordinator({ buildService, previewController: realPreviewController(), now: clock });
+
+  // Establish a PRIOR good artifact for `backend` itself (the target that will
+  // later FAIL its rebuild). This is the case Req 16.7 protects: the FAILED
+  // target's OWN previously produced artifact must survive its failed rebuild.
+  const prior = await coord.buildTargets({ projectId: PROJECT_ID, targets: ['backend'] });
+  assert.equal(prior.ok, true);
+  const priorBackendPath = prior.artifacts.backend.path;
+  const priorBackendBytes = fs.readFileSync(priorBackendPath, 'utf8');
+  const priorBackendArtifact = buildService.artifactFor(PROJECT_ID, 'backend');
+  assert.equal(priorBackendArtifact.targetKind, 'backend');
+
+  // Now rebuild with `backend` FAILING while `web` succeeds.
+  failBackend = true;
+  const res = await coord.buildTargets({ projectId: PROJECT_ID, targets: ['web', 'backend'] });
+  assert.equal(res.ok, false);
+  assert.deepEqual(res.failedTargets, ['backend']);
+  assert.equal(res.artifacts.backend, undefined);
+  // The sibling `web` completed.
+  assert.equal(res.artifacts.web.targetKind, 'web');
+  // MUTATION SENSITIVITY: the FAILED target's OWN prior artifact is PRESERVED —
+  // still on disk with unchanged bytes, and still the tracked artifact for
+  // `backend`. A failed rebuild that deleted or overwrote its own prior would
+  // flip these. (This is distinct from the sibling-preservation case: here the
+  // preserved prior belongs to the target that FAILED.)
+  assert.ok(fs.existsSync(priorBackendPath));
+  assert.equal(fs.readFileSync(priorBackendPath, 'utf8'), priorBackendBytes);
+  const stillTracked = buildService.artifactFor(PROJECT_ID, 'backend');
+  assert.equal(stillTracked.targetKind, 'backend');
+  assert.equal(stillTracked.path, priorBackendPath);
+});
+
 test('buildTargets: an invalid requested target rejects the WHOLE request naming it, modifying NO existing artifact (Req 16.8)', async () => {
   const clock = manualClock();
   const layout = tempLayout();

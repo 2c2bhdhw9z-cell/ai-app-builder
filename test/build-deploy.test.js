@@ -380,6 +380,46 @@ test('deploy: confirm-classified command deploys ONLY when consent is granted; d
   }
 });
 
+test('deploy: an allow-class command DENIED at the boundary does NOT proceed to deploy (Req 18.7)', async () => {
+  const clock = manualClock();
+  const layout = tempLayout();
+  const build = scriptedBuildBoundary(clock, { durationMs: 1000, exitStatus: 0 });
+
+  // A REAL guard whose manager.exec reports a BOUNDARY DENIAL (launch-failure)
+  // for the allow-class command: executed reached exec, but the boundary refused
+  // it (denied:true) — DISTINCT from a non-zero in-box exit.
+  const execCalls = [];
+  const manager = {
+    exec: async (projectId, command, opts) => {
+      execCalls.push({ projectId, command, opts });
+      return { stdout: '', stderr: '', exitCode: null, denied: true, deniedReason: 'launch-failure', timedOut: false };
+    },
+  };
+  const guard = createCommandGuard({ manager, classify: classifyCommand });
+
+  const deployB = scriptedDeployBoundary(clock, { durationMs: 1000, url: 'https://should-not.example.app' });
+  const svc = createBuildService({ layout, buildBoundary: build, deployBoundary: deployB, commandGuard: guard, now: clock });
+  const artifact = await buildOne(svc, 'web');
+
+  const res = await svc.deploy({
+    projectId: PROJECT_ID,
+    artifact,
+    destination: 'prod',
+    command: ALLOW_DEPLOY_COMMAND,
+  });
+
+  // MUTATION SENSITIVITY: without the `denied !== true` guard, an allow-class
+  // command that the boundary DENIED would still be treated as permitted and the
+  // deploy boundary would run. The gate command reached exec, but its boundary
+  // denial must block the deploy.
+  assert.equal(execCalls.length, 1);
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'DEPLOY_DENIED');
+  // The deploy boundary NEVER ran and nothing was recorded.
+  assert.equal(deployB.calls.length, 0);
+  assert.equal(svc.deployedUrl(PROJECT_ID, 'web'), null);
+});
+
 test('deploy: an allow-classified deploy command proceeds through the guard (Req 18.7)', async () => {
   const clock = manualClock();
   const layout = tempLayout();
