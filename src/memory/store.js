@@ -50,9 +50,20 @@
  *                (3) structured-summarize the oldest overflow,
  *                (4) replace them with ONE synthetic 'summary' entry,
  *                (5) if still over EITHER bound, evict the oldest summarized
- *                    content first (never the recent verbatim tail),
+ *                    content first (NEVER the recent verbatim tail),
  *                (6) persist. Store is then <= capBytes AND <= capEntries
  *                    (Property 16). The user is notified eviction happened.
+ * CONSTRUCTION INVARIANTS (design.md §11) that keep "never evict the verbatim
+ * tail" and "must end within both caps" consistent, so the degenerate
+ * evict-into-the-tail branch is UNREACHABLE on the auto path:
+ *   - keepRecent is clamped strictly < capEntries (resolveCaps), so an add over
+ *     the entry cap ALWAYS leaves at least one overflow entry to summarize — a
+ *     synthetic gist is produced whenever eviction happens (no gist-less
+ *     eviction, no eviction-occurred notification with nothing summarized).
+ *   - addAuto REFUSES an entry whose single record alone exceeds capBytes,
+ *     returning { ok:false, code:'entry_too_large', preserved:true,
+ *     notified:true } instead of forcing it in by destroying the protected
+ *     verbatim tail (which could silently drop a user-origin entry with no gist).
  * SAFEGUARD (never destroy history on a bad summary): if the summarizer returns
  * empty/blank/garbage, NOTHING is evicted or replaced — prior entries are left
  * unchanged, the incoming entry is not added if it cannot fit, the user is
@@ -129,12 +140,23 @@ function resolveCaps({ capBytes, capEntries, keepRecent, env }) {
   const source = env ?? process.env ?? {};
   const fromEnvBytes = parsePositiveInt(source.AAB_MEMORY_CAP_BYTES);
   const fromEnvEntries = parsePositiveInt(source.AAB_MEMORY_CAP_ENTRIES);
+  const resolvedCapBytes =
+    parsePositiveInt(capBytes) ?? fromEnvBytes ?? MEMORY_STORE_DEFAULTS.capBytes;
+  const resolvedCapEntries =
+    parsePositiveInt(capEntries) ?? fromEnvEntries ?? MEMORY_STORE_DEFAULTS.capEntries;
+  const requestedKeepRecent = parseNonNegativeInt(keepRecent) ?? DEFAULT_KEEP_RECENT;
+  // INVARIANT (design.md §11): keepRecent MUST be strictly < capEntries so the
+  // summarize step always has at least one overflow entry to summarize when the
+  // entry cap trips. Without this, an add over the entry cap would produce NO
+  // synthetic 'summary' gist yet still evict verbatim entries — evicting
+  // unsummarized history and firing an eviction notification with nothing
+  // preserved. Clamp a misconfiguration down to capEntries - 1 (documented,
+  // fail-safe) rather than silently allowing the degenerate path.
+  const keepRecentN = Math.max(0, Math.min(requestedKeepRecent, resolvedCapEntries - 1));
   return {
-    capBytes:
-      parsePositiveInt(capBytes) ?? fromEnvBytes ?? MEMORY_STORE_DEFAULTS.capBytes,
-    capEntries:
-      parsePositiveInt(capEntries) ?? fromEnvEntries ?? MEMORY_STORE_DEFAULTS.capEntries,
-    keepRecent: parseNonNegativeInt(keepRecent) ?? DEFAULT_KEEP_RECENT,
+    capBytes: resolvedCapBytes,
+    capEntries: resolvedCapEntries,
+    keepRecent: keepRecentN,
   };
 }
 
@@ -194,7 +216,8 @@ export function serializeDocument({ meta, entries }) {
  * @param {Function|{notify:Function}|{record:Function}} [args.notify]  user-notification sink.
  * @param {number} [args.capBytes]  cap override (env AAB_MEMORY_CAP_BYTES, else 65536).
  * @param {number} [args.capEntries]  cap override (env AAB_MEMORY_CAP_ENTRIES, else 200).
- * @param {number} [args.keepRecent]  newest entries kept verbatim on eviction (default 20).
+ * @param {number} [args.keepRecent]  newest entries kept verbatim on eviction (default 20;
+ *   clamped strictly < capEntries so an over-cap add always has overflow to summarize).
  * @param {object} [args.env]  env source for cap overrides (default process.env).
  * @returns {object} store (frozen)
  */
@@ -326,6 +349,17 @@ export function createMemoryStore({
     );
   }
 
+  /**
+   * True when a SINGLE entry, on its own in a fresh document, would already
+   * exceed capBytes. Such an entry can never be stored within the byte cap no
+   * matter how much else is evicted, so an automatic add of it must be refused
+   * (design.md §11: never evict the recent verbatim tail — and never silently
+   * destroy unsummarized user content to make room for it).
+   */
+  function entryExceedsByteCap(meta, entry) {
+    return documentByteSize({ meta, entries: [entry] }) > meta.capBytes;
+  }
+
   /** Entries sorted oldest -> newest (by createdAt, then original order). */
   function sortedOldestFirst(entries) {
     return entries
@@ -382,20 +416,20 @@ export function createMemoryStore({
     }
 
     // (5) if STILL over either bound, evict the oldest SUMMARIZED content first
-    // (never the recent verbatim tail) until BOTH bounds hold.
+    // (never the recent verbatim tail) until BOTH bounds hold. The summary (if
+    // any) is the sole entry ahead of the recent tail, so eviction drops from
+    // the front and STOPS at the protected tail — the verbatim tail is never
+    // evicted (design.md §11 step 5).
+    //
+    // This terminates within the caps by construction: keepRecent is guaranteed
+    // strictly < capEntries (resolveCaps), so once the summary is dropped the
+    // tail is <= capEntries - 1 <= capEntries; and addAuto refuses any single
+    // entry that alone exceeds capBytes, so the recent tail (each entry fits,
+    // and keepRecent leaves byte headroom) fits under capBytes. The protected
+    // tail is therefore always within both bounds, and the degenerate
+    // "evict into the tail" branch is unreachable on the auto add path.
     let doc = { meta, entries: next };
-    while (!withinCaps(doc) && doc.entries.length > 0) {
-      // The recent verbatim tail is protected: only drop entries that are not
-      // part of the kept tail. Since the summary (if any) sits at the front, we
-      // drop from the front. Never drop below the recent tail.
-      if (doc.entries.length <= recentTail.length) break;
-      doc = { meta, entries: doc.entries.slice(1) };
-    }
-
-    // If even the protected tail alone exceeds a bound, evict oldest of the tail
-    // too (bytes bound may still bind on very large recent entries) — Property 16
-    // requires the store end within BOTH bounds.
-    while (!withinCaps(doc) && doc.entries.length > 1) {
+    while (!withinCaps(doc) && doc.entries.length > recentTail.length) {
       doc = { meta, entries: doc.entries.slice(1) };
     }
 
@@ -490,6 +524,26 @@ export function createMemoryStore({
       }
 
       // mode === 'auto': summarize-and-evict.
+      // GUARD (design.md §11): refuse an auto add whose single entry alone
+      // exceeds capBytes. No amount of summarizing/evicting the rest could make
+      // it fit, and forcing it in would require evicting the protected recent
+      // verbatim tail (possibly a user entry) with no gist retained. Reject with
+      // a structured result and notify, leaving prior history untouched.
+      if (entryExceedsByteCap(doc.meta, candidateEntry)) {
+        const notified = notifyUser({
+          type: 'entry-too-large',
+          scope: addr.scope,
+          message: `${MODEL}: an automatic entry alone exceeds capBytes and was not added; history preserved`,
+        });
+        return {
+          ok: false,
+          code: 'entry_too_large',
+          preserved: true,
+          notified,
+          message: `${MODEL}: entry exceeds the byte cap and cannot be stored automatically`,
+        };
+      }
+
       const result = summarizeAndEvict(addr, doc.meta, candidate);
       if (!result.ok && result.code === 'summary_failed') {
         // NEVER destroy history on a bad/empty summary. Leave prior state; do

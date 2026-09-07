@@ -221,6 +221,74 @@ test('auto: reaching the cap summarizes-and-evicts, preserving a synthetic summa
   assert.ok(events.some((e) => e.type === 'eviction-occurred'), 'user notified of eviction');
 });
 
+// --- design.md §11 / Req 14.8: never evict the verbatim tail ---------------
+// Regression for review issue (1): the old byte-cap fallback loop could evict
+// the protected recent verbatim tail — including a user-origin entry — with no
+// summary gist retained, when a single entry exceeded capBytes. The fix refuses
+// such an automatic add (code 'entry_too_large') instead of destroying history.
+
+test('auto: an auto entry that alone exceeds capBytes is refused and never evicts the verbatim tail', () => {
+  const { store, events } = freshStore({ capBytes: 600, capEntries: 50, keepRecent: 2 });
+  const ps = store.projectStore(PROJECT);
+
+  // A user pastes a large block (bigger than the whole byte cap on its own).
+  const bigText = 'X'.repeat(2000);
+  const userAdd = ps.addUser({ kind: 'decision', text: bigText });
+  assert.equal(userAdd.ok, true, 'user add is always allowed (user asked for it)');
+  const userId = userAdd.entry.id;
+  const before = ps.list();
+
+  // A later AUTOMATIC add whose single entry alone exceeds capBytes must be
+  // refused — NOT forced in by evicting the protected verbatim tail.
+  const bigAuto = ps.addAuto({ kind: 'decision', text: 'Y'.repeat(2000) });
+  assert.equal(bigAuto.ok, false, 'oversized auto entry is refused');
+  assert.equal(bigAuto.code, 'entry_too_large');
+  assert.equal(bigAuto.preserved, true);
+  assert.equal(bigAuto.notified, true);
+
+  // History is untouched: the user entry survives, nothing was evicted, and NO
+  // eviction notification was emitted (nothing was actually summarized/evicted).
+  assert.deepEqual(ps.list(), before, 'prior history is byte-for-byte preserved');
+  assert.equal(ps.list().some((e) => e.id === userId), true, 'the user entry is not destroyed');
+  assert.equal(
+    events.some((e) => e.type === 'eviction-occurred'),
+    false,
+    'no eviction-occurred fired when nothing was summarized',
+  );
+});
+
+// --- design.md §11: keepRecent is clamped strictly < capEntries -------------
+// Regression for review issue (2): when keepRecent >= capEntries the overflow
+// was empty, so no summary was produced, yet the fallback still evicted verbatim
+// entries and fired an eviction-occurred notification with no gist. The fix
+// clamps keepRecent to capEntries - 1 at construction, so an over-cap add always
+// has overflow to summarize and eviction always preserves a gist.
+
+test('keepRecent is clamped strictly below capEntries so eviction always preserves a gist', () => {
+  // Misconfiguration: keepRecent (10) >= capEntries (3).
+  const { store, events } = freshStore({ capEntries: 3, capBytes: 100000, keepRecent: 10 });
+  assert.equal(store.caps.keepRecent, 2, 'keepRecent clamped to capEntries - 1');
+
+  const ps = store.projectStore(PROJECT);
+  assert.equal(ps.addAuto({ kind: 'decision', text: 'one' }).ok, true);
+  assert.equal(ps.addAuto({ kind: 'decision', text: 'two' }).ok, true);
+  assert.equal(ps.addAuto({ kind: 'decision', text: 'three' }).ok, true);
+  assert.equal(ps.list().length, 3, 'at the entry cap');
+
+  // The fourth add trips the entry cap. Because keepRecent < capEntries, there
+  // is overflow to summarize: eviction MUST produce a synthetic summary gist.
+  const overflow = ps.addAuto({ kind: 'decision', text: 'four' });
+  assert.equal(overflow.ok, true);
+  assert.equal(overflow.evicted, true);
+
+  assert.ok(ps.list().length <= 3, 'entry cap holds');
+  const summaries = ps.list().filter((e) => e.kind === 'summary' && e.origin === 'auto');
+  assert.equal(summaries.length >= 1, true, 'a synthetic summary gist was preserved');
+  assert.ok(summaries[0].text.length > 0, 'the summary carries a non-empty gist');
+  // An eviction notification is only fired because something WAS summarized.
+  assert.ok(events.some((e) => e.type === 'eviction-occurred'), 'user notified of a real eviction');
+});
+
 // --- Task 24.4 / Req 14.6: export completeness -----------------------------
 
 test('export() reproduces every current entry as human-readable content with no hidden state', () => {
