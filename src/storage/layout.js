@@ -10,9 +10,13 @@
  *       `exportRoot/projects/<projectId>/`.
  *
  *   (2) CONTROL-PLANE — out-of-tree metadata that must NEVER enter an exported
- *       tree: the project registry, share links, connector bindings, and secret
- *       values (ciphertext). Rooted under `controlRoot/` and keyed/filterable by
- *       ownerId (three-axis isolation, Req 7.6).
+ *       tree: the project registry, share links, connector bindings, secret
+ *       values (ciphertext), the per-owner User_Skill library, and the per-owner
+ *       Global_Memory store. Rooted under `controlRoot/` and keyed/filterable by
+ *       ownerId (three-axis isolation, Req 7.6). NOTE: Project_Memory is NOT
+ *       control-plane — it lives INSIDE the exportable project tree
+ *       (exportableMemoryPath) so it persists/exports with the Project (Req
+ *       14.1); Global_Memory is per-User_Account, out-of-tree here (Req 14.2).
  *
  * THE INVARIANT (Req 9.7, 10.4, Properties 8, 9, 14): every control-plane /
  * secret path resolves OUTSIDE every Project's exportable tree. This module
@@ -39,6 +43,7 @@ const BINDINGS_DIR = 'connector-bindings'; // ConnectorBinding records
 const SECRETS_DIR = 'secrets'; // Secret ciphertext (out-of-tree only)
 const SNAPSHOTS_DIR = 'snapshots'; // Snapshot registry/metadata (out-of-tree only)
 const USER_SKILLS_DIR = 'user-skills'; // per-owner User_Skill library (out-of-tree)
+const GLOBAL_MEMORY_DIR = 'global-memory'; // per-owner Global_Memory store (out-of-tree)
 
 /**
  * Create a storage layout rooted at `baseDir`. `exportRoot` and `controlRoot`
@@ -183,6 +188,26 @@ class StorageLayout {
     return this.assertOutsideExportTrees(
       path.join(this.controlRoot, USER_SKILLS_DIR, ownerId),
       'controlUserSkillsRoot',
+    );
+  }
+
+  /**
+   * The per-owner Global_Memory ROOT (control-plane, out of every tree).
+   * Global_Memory is per-User_Account, not per-project (Req 14.2) — it holds a
+   * user's durable preferences, conventions, and recurring corrections across
+   * ALL of that user's Projects — so it is keyed by ownerId here rather than
+   * living inside any single exportable tree. The store writes HUMAN-READABLE
+   * files beneath this root (so it stays user-owned and fully exportable, Req
+   * 14.6/14.13), and it resolves OUT-OF-TREE (asserted) so a user's global
+   * memory can never leak into an exported project tree. Project_Memory, by
+   * contrast, lives INSIDE the exportable project tree (exportableMemoryPath) so
+   * it is persisted/restored with the Project (Req 14.1).
+   */
+  controlGlobalMemoryRoot(ownerId) {
+    requireId('ownerId', ownerId);
+    return this.assertOutsideExportTrees(
+      path.join(this.controlRoot, GLOBAL_MEMORY_DIR, ownerId),
+      'controlGlobalMemoryRoot',
     );
   }
 
