@@ -80,6 +80,49 @@ export {
   BASELINE_BUILD_SLO_MS,
 } from './templates.js';
 
+// The Build + Deploy service for NON-`mobile` Targets (Task 26.1, Req 18.1,
+// 18.3-18.8): builds a `web`/`backend`/`shared` Target into a REAL
+// Deployment_Artifact within the 300s build SLO, and deploys an artifact to a
+// hosting destination within the 120s deploy SLO — routing a confirm-classified
+// deploy through the CommandGuard/plumby classifier (60s consent), rejecting a
+// nonexistent artifact, and leaving prior deployed state unchanged on failure.
+// Every SLO is measured against an injected clock (offline SEAM boundaries).
+export {
+  createBuildService,
+  BUILD_SLO_MS,
+  DEPLOY_SLO_MS,
+} from './build-service.js';
+
+// The Mobile (Expo/RN) scaffold + build service (Task 26.2, Req 15.1, 15.4-15.7,
+// 18.2-18.3): scaffolds the `mobile` Target within 30s and builds the mobile
+// Deployment_Artifact bounded by a CONFIGURABLE execution timeout (default
+// 1800s) measured from build-execution START and EXCLUDING queue time (queue and
+// execution modeled as separate injected-clock phases). Names a missing
+// toolchain component without claiming success and leaving prior state unchanged.
+export {
+  createMobileBuildService,
+  SCAFFOLD_SLO_MS,
+  DEFAULT_MOBILE_BUILD_EXECUTION_TIMEOUT_MS,
+} from './mobile-build-service.js';
+
+// The Multi-Target coordinator (Task 26.3, Req 16.2-16.8): coordinates the
+// EXACTLY four Targets web/mobile/backend/shared derived from the closed Target
+// enum. Propagates a completed `shared` modification to web/mobile/backend
+// within 5s with ALL-OR-NOTHING / last-good semantics (a failed/over-budget
+// propagation retains the last good `shared` version in ALL Targets and names
+// the failed one(s)). REUSES the PreviewController.selectTarget selector (web
+// default + explicit defaultUsed; INVALID_TARGET rejection) rather than building
+// a second one, and composes the FEAT-002 build service so a build produces
+// exactly one artifact per requested Target and none for unrequested — a failed
+// Target build still completes the others, names the failed Target, produces no
+// artifact for it, and preserves prior artifacts; an invalid requested Target
+// rejects the whole request naming it. The 5s SLO is measured against an
+// injected clock (offline SEAM boundary).
+export {
+  createMultiTargetCoordinator,
+  PROPAGATION_SLO_MS,
+} from './multi-target.js';
+
 import { createProjectOrigin as createProjectOriginImpl } from './project-origins.js';
 import { createTemplateProvider as createTemplateProviderImpl } from './templates.js';
 
