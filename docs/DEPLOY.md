@@ -46,6 +46,36 @@ valid. Anything else logs `identity: LOGIN DISABLED — <reason>` and leaves
 | `OIDC_JWKS_URI` | no | Override the signing-key endpoint. Same rules as `OIDC_ISSUER`. |
 | `OIDC_STATE_SIGNING_KEY` | no | HMAC key for the login `state`. Without it a random key is generated per process, so a restart invalidates logins that are mid-flight (the user just retries) and two replicas reject each other's states. Set it for a multi-replica or restart-tolerant deploy. **Must be at least 32 characters** — a shorter value is ignored (falling back to the random per-process key) rather than used as a weak secret. Generate with `openssl rand -base64 32`. |
 
+### Storage
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AAB_DATA_DIR` | `~/.ai-app-builder/data` | **Durability-critical — mount a volume here.** Holds both the exportable Project trees (each Project's sandbox mount, i.e. the agent's working directory) and the control plane (project registry, snapshots, secrets, presentation settings). The default is deliberately *outside* the server's own source tree; a relative value is resolved against the process cwd. Losing this directory loses every Project. |
+
+### Sandbox / container runtime
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONTAINER_BIN` | `docker` | Container CLI. Set to `podman` on a podman host. Not probed at boot, so the server still starts (and `/healthz` still answers) on a host with no runtime — the failure surfaces as a `503` from `POST /projects` instead. One consequence of not probing: containers left behind by a crashed previous process are **not** reaped at startup (per-project orphan cleanup still happens on release). Run `docker ps -a --filter label=aab.sandbox` after an unclean restart if you want to check. |
+| `SANDBOX_IMAGE` | `node:22-slim` | Image each Project sandbox runs. |
+| `AAB_SANDBOX_EGRESS` | `none` | Sandbox network posture. `none` = no network at all: commands run, but nothing can reach the network (so **`npm install` cannot work**). `registry` = allow the package-registry hosts, which requires per-host egress filtering that the CLI container backend **cannot** enforce — it fails closed, refusing every command. Only choose `registry` with a filtering-capable backend. Any unrecognized value falls back to `none`. |
+
+### Resource quotas
+
+All optional; each must be a positive integer or it is ignored.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AAB_MAX_CONCURRENT_SANDBOXES` | 64 | Global concurrent-sandbox ceiling, counted as the sandboxes *in use* within `AAB_SANDBOX_IDLE_MS` (see below). Deliberately below the SandboxManager's internal capacity of 256: setting it *equal* to that capacity is a trap, because the quota denies at `current >= max` before the acquire that would trigger LRU eviction, so the count could never fall. |
+| `AAB_SANDBOX_IDLE_MS` | `900000` (15 min) | How long a sandbox boundary may sit unused before it is reclaimed. **This is what makes the ceiling recoverable.** Nothing releases a boundary on the success path (a create takes one, and so does the first turn), so without reclamation the count only grows and the ceiling would become permanent until a restart. Lower it to recycle capacity faster; raise it to keep sandboxes warm longer. A boundary with a command in flight is never reclaimed, and completion counts as use, so this does not have to exceed your longest command — but values below a few seconds will churn sandboxes between turns for no benefit. |
+| `AAB_MAX_CONCURRENT_SANDBOXES_PER_ACCOUNT` | unset (no per-account limit) | Enables the Req 23 anti-starvation ceiling. **Set this on any multi-tenant deploy:** without it, one account can consume the entire global allowance. Note it costs a registry lookup per live sandbox on the create/turn path. |
+| `AAB_MAX_TOTAL_PROJECTS` | 50 | Per-account total-Project ceiling. |
+
+Known limitation: at exactly the global ceiling, a turn on a project that already
+holds a sandbox is also refused, because the quota seam receives no per-project
+context and so cannot exclude the requester. Idle reclamation clears this within
+`AAB_SANDBOX_IDLE_MS` rather than requiring a restart.
+
 ### Model provider
 
 The agent needs a model provider. Construction is offline, so a missing key does
@@ -54,7 +84,8 @@ not stop the server from booting — it fails when a turn actually runs.
 | Variable | Purpose |
 |---|---|
 | `PLUMBY_PROVIDER` | `anthropic` (default), `gemini`, or `openrouter`. |
-| `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | The key for the selected provider. |
+| `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) / `OPENROUTER_API_KEY` | The key for the selected provider. |
+| `AAB_MODEL` | Optional. Pins the model the default agent path builds with, instead of the provider's default. |
 
 ## Setting up the provider
 

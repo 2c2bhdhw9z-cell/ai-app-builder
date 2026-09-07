@@ -1,5 +1,7 @@
 node_modules/
 coverage/
+# The default AAB_DATA_DIR: export trees + control plane created at runtime.
+.data/
 *.log
 .DS_Store
 .agents/
