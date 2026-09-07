@@ -31,3 +31,5 @@ export {
   toAuditSink,
   AUDIT_EVENTS,
 } from './audit.js';
+export { createShareLinkStore } from './share-link-store.js';
+export { createShareLinkService } from './share-link-service.js';
