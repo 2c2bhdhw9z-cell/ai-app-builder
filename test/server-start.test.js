@@ -141,8 +141,17 @@ test('startPlatformServer threads the resolved host/port into listen()', async (
     assert.ok(Number.isInteger(address.port) && address.port > 0);
 
     // The bound address is logged on startup.
-    assert.equal(logs.length, 1);
-    assert.match(logs[0], /listening on http:\/\/127\.0\.0\.1:\d+/);
+    assert.ok(
+      logs.some((m) => /listening on http:\/\/127\.0\.0\.1:\d+/.test(m)),
+      `expected a listening log, got ${JSON.stringify(logs)}`,
+    );
+    // With no OIDC_* in the injected env, the entry point ALSO states plainly
+    // that login is disabled (fail-closed), so a deploy log shows why the gated
+    // routes deny. See test/oidc-login-wiring.test.js for the configured path.
+    assert.ok(
+      logs.some((m) => /LOGIN DISABLED/.test(m)),
+      `expected a fail-closed identity log, got ${JSON.stringify(logs)}`,
+    );
 
     // The composed server is really reachable and health-checkable.
     const res = await fetch(`http://${address.host}:${address.port}/healthz`);

@@ -446,6 +446,16 @@ export function themeFrame({ theme, palette, previewed, experience } = {}) {
  *        a live preview is NOT inherited as committed. With NO themeStore
  *        injected, neither route is routed and every existing route/behavior is
  *        byte-identical (backward compatible).
+ * @param {object} [opts.loginFlow]  OPTIONAL delegated-login flow
+ *        (src/auth/login-flow.js). Every gated route requires an
+ *        `Authorization: Bearer <token>`, but nothing on the wire could ever
+ *        MINT one: authenticate()/scopeSession() are in-process calls. Injecting
+ *        a flow routes the browser-facing round-trip that closes that gap —
+ *        GET /auth/login (302 to the IdP) and GET /auth/callback (code+state ->
+ *        session token). STRICTLY ADDITIVE and fail-closed by omission: with no
+ *        flow injected neither path is routed (405, exactly as any unknown path)
+ *        and every existing route is byte-identical, so an unconfigured deploy
+ *        advertises no login it cannot honor.
  * @param {number} [opts.confirmTimeoutMs=60000]  fail-closed confirm ceiling.
  * @param {() => number} [opts.now]       injectable clock.
  * @returns {object} frozen server handle.
@@ -453,6 +463,7 @@ export function themeFrame({ theme, palette, previewed, experience } = {}) {
 export function createBuilderServer(opts = {}) {
   const {
     authService,
+    loginFlow,
     agentFactory,
     sandboxManager,
     layout,
@@ -815,6 +826,18 @@ export function createBuilderServer(opts = {}) {
       return sendJson(res, 200, { status: 'ok' });
     }
 
+    // The delegated-login round-trip. Deliberately placed with /healthz BEFORE
+    // the gated routes: these two paths are how a client OBTAINS a session
+    // token, so requiring one here would be circular. They are only routed when
+    // a LoginFlow is injected (strictly additive). Authentication itself is
+    // still performed entirely by the AuthService + IdP verifier behind the flow.
+    if (loginFlow && req.method === 'GET' && pathname === '/auth/login') {
+      return handleLoginStart(req, res);
+    }
+    if (loginFlow && req.method === 'GET' && pathname === '/auth/callback') {
+      return handleLoginCallback(req, res, url);
+    }
+
     if (req.method === 'GET' && pathname === '/events') return handleEvents(req, res);
     if (req.method === 'POST' && pathname === '/message') return handleMessage(req, res);
     if (req.method === 'POST' && pathname === '/confirm') return handleConfirm(req, res);
@@ -869,6 +892,141 @@ export function createBuilderServer(opts = {}) {
 
     res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'GET, POST' });
     res.end('method not allowed');
+  }
+
+  // -------- delegated login — only routed when a LoginFlow is injected
+
+  /**
+   * GET /auth/login — redirect the browser to the IdP's authorize endpoint.
+   *
+   * Unauthenticated BY NECESSITY (this is how a client acquires a token). The
+   * single-use CSRF `state` is minted and remembered by the flow. `no-store`
+   * keeps the redirect (and its state) out of any shared cache.
+   */
+  function handleLoginStart(req, res) {
+    const { url: authorizeUrl, cookie } = loginFlow.beginLogin();
+    // The cookie BINDS this login to this browser: /auth/callback requires it to
+    // match the state, which is what stops an attacker-supplied callback URL from
+    // logging a victim into the attacker's account. HttpOnly (no script access),
+    // SameSite=Lax (still sent on the IdP's top-level redirect back to us, but
+    // not on cross-site subrequests), and Secure whenever the deployment is TLS.
+    const attrs = [
+      `${cookie.name}=${encodeURIComponent(cookie.value)}`,
+      'Path=/',
+      'HttpOnly',
+      'SameSite=Lax',
+      `Max-Age=${cookie.maxAgeSec}`,
+    ];
+    if (cookie.secure) attrs.push('Secure');
+
+    res.writeHead(302, {
+      location: authorizeUrl,
+      'set-cookie': attrs.join('; '),
+      'cache-control': 'no-store',
+      'content-type': 'text/plain; charset=utf-8',
+    });
+    res.end('redirecting to identity provider');
+  }
+
+  /**
+   * Read one cookie value from a request's Cookie header, requiring the name to
+   * appear EXACTLY ONCE.
+   *
+   * Returning the first match would defeat the login binding entirely: cookies
+   * that share a name but were set by different origins/paths are ALL sent, and
+   * the browser orders them by path specificity (RFC 6265 §5.4). An attacker able
+   * to set a cookie on this registrable domain (a sibling subdomain, or any
+   * plaintext origin on it — classic "cookie tossing") could therefore place
+   * their nonce ahead of the victim's and have the victim's browser complete the
+   * ATTACKER's login. A duplicated name is never legitimate here, so ambiguity is
+   * refused outright — the same exactly-one rule selectJwk applies to JWKS keys.
+   */
+  function cookieFrom(req, name) {
+    const header = req.headers['cookie'];
+    if (typeof header !== 'string') return null;
+    // ONE layer, deliberately: an earlier version also bailed on the second match,
+    // which was redundant with the exactly-one check below — and because either
+    // layer alone enforced the rule, neither was individually observable in a test.
+    let found = null;
+    let matches = 0;
+    for (const part of header.split(';')) {
+      const eq = part.indexOf('=');
+      if (eq <= 0) continue;
+      if (part.slice(0, eq).trim() !== name) continue;
+      matches += 1;
+      try {
+        found = decodeURIComponent(part.slice(eq + 1).trim());
+      } catch {
+        return null;
+      }
+    }
+    return matches === 1 ? found : null;
+  }
+
+  /**
+   * GET /auth/callback?code=...&state=... — finish the login and return a
+   * session token.
+   *
+   * The IdP may also redirect here with `?error=` (user pressed "cancel", etc.);
+   * that is a denial, not a protocol bug. A bad/expired/replayed `state` or a
+   * missing code is a 400 with its specific code (a client-side protocol fault
+   * that discloses nothing about any account or Project). An IdP-level denial
+   * collapses to the SAME non-disclosing 401 ACCESS_DENIED every other gated
+   * route uses. The token is returned with `no-store` so it is never cached.
+   */
+  async function handleLoginCallback(req, res, url) {
+    // Set on EVERY path, before any branch: the REQUEST url carries `code` and
+    // `state`, so no response correlated with it may be cached anywhere.
+    res.setHeader('cache-control', 'no-store');
+
+    /**
+     * Clear the spent login cookie — but ONLY once the request has proven it owns
+     * this login (`bound`). Clearing unconditionally would turn any cross-site GET
+     * to /auth/callback into a way to destroy a victim's in-flight login. The
+     * attributes mirror the ones used when setting it, so the deletion actually
+     * overwrites a Secure/__Host- cookie.
+     */
+    function clearLoginCookie() {
+      const attrs = [`${loginFlow.cookieName}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+      if (loginFlow.cookieSecure) attrs.push('Secure');
+      res.setHeader('set-cookie', attrs.join('; '));
+    }
+
+    if (url.searchParams.get('error')) {
+      // The IdP redirected back with a failure (user cancelled, etc.). Do not echo
+      // its text, and do not clear the cookie: this request proved nothing, so an
+      // unvalidated ?error= must not be able to cancel someone else's login.
+      return sendJson(res, 401, ACCESS_DENIED);
+    }
+
+    const result = await loginFlow.completeLogin({
+      code: url.searchParams.get('code') ?? undefined,
+      state: url.searchParams.get('state') ?? undefined,
+      cookieNonce: cookieFrom(req, loginFlow.cookieName) ?? undefined,
+    });
+
+    if (result && result.bound === true) clearLoginCookie();
+
+    if (!result || result.ok !== true) {
+      if (result && result.code === 'AUTH_DENIED') {
+        return sendJson(res, 401, ACCESS_DENIED);
+      }
+      // Every message reachable here is a STATIC string from completeLogin (a
+      // client-side protocol fault: missing/expired/replayed state, unbound
+      // browser, absent code). The `code` is the machine-readable part; nothing
+      // account-, Project- or IdP-specific is interpolated into either field.
+      return sendJson(res, 400, {
+        error: result?.message ?? 'login failed',
+        code: result?.code ?? 'LOGIN_FAILED',
+      });
+    }
+
+    return sendJson(res, 200, {
+      token: result.token,
+      accountId: result.accountId,
+      expiresAt: result.expiresAt,
+      tokenType: 'Bearer',
+    });
   }
 
   // -------- POST /projects (create) — only routed when a ProjectManager is injected
