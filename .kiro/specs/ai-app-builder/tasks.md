@@ -785,35 +785,48 @@ top of the security foundations (Auth, SecretStore, Builder Server) once those e
       current mode in effect
     - _Requirements: 28.1, 28.2, 28.3, 28.4, 28.5, 28.6, 28.7_
 
-- [ ] 33. Implement Themes (persisted visual preference, independent of experience/mode)
-  - [ ] 33.1 Add the Theme closed-but-extensible enum + per-user persistence
-    - Add a frozen `Theme` enum to `src/model/enums.js` whose initial members are `light` and `dark`,
-      documented as extensible only by a spec change (never open-ended input), plus an `isValidTheme`
-      predicate; persist the selected Theme **per User_Account** in the control-plane settings and re-apply it
-      to the user's subsequent Sessions
-    - _Requirements: 29.1, 29.2, 29.3_
+- [ ] 33. Implement Themes (named color-theme catalog, per-Workspace-Experience, preview-then-commit)
+  - [ ] 33.1 Add the Theme catalog enum + per-(User_Account, Workspace_Experience) persistence
+    - Add a frozen `Theme` catalog enum to `src/model/enums.js` whose members are the base `light` and `dark`
+      themes PLUS named color themes (e.g. `pastel-pasture`, `out-there`, `paranormal-purple`, `morning-dew`,
+      `summer-sunset`, `peach-popsicle`), each carrying a display name and a color palette (backgrounds,
+      surfaces, accents, buttons, badges, status colors); documented as extensible only by a spec change
+      (never open-ended input), plus an `isValidTheme` predicate. Persist a COMMITTED Theme **per
+      (User_Account, Workspace_Experience) pair** in the control-plane presentation settings (NOT a single
+      per-user value), and re-apply each experience's committed Theme to the user's subsequent Sessions.
+    - _Requirements: 29.1, 29.2, 29.3, 29.5_
 
-  - [ ] 33.2 Apply Theme on the surface, independent and non-mutating
-    - Apply a Theme selection as a visual-only surface change on the existing SSE surface; keep the Theme
-      independent of the Workspace_Experience and Work_Mode (changing one never changes the others);
-      guarantee a Theme change alters no source code, agent state, Project data, models, Skills, Connectors,
-      permissions, Work_Mode, or Project_Origin; reject an out-of-enum value with the current Theme left in
-      effect
-    - _Requirements: 29.4, 29.5, 29.6_
+  - [ ] 33.2 Preview-then-commit interaction + per-surface application, non-mutating
+    - Apply a Theme's palette as a visual-only change on the existing SSE surface. Model the two-step
+      interaction: a PREVIEW renders the surface in the Theme's colors WITHOUT persisting (reversible; a
+      cancel/navigate-away restores the previously committed Theme), and a COMMIT (a second selection of the
+      previewed Theme, or an explicit "Apply") persists it for the current (User_Account, Workspace_Experience)
+      pair. Entering a Workspace_Experience with no committed Theme applies THAT experience's default Theme;
+      switching Workspace_Experience surfaces each experience's own committed Theme. Guarantee that preview,
+      commit, or change alters no source code, agent state, Project data, models, Skills, Connectors,
+      permissions, Work_Mode, Project_Origin, the Workspace_Experience layout, or any OTHER experience's
+      committed Theme; reject an out-of-catalog value with the current committed Theme left in effect.
+    - _Requirements: 29.4, 29.6, 29.7, 29.8_
 
-  - [ ]* 33.3 Write property test for Theme non-mutation + independence
-    - **Property 22: Theme change preserves state and is independent** — a Theme change alters visuals only
-      and leaves source, agent state, Project data, models, Skills, Connectors, permissions, Work_Mode,
-      Workspace_Experience, and Project_Origin unchanged; the persisted Theme is independent of experience
-      and mode
-    - `fast-check` generates Theme switch sequences and asserts visuals-only change and independence; ≥100
-      iterations; tag `Feature: ai-app-builder, Property 22: Theme change preserves state and is independent`
-    - **Validates: Requirements 29.4, 29.5**
+  - [ ]* 33.3 Write property test for per-experience isolation + preview safety + non-mutation
+    - **Property 22: Theme is per-experience, preview-safe, and state-preserving** — (a) previewing changes no
+      committed Theme; (b) committing a Theme for one Workspace_Experience changes only that
+      (User_Account, Workspace_Experience) pair and leaves every other experience's committed Theme unchanged,
+      and switching experience surfaces each one's own Theme; (c) preview/commit/change alters visuals only and
+      leaves source, agent state, Project data, models, Skills, Connectors, permissions, Work_Mode, the
+      Workspace_Experience layout, and Project_Origin unchanged
+    - `fast-check` generates (experience, theme) preview/commit sequences and asserts preview-safety,
+      per-experience isolation, and visuals-only change; ≥100 iterations; tag
+      `Feature: ai-app-builder, Property 22: Theme is per-experience, preview-safe, and state-preserving`
+    - **Validates: Requirements 29.2, 29.4, 29.6, 29.7**
 
-  - [ ]* 33.4 Write unit tests for theme values/persistence/independence/rejection
-    - at least `light` and `dark` offered; selection persists per user and re-applies to a later Session;
-      independent of experience and mode; out-of-enum rejected leaving the current Theme in effect
-    - _Requirements: 29.1, 29.2, 29.3, 29.4, 29.6_
+  - [ ]* 33.4 Write unit tests for catalog/preview/commit/per-experience/rejection
+    - the catalog offers at least `light`, `dark`, and the named color themes; a PREVIEW does not persist and
+      is reversible; a COMMIT persists per (User_Account, Workspace_Experience) and re-applies to a later
+      Session; a Theme committed in one experience does not change another experience's Theme; entering an
+      experience with no committed Theme applies its default; an out-of-catalog value is rejected leaving the
+      current committed Theme in effect
+    - _Requirements: 29.1, 29.2, 29.3, 29.4, 29.7, 29.8_
 
 - [ ] 34. Checkpoint - workspace experiences, work modes, and themes
   - Ensure all tests pass, confirm the three presentation features are wired on the existing Builder Server

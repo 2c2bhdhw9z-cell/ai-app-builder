@@ -926,22 +926,41 @@ file mutation.
   Builder Server frames the *next* turn's prompt/flow (e.g., whether it asks the agent to plan first); it
   never rewrites history or mutates the tree, so switching mid-Session is safe.
 
-- **Theme (Req 29).** A `Theme` is a **persisted visual preference** — at minimum `light` and `dark`, a
-  **closed but extensible enum** — selectable by the user and stored per `User_Account` in the control-plane
-  settings (Req 29.1–29.2). It is re-applied to later Sessions until changed (Req 29.3) and is **independent
-  of both the Workspace_Experience and the Work_Mode**: changing a layout or a mode does not change the Theme,
-  and changing the Theme does not change either of them (Req 29.4, decision D2's "must never change the
-  theme" restated as independence). Changing the Theme **never** alters source code, agent state, Project
-  data, models, Skills, Connectors, permissions, Work_Mode, or Project_Origin (Req 29.5, Property 22); an
-  out-of-enum value is rejected with the current Theme left in effect (Req 29.6).
+- **Theme (Req 29).** A `Theme` is a **named visual appearance** — a `light`/`dark` base mode PLUS a full
+  color palette (backgrounds, surfaces, accents, buttons, badges, status colors) — drawn from a **catalog**
+  defined as a **closed but extensible enum**. The catalog includes at minimum the base `light` and `dark`
+  themes and a set of named color themes (e.g. "Pastel Pasture", "Out There", "Paranormal Purple", "Morning
+  Dew", "Summer Sunset", "Peach Popsicle"); more named themes are added by extending the frozen list, never
+  by open-ended input (Req 29.1). **Themes are PER-Workspace-Experience, not global:** a committed Theme is
+  stored per **(User_Account, Workspace_Experience)** pair, so the Theme chosen in the Vibe-first area applies
+  to that surface only and does not change the Technical Workbench's Theme or any other experience's (Req
+  29.2, Req 29.7). Entering a Workspace_Experience with no committed Theme applies **that experience's default
+  Theme**, which the user may then change per surface (Req 29.3); each experience's committed Theme is
+  re-applied to later Sessions until changed (Req 29.5).
+
+  **Preview vs. commit (the Snapchat-style interaction).** Selecting a Theme is a **two-step** action:
+  *previewing* renders the current surface in the Theme's colors WITHOUT persisting it (a reversible,
+  uncommitted visual state — navigating away or cancelling restores the previously committed Theme), and
+  *committing* is a distinct second action (a second tap on the previewed Theme, or an explicit "Apply") that
+  persists it for the current (User_Account, Workspace_Experience) pair (Req 29.4). Preview, select, and
+  change **never** alter source code, agent state, Project data, models, Skills, Connectors, permissions,
+  Work_Mode, Project_Origin, the Workspace_Experience layout, or any OTHER experience's Theme (Req 29.6,
+  Property 22); an out-of-catalog value is rejected with the current committed Theme left in effect (Req
+  29.8). Because Theme is scoped to a Workspace_Experience, it is a *facet of* the presentation layer rather
+  than a globally-independent axis — selecting a layout (Req 27) never changes any surface's committed Theme,
+  and choosing a Theme never changes the layout.
 
 **Closed-enum conventions.** Consistent with `src/model/enums.js`, three new frozen closed enums are added
 and validated at the edges (API input, control-plane storage reads): a `Workspace_Experience` enum of the
 five names (`kiro-style`, `vibe-first`, `technical-workbench`, `mobile-command-center`, `custom`); a
-`Work_Mode` enum of `vibe | spec | hybrid` (default `vibe`); and a `Theme` enum whose initial members are
-`light` and `dark` and which is documented as **extensible by a spec change** (new members added to the
-frozen list, never open-ended input). Each ships an `isValidX` predicate mirroring the existing enums; an
-invalid value is rejected at the edge and the current setting is left in effect.
+`Work_Mode` enum of `vibe | spec | hybrid` (default `vibe`); and a `Theme` catalog enum whose members are
+the base `light`/`dark` themes plus the named color themes (e.g. `pastel-pasture`, `out-there`,
+`paranormal-purple`, `morning-dew`, `summer-sunset`, `peach-popsicle`), each carrying a display name and a
+color palette, documented as **extensible by a spec change** (new members added to the frozen list, never
+open-ended input). Each ships an `isValidX` predicate mirroring the existing enums; an invalid value is
+rejected at the edge and the current setting is left in effect. Committed Theme selections are stored per
+**(User_Account, Workspace_Experience)** pair in the control-plane presentation settings (not a single
+per-user value), so each surface remembers its own Theme.
 
 **Satisfies:** Req 27, Req 28, Req 29, Properties 20–22. Sits on Architecture §1 (Builder Server SSE
 surface + Session_Header), §4 (Preview surface, including the mobile surface), §5 (Activity_Stream), and §0
@@ -1397,12 +1416,17 @@ all Project state — source code, agent state, Project data, Snapshots, models,
 permissions, Project_Origin, Theme, and Workspace_Experience — unchanged.
 **Validates: Requirements 28.4, 28.5, 28.6**
 
-### Property 22: Theme change preserves state and is independent
-*For all* Theme selections among the defined values, changing the Theme SHALL alter only visual appearance
+### Property 22: Theme is per-experience, preview-safe, and state-preserving
+*For all* Theme selections among the defined catalog values and *for all* Workspace_Experiences:
+(a) **preview safety** — previewing a Theme SHALL NOT change any committed Theme (the previously committed
+Theme is restored on cancel/navigate-away), and only an explicit commit persists it;
+(b) **per-experience isolation** — committing a Theme for one Workspace_Experience SHALL change only that
+(User_Account, Workspace_Experience) pair's Theme and SHALL leave every OTHER experience's committed Theme
+unchanged; and switching Workspace_Experience SHALL surface each experience's own committed Theme;
+(c) **state preservation** — previewing, committing, or changing a Theme SHALL alter only visual appearance
 and SHALL leave source code, agent state, Project data, models, Skills, Connectors, permissions, Work_Mode,
-Workspace_Experience, and Project_Origin unchanged; and the persisted Theme SHALL be independent of the
-Workspace_Experience and Work_Mode.
-**Validates: Requirements 29.4, 29.5**
+the Workspace_Experience layout, and Project_Origin unchanged.
+**Validates: Requirements 29.2, 29.4, 29.6, 29.7**
 
 ---
 

@@ -498,16 +498,25 @@ Beyond those two lock-in skills, the platform ships a curated Skill_Library that
 
 ### Requirement 29: Themes
 
-**User Story:** As a builder user, I want to pick a visual theme such as light or dark that sticks across my sessions, so that the platform looks the way I prefer without that choice affecting my project, my code, or my other settings.
+**User Story:** As a builder user, I want to pick from a catalog of named color themes (not just light and dark) — previewing one live before I commit to it — and I want each Workspace_Experience (e.g. the Vibe area vs. the Technical Workbench) to remember its OWN theme independently, so the platform looks the way I want in each surface without that choice affecting my project, my code, or my other settings.
+
+#### Definitions
+
+- **Theme.** A named visual appearance made of a `light` or `dark` base mode PLUS a color palette that recolors the surface (backgrounds, surfaces, accents, buttons, badges, and status colors). The catalog is a **closed but extensible** set that SHALL include at minimum the base `light` and `dark` themes AND a set of named color themes (e.g. "Pastel Pasture", "Out There", "Paranormal Purple", "Morning Dew", "Summer Sunset", "Peach Popsicle"); additional named themes MAY be added without changing the selection model.
+- **Theme preview vs. selection.** *Previewing* a Theme renders the surface in that Theme's colors WITHOUT persisting it (a reversible, uncommitted visual state). *Selecting* (committing) a Theme is a distinct second action (a second tap on the previewed Theme, or an explicit "Apply" action) that persists it.
 
 #### Acceptance Criteria
 
-1. THE AI_App_Builder SHALL offer a user-selectable Theme with at least `light` and `dark` values, defined as a closed but extensible enum.
-2. WHEN a user selects a Theme, THE AI_App_Builder SHALL apply only the visual appearance change and SHALL persist the selected Theme per User_Account.
-3. THE AI_App_Builder SHALL apply a user's persisted Theme to that user's subsequent Sessions until the user selects a different Theme.
-4. THE AI_App_Builder SHALL keep the Theme independent of the Workspace_Experience and the Work_Mode, such that changing a Workspace_Experience or a Work_Mode does not change the Theme and changing the Theme does not change either of them.
-5. WHEN a user changes the Theme, THE AI_App_Builder SHALL NOT alter any Project source code, agent state, Project data, the selected models, Skills, Connectors, permissions, Work_Mode, or Project_Origin.
-6. IF a user selects a Theme that is not one of the defined values, THEN THE AI_App_Builder SHALL reject the selection, SHALL leave the current Theme in effect, and SHALL return an error indicating the Theme is unsupported.
+1. THE AI_App_Builder SHALL offer a **catalog of named Themes**, defined as a closed but extensible enum, that includes at minimum the base `light` and `dark` themes and the named color themes listed in the definitions above; each Theme SHALL carry a display name and a full color palette applied to the surface.
+2. **Themes are PER-Workspace-Experience, not global.** THE AI_App_Builder SHALL persist a selected Theme **per (User_Account, Workspace_Experience) pair**, so that the Theme chosen while in one Workspace_Experience (e.g. the Vibe-first area) applies to that Workspace_Experience only and does NOT change the Theme of any other Workspace_Experience (e.g. the Technical Workbench).
+3. WHEN a user first enters a Workspace_Experience for which they have selected no Theme, THE AI_App_Builder SHALL apply that Workspace_Experience's **default Theme**; the user MAY then select a different Theme for that Workspace_Experience (or keep the default), and switching between Workspace_Experiences SHALL show each one's own remembered Theme.
+4. **Preview then commit.** WHEN a user previews a Theme, THE AI_App_Builder SHALL render the current surface in that Theme's colors WITHOUT persisting the selection (leaving the previously committed Theme in effect if the user navigates away or cancels); and THE AI_App_Builder SHALL persist the Theme only on an explicit second/commit action (a second selection of the previewed Theme, or an "Apply" action) — for that (User_Account, Workspace_Experience) pair.
+5. THE AI_App_Builder SHALL apply each Workspace_Experience's persisted (committed) Theme to that user's subsequent Sessions until the user commits a different Theme for that Workspace_Experience.
+6. WHEN a user previews, selects, or changes a Theme, THE AI_App_Builder SHALL apply only the visual appearance change to the current surface and SHALL NOT alter any Project source code, agent state, Project data, the selected models, Skills, Connectors, permissions, Work_Mode, Project_Origin, the Workspace_Experience layout itself, or any OTHER Workspace_Experience's Theme.
+7. WHEN a user selects or switches a Workspace_Experience (Requirement 27), THE AI_App_Builder SHALL NOT change any Workspace_Experience's committed Theme; the layout choice and the per-surface Theme are independent axes.
+8. IF a user selects or previews a Theme that is not one of the defined catalog values, THEN THE AI_App_Builder SHALL reject the request, SHALL leave the current committed Theme in effect, and SHALL return an error indicating the Theme is unsupported.
+
+*Note: a "let friends see my theme on my profile" sharing toggle is intentionally deferred to a later requirement and is NOT part of this requirement's scope.*
 
 ## Correctness Properties (for Property-Based Testing)
 
