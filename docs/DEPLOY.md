@@ -60,6 +60,55 @@ valid. Anything else logs `identity: LOGIN DISABLED — <reason>` and leaves
 | `SANDBOX_IMAGE` | `node:22-slim` | Image each Project sandbox runs. |
 | `AAB_SANDBOX_EGRESS` | `none` | Sandbox network posture. `none` = no network at all: commands run, but nothing can reach the network (so **`npm install` cannot work**). `registry` = allow the package-registry hosts, which requires per-host egress filtering that the CLI container backend **cannot** enforce — it fails closed, refusing every command. Only choose `registry` with a filtering-capable backend. Any unrecognized value falls back to `none`. |
 
+### Preview (the served dev server)
+
+A Preview is only real if a dev server is actually listening **and** the host can
+reach it. That needs a published port, and a published port needs a routable
+container network: `--network none` gives a container only a loopback interface,
+so a published port has no DNAT target and could never answer. Publishing a URL
+that cannot answer is exactly the failure mode this section exists to avoid, so
+the backend **refuses** that combination instead of pretending.
+
+That collides with deny-by-default egress, and the collision is real: the code a
+Preview runs is generated, untrusted code, so attaching it to a routable network
+grants it egress the sandbox posture otherwise withholds. **That trade is yours to
+make explicitly** — it is never a default.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AAB_PREVIEW_NETWORK` | unset → **no real Preview** | The container network a Project's dev server joins. **Unset: the Dev_Server stays an inert seam** — the Preview lifecycle is wired and answers, but no container is launched and the URL is honestly reported as a `http://preview.local/<id>` placeholder that serves nothing. **Set to a network name: Previews are real** — the dev server is launched detached inside the Project's Isolation_Boundary (same bind-mounted tree, same `aab.sandbox` owner label, same requested cgroup limits as an exec container) and its port is published to the host. You choose the network, so you choose how much egress the previewed app gets; a network that permits inbound while restricting egress is the containing choice. Composition **fails loudly** if this is set but the backend cannot run service containers, rather than silently falling back to the placeholder. |
+| `AAB_PREVIEW_HOST_IP` | `127.0.0.1` | Host IP previews are published on. Loopback by default so a preview is never exposed on every interface by accident. Put a reverse proxy in front of it rather than widening this. |
+| `AAB_PREVIEW_CONTAINER_PORT` | `5173` | The in-container port the dev server is asked to listen on. Exported to the container as `$PORT` (with `$HOST=0.0.0.0`). Must be a valid TCP port; an out-of-range value is ignored in favour of the default. |
+| `AAB_PREVIEW_PORT_RANGE` | `43000-43999` | Host ports previews may be published on, as `from-to`. A malformed or inverted range is ignored in favour of the default rather than guessed at. |
+
+How a dev server is started, in order: the Project's `package.json` `dev`, then
+`start`, then `serve` script (run as `npm run <script>` — the script *body* is
+never spliced into a command, so generated content is interpreted by npm inside
+the container and never by a host shell); Vite additionally gets explicit
+`--host 0.0.0.0 --port $PORT` flags because it ignores `$PORT`. A project with no
+dev script but an `index.html` is served by a **dependency-free stdlib static
+server**, which needs no install and therefore works under `AAB_SANDBOX_EGRESS=none`.
+A project with neither is refused with a structured reason. A `mobile` Target is
+refused here on purpose — an Expo preview needs a device-reachable endpoint, not a
+published HTTP port.
+
+Readiness is polled against the published URL up to the 60s bound (Req 1.3). A dev
+server that dies **during startup** is detected on the next poll by inspecting the
+container rather than waiting the bound out; one that dies **after** it came up is
+caught by a background liveness check every 10s. Either way its log tail is
+attached to the failure, the container is removed, the host port is released, and
+the committed snapshot from the last good commit is **retained** while the served
+status drops from `served` to `committed` with a null URL — so the surface stops
+advertising a URL that no longer answers.
+
+Two limits to know about here. `PreviewController`'s own 60s *startup* bound is not
+the one in force: because `start()` must return synchronously (the controller
+inspects its result inline), a container-backed start reports `ready` as soon as the
+launch is *requested*, and the real readiness bound is the one above. And while a
+dead preview is recorded and `notifyExit` runs, **nothing pushes a status frame to
+a connected client** — a client learns about it by polling `GET /preview`, not from
+the session SSE. Wiring that broadcast is a remaining follow-up.
+
 ### Resource quotas
 
 All optional; each must be a positive integer or it is ignored.
@@ -263,13 +312,35 @@ register exactly that URL with your identity provider.
 
 ## Known follow-ups
 
-- **No real Preview is served.** The Preview *lifecycle* is wired and reachable —
-  `GET /preview` and `POST /preview/restart` answer, status frames stream on the
-  session SSE, and publish-on-commit is enforced — but the DevServer behind it
-  (`src/project/dev-server.js`) is a documented inert seam: it records intent and
-  synthesizes a `http://preview.local/<id>` placeholder, launching nothing. A
-  client therefore receives a preview URL that serves no content. Making the
-  preview real means implementing a live dev server behind that existing seam.
+- ~~**No real Preview is served.**~~ **Done** — a real dev server now exists behind
+  the seam (`src/project/container-dev-server.js`), launched detached inside the
+  Project's Isolation_Boundary with its port published to the host, and it is
+  selected by setting `AAB_PREVIEW_NETWORK` (see *Preview* above). The inert seam
+  (`src/project/dev-server.js`) remains the default, so a deploy that has not made
+  the network/egress decision keeps exactly the old, honest placeholder behavior
+  rather than silently gaining egress. `runtime.previewMode` reports which one you
+  got (`'container'` or `'inert'`).
+
+  What is proven without a container: the emitted runtime argv (detached, published
+  port, owner label, project-only mount, boundary cgroup limits, unchanged isolation
+  flags), both fail-closed refusals, the dev-command decision, phase transitions,
+  the clock-driven readiness bound, dead-container detection both during and after
+  startup with its log tail, host-port accounting across failure/stop/reuse
+  (including that a failed preview cannot free a port another project holds),
+  teardown of a stop that races an in-flight launch, and — through the **real**
+  `PreviewController` — that publish-on-commit reports a live URL where the inert
+  seam reported a placeholder, and that a dead dev server stops being reported as
+  served. The static fallback server is additionally proven by running it as a real
+  process on a real port over real HTTP, including traversal, symlink-escape and
+  malformed-request (NUL byte) handling.
+
+  **What only a real container host can prove:** that the runtime accepts this argv,
+  that the published port is reachable from the host, and that a given generated
+  project's dev script really binds `0.0.0.0:$PORT`. To check it on a container
+  host: `docker network create aab-preview`, start with
+  `AAB_PREVIEW_NETWORK=aab-preview`, create a project and run a turn, then
+  `GET /preview?projectId=...` and fetch the returned URL — it must serve the app,
+  and `docker ps --filter label=aab.sandbox` must show the dev-server container.
 - **`AAB_SANDBOX_EGRESS=none` means package installs cannot work.** The CLI
   container backend cannot enforce per-host egress filtering, so the only postures
   available are "no network" (commands run) or "filtered" (which that backend

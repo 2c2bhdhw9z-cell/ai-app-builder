@@ -40,6 +40,7 @@ import {
   platformSecretSet,
   resolveDataDir,
   resolveQuotaConfig,
+  resolvePreviewConfig,
   PLATFORM_SECRET_ENV_NAMES,
   DEFAULT_DATA_DIR,
   DEFAULT_MAX_CONCURRENT_SANDBOXES,
@@ -69,6 +70,7 @@ function tempDataDir() {
  */
 function fakeBackend() {
   const runs = [];
+  const services = [];
   return {
     bin: 'fake-docker',
     image: 'fake:latest',
@@ -93,6 +95,26 @@ function fakeBackend() {
     },
     async remove() {},
     async reapOrphans() { return { removed: 0 }; },
+    // MIRRORS THE REAL BACKEND's service surface (the long-running, port-publishing
+    // containers a real Preview needs). Same rule as above: the fake must refuse
+    // exactly where production refuses, so it fails closed on a published port over
+    // a non-routable network instead of pretending a preview URL would answer.
+    supportsServices: true,
+    services,
+    async startService(spec) {
+      services.push(spec);
+      const publish = Array.isArray(spec.publish) ? spec.publish : [];
+      if (publish.length > 0 && spec.network === 'none') {
+        throw new Error('published ports require a routable network');
+      }
+      if (spec.network === 'filtered') {
+        throw new Error(`egress filtering unsupported: refusing network mode ${spec.network}`);
+      }
+      return { ok: true, containerId: `fake-${services.length}`, code: 0, stdout: '', stderr: '', timedOut: false, limitsApplied: true, degraded: false };
+    },
+    async serviceStatus() { return { ok: true, exists: true, running: true, exitCode: null }; },
+    async serviceLogs() { return { ok: true, logs: '' }; },
+    async stopService() { return { ok: true, stopped: true }; },
   };
 }
 
@@ -816,6 +838,129 @@ test('an unrecognized AAB_SANDBOX_EGRESS falls back to the restrictive posture',
     }
     // Only the explicit, recognized value opts in.
     assert.equal(makeRuntime({ dir, env: { AAB_SANDBOX_EGRESS: 'registry' } }).runtime.egressMode, 'registry');
+  } finally {
+    cleanup();
+  }
+});
+
+// ================================================= preview posture (follow-up 1)
+
+test('the Preview is the INERT seam by default — no container, and no egress opened behind the operator', () => {
+  const { dir, cleanup } = tempDataDir();
+  try {
+    const { runtime } = makeRuntime({ dir });
+    assert.equal(runtime.previewMode, 'inert');
+    assert.equal(runtime.previewNetwork, null);
+    // The default must not launch anything: a Preview needs a routable network, and
+    // the previewed app is untrusted GENERATED code, so opening one is the
+    // operator's explicit decision, never a default.
+    const created = runtime.projectManager.createProject({
+      accountId: 'owner-1', description: 'x', targetCategory: 'web', origin: 'blank',
+    });
+    const handle = runtime.sandboxManager.acquire(created.project.id);
+    const started = runtime.devServer.start({ projectId: created.project.id, sandbox: handle });
+    assert.equal(started.ok, true);
+    assert.match(started.url, /^http:\/\/preview\.local\//, 'the inert seam reports a placeholder, honestly');
+    assert.equal(runtime.backend.services.length, 0, 'the default posture must launch NO service container');
+  } finally {
+    cleanup();
+  }
+});
+
+test('AAB_PREVIEW_NETWORK makes the Preview REAL: a published dev-server container and a live URL', async () => {
+  const { dir, cleanup } = tempDataDir();
+  try {
+    const { runtime } = makeRuntime({
+      dir,
+      env: { AAB_PREVIEW_NETWORK: 'aab-preview', AAB_PREVIEW_PORT_RANGE: '45000-45010' },
+    });
+    assert.equal(runtime.previewMode, 'container');
+    assert.equal(runtime.previewNetwork, 'aab-preview');
+
+    const created = runtime.projectManager.createProject({
+      accountId: 'owner-1', description: 'x', targetCategory: 'web', origin: 'blank',
+    });
+    const projectId = created.project.id;
+    const handle = runtime.sandboxManager.acquire(projectId);
+    // Give the project something to serve, at the REAL bind-mount source the
+    // layout resolved for it.
+    fs.mkdirSync(handle.mountSource, { recursive: true });
+    fs.writeFileSync(path.join(handle.mountSource, 'index.html'), '<h1>hi</h1>');
+
+    const started = runtime.devServer.start({ projectId, sandbox: handle, targetCategory: 'web' });
+    assert.equal(started.ok, true, JSON.stringify(started));
+    assert.equal(started.url, 'http://127.0.0.1:45000', 'the URL is a real published host port');
+    assert.ok(!started.url.includes('preview.local'));
+
+    // A real service container was requested, inside this project's boundary.
+    assert.equal(runtime.backend.services.length, 1);
+    const spec = runtime.backend.services[0];
+    assert.equal(spec.network, 'aab-preview');
+    assert.equal(spec.mountSource, handle.mountSource);
+    assert.equal(spec.labelValue, handle.containerName, 'the owner label is what release() already reaps');
+    assert.deepEqual(spec.publish, [{ hostIp: '127.0.0.1', hostPort: 45_000, containerPort: 5173 }]);
+    // No dev script in a blank project, so the stdlib static server serves it —
+    // which needs no install and therefore works under deny-by-default egress.
+    assert.equal(spec.command[0], 'node');
+
+    runtime.devServer.stop(projectId);
+    await runtime.devServer.whenStopped(projectId);
+  } finally {
+    cleanup();
+  }
+});
+
+test('resolvePreviewConfig only enables a preview for an explicit network, and validates the port range', () => {
+  assert.deepEqual(resolvePreviewConfig({}), { enabled: false, network: null });
+  assert.deepEqual(resolvePreviewConfig({ AAB_PREVIEW_NETWORK: '   ' }), { enabled: false, network: null });
+
+  const on = resolvePreviewConfig({ AAB_PREVIEW_NETWORK: 'net-a' });
+  assert.equal(on.enabled, true);
+  assert.equal(on.network, 'net-a');
+  assert.equal(on.hostIp, '127.0.0.1', 'a preview publishes on loopback unless told otherwise');
+  assert.equal(on.portRange, undefined, 'an unset range leaves the module default in place');
+
+  assert.deepEqual(resolvePreviewConfig({ AAB_PREVIEW_NETWORK: 'n', AAB_PREVIEW_PORT_RANGE: '5000-5010' }).portRange, { from: 5_000, to: 5_010 });
+  // A malformed or inverted range falls back to the default rather than guessing.
+  for (const bad of ['5000', 'a-b', '5010-5000', '0-10', '1-70000', '']) {
+    assert.equal(
+      resolvePreviewConfig({ AAB_PREVIEW_NETWORK: 'n', AAB_PREVIEW_PORT_RANGE: bad }).portRange,
+      undefined,
+      `${JSON.stringify(bad)} must not be honored`,
+    );
+  }
+  assert.equal(resolvePreviewConfig({ AAB_PREVIEW_NETWORK: 'n', AAB_PREVIEW_HOST_IP: '10.0.0.5' }).hostIp, '10.0.0.5');
+
+  // The container port is range-checked HERE, not left to fail every start() later.
+  assert.equal(resolvePreviewConfig({ AAB_PREVIEW_NETWORK: 'n', AAB_PREVIEW_CONTAINER_PORT: '3000' }).containerPort, 3_000);
+  for (const bad of ['99999', '0', '-1', 'abc', '65536']) {
+    assert.equal(
+      resolvePreviewConfig({ AAB_PREVIEW_NETWORK: 'n', AAB_PREVIEW_CONTAINER_PORT: bad }).containerPort,
+      undefined,
+      `${bad} is not a usable container port`,
+    );
+  }
+});
+
+test('asking for a real Preview from a backend that cannot run services REFUSES to compose', () => {
+  const { dir, cleanup } = tempDataDir();
+  try {
+    // Silently falling back to the inert seam is how you ship placeholder URLs
+    // while believing previews work. Fail loudly instead.
+    const serviceless = () => {
+      const b = fakeBackend();
+      const { startService, ...rest } = b;
+      return rest;
+    };
+    assert.throws(
+      () =>
+        composeProjectRuntime({
+          composed: composePlatformOps({ secretProvider: platformSecretSet({}) }),
+          env: { AAB_DATA_DIR: dir, AAB_PREVIEW_NETWORK: 'aab-preview' },
+          createBackend: serviceless,
+        }),
+      /cannot run long-running service containers/,
+    );
   } finally {
     cleanup();
   }

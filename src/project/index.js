@@ -45,6 +45,16 @@ export { createProjectRegistry } from './project-registry.js';
 
 export { createDevServer } from './dev-server.js';
 
+export {
+  createContainerDevServer,
+  resolveDevCommand,
+  STATIC_PREVIEW_SERVER_SRC,
+  DEFAULT_PREVIEW_CONTAINER_PORT,
+  DEFAULT_PORT_RANGE,
+  DEV_SCRIPT_PREFERENCE,
+  READY_TIMEOUT_MS,
+} from './container-dev-server.js';
+
 // The PreviewController (Task 18.1/18.2, Req 3, 15.2-15.3, 16.4-16.5): the
 // first-class, lifecycle-managed Preview surface. It LAYERS ON the Dev_Server
 // seam (createDevServer above) — publish-on-commit web semantics (the served

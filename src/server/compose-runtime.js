@@ -62,6 +62,7 @@ import { createStorageLayout } from '../storage/layout.js';
 import { createProjectRegistry } from '../project/project-registry.js';
 import { createProjectManager } from '../project/project-manager.js';
 import { createDevServer } from '../project/dev-server.js';
+import { createContainerDevServer } from '../project/container-dev-server.js';
 import { createPreviewController } from '../project/preview-controller.js';
 import { createProjectOriginWithTemplates } from '../project/index.js';
 import { createSandboxManager } from '../sandbox/sandbox-manager.js';
@@ -144,6 +145,69 @@ export const PLATFORM_SECRET_ENV_NAMES = Object.freeze([
  * accepted `filtered`. The composition now states the posture explicitly.
  */
 export const SANDBOX_EGRESS_MODES = Object.freeze(['none', 'registry']);
+
+/**
+ * THE PREVIEW POSTURE (AAB_PREVIEW_NETWORK).
+ *
+ * A Preview is only real if a dev server is actually listening and the host can
+ * reach it. That needs a PUBLISHED PORT, and a published port needs a routable
+ * container network — `--network none` gives the container only a loopback
+ * interface, so a published port has no DNAT target and can never answer (see
+ * PUBLISH_REQUIRES_ROUTABLE_NETWORK).
+ *
+ * That collides with deny-by-default egress, and the collision is REAL, not
+ * cosmetic: the code a Preview runs is generated, untrusted code, so attaching it
+ * to a routable network grants exactly the egress the sandbox posture withholds.
+ * We refuse to make that trade silently. So:
+ *
+ * - UNSET (default): the Dev_Server stays the INERT seam. Identical behavior to
+ *   before — the Preview lifecycle is wired, no container is launched, and the URL
+ *   is honestly reported as a placeholder that serves nothing. Nothing regresses,
+ *   and no egress is opened behind the operator's back.
+ * - SET to a container network name: previews are REAL. The dev server is launched
+ *   detached inside the project's Isolation_Boundary and published on
+ *   AAB_PREVIEW_HOST_IP (loopback by default). The operator chooses the network
+ *   and therefore chooses how much egress the previewed app gets; a network that
+ *   restricts egress while permitting inbound is the containing choice.
+ */
+export function resolvePreviewConfig(env = process.env) {
+  const network = (env.AAB_PREVIEW_NETWORK ?? '').trim();
+  if (network === '') return { enabled: false, network: null };
+  return {
+    enabled: true,
+    network,
+    hostIp: (env.AAB_PREVIEW_HOST_IP ?? '').trim() || '127.0.0.1',
+    // Range-validated HERE rather than left to fail every start() later: an
+    // out-of-range port is a boot-time configuration error, and the rest of this
+    // preview config fails loudly at composition too.
+    ...(tcpPort(env.AAB_PREVIEW_CONTAINER_PORT) !== undefined
+      ? { containerPort: tcpPort(env.AAB_PREVIEW_CONTAINER_PORT) }
+      : {}),
+    ...(previewPortRange(env) ? { portRange: previewPortRange(env) } : {}),
+  };
+}
+
+/** Parse a legal TCP port, or undefined when unset/invalid/out of range. */
+function tcpPort(raw) {
+  const n = positiveInt(raw);
+  return n !== undefined && n <= 65_535 ? n : undefined;
+}
+
+/**
+ * Parse `AAB_PREVIEW_PORT_RANGE` as `from-to`. An unparseable or inverted range
+ * yields undefined so the module default applies, rather than a guess.
+ */
+function previewPortRange(env) {
+  const raw = (env.AAB_PREVIEW_PORT_RANGE ?? '').trim();
+  if (raw === '') return undefined;
+  const match = /^(\d+)\s*-\s*(\d+)$/.exec(raw);
+  if (!match) return undefined;
+  const from = Number(match[1]);
+  const to = Number(match[2]);
+  if (!Number.isInteger(from) || !Number.isInteger(to)) return undefined;
+  if (from < 1 || to > 65_535 || from > to) return undefined;
+  return { from, to };
+}
 
 /**
  * Build the live secret set to seed the central redactor, from the environment.
@@ -690,8 +754,43 @@ export function composeProjectRuntime({
     ...composed.commandGuardOptions(),
   });
 
-  const devServer = createDevServer();
-  const previewController = createPreviewController({ devServer, sandboxManager, now });
+  /**
+   * The Dev_Server behind the Preview. REAL (a detached, port-publishing container
+   * inside the project's Isolation_Boundary) when the operator has named a preview
+   * network; otherwise the inert seam, unchanged. See resolvePreviewConfig.
+   *
+   * `previewController` is referenced by the onExit callback before it exists —
+   * that is fine and deliberate: the callback only ever runs later, when a started
+   * Dev_Server dies, and routing that through notifyExit is what preserves the
+   * served preview and offers a restart (Req 3.6).
+   */
+  const preview = resolvePreviewConfig(env);
+  // If the operator explicitly asked for real previews, do NOT quietly fall back
+  // to the inert seam — that is how you end up serving placeholder URLs while
+  // believing previews work. Refuse to compose instead.
+  if (preview.enabled && typeof backend.startService !== 'function') {
+    throw new TypeError(
+      'AAB_PREVIEW_NETWORK is set, but the composed container backend cannot run ' +
+        'long-running service containers (no startService). A real Preview needs one; ' +
+        'refusing to fall back to the inert Dev_Server seam silently.',
+    );
+  }
+  let previewController;
+  const devServer = preview.enabled
+    ? createContainerDevServer({
+        backend,
+        network: preview.network,
+        hostIp: preview.hostIp,
+        ...(preview.containerPort !== undefined ? { containerPort: preview.containerPort } : {}),
+        ...(preview.portRange ? { portRange: preview.portRange } : {}),
+        ...(containerImage ? { image: containerImage } : {}),
+        now,
+        onExit: (projectId, info) => {
+          previewController?.notifyExit({ projectId, error: info?.error });
+        },
+      })
+    : createDevServer();
+  previewController = createPreviewController({ devServer, sandboxManager, now });
 
   const projectOrigin = createProjectOriginWithTemplates({
     persistenceStore,
@@ -758,6 +857,13 @@ export function composeProjectRuntime({
     workspaceExperienceStore,
     serverOptions,
     egressMode: egress.mode,
+    /**
+     * Is the Preview REAL (a launched dev-server container) or the inert seam?
+     * Exposed so a deployment can assert which one it got instead of discovering
+     * it from a preview URL that serves nothing.
+     */
+    previewMode: preview.enabled ? 'container' : 'inert',
+    previewNetwork: preview.network,
     /**
      * Owner-SCOPED store access, for the surfaces that operate on an account
      * rather than on one project — notably RetentionService (Req 24 account/project
