@@ -307,6 +307,93 @@ test('an induced writer failure aborts, returns a cause, and leaves the source t
   }
 });
 
+// --- (g) a caller-supplied destDir with pre-existing content survives abort --
+
+test('an abort does NOT destroy a caller-supplied destDir or its pre-existing content', () => {
+  const { base, layout } = tempLayout();
+  // A caller-owned, ALREADY NON-EMPTY directory used as the export target.
+  const callerDest = fs.mkdtempSync(path.join(os.tmpdir(), 'aab-caller-dest-'));
+  try {
+    persistTree(layout, PROJECT, {
+      'package.json': '{ "name": "app", "dependencies": {} }\n',
+      'src/index.js': "console.log('x');\n",
+    });
+
+    // Pre-existing caller content the export must NEVER remove on abort.
+    const keepFile = path.join(callerDest, 'IMPORTANT.txt');
+    const keepSubdir = path.join(callerDest, 'existing-subdir');
+    const keepNested = path.join(keepSubdir, 'data.json');
+    fs.writeFileSync(keepFile, 'do not delete me\n');
+    fs.mkdirSync(keepSubdir, { recursive: true });
+    fs.writeFileSync(keepNested, '{"keep":true}\n');
+
+    // Induce a writer failure so the export takes the abort path.
+    const failingWriter = () => {
+      throw new Error('disk full (induced)');
+    };
+    const exporter = createProjectExport({ layout, writeExport: failingWriter });
+    const result = exporter.export(PROJECT, { destDir: callerDest });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'WRITE_FAILED');
+
+    // The caller-owned directory and ALL its pre-existing content are intact.
+    assert.ok(fs.existsSync(callerDest), 'caller destDir must NOT be removed on abort');
+    assert.equal(fs.readFileSync(keepFile, 'utf8'), 'do not delete me\n', 'caller file survives');
+    assert.ok(fs.existsSync(keepSubdir), 'caller subdir survives');
+    assert.equal(fs.readFileSync(keepNested, 'utf8'), '{"keep":true}\n', 'nested caller file survives');
+  } finally {
+    fs.rmSync(callerDest, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+// --- (h) partial export output IS cleaned from a caller destDir on abort -----
+
+test('a mid-write abort removes only the export output from a caller destDir, keeping caller files', () => {
+  const { base, layout } = tempLayout();
+  const callerDest = fs.mkdtempSync(path.join(os.tmpdir(), 'aab-caller-dest2-'));
+  try {
+    persistTree(layout, PROJECT, {
+      'package.json': '{ "name": "app", "dependencies": {} }\n',
+      'src/index.js': "console.log('x');\n",
+      'src/nested/deep.js': 'export const d = 1;\n',
+    });
+
+    const keepFile = path.join(callerDest, 'KEEP.txt');
+    fs.writeFileSync(keepFile, 'keep\n');
+
+    // A writer that writes REAL partial output (the export's own files) and then
+    // throws — exercising the surgical cleanup of only what the export created.
+    const partialThenFail = (destDir, treeMap) => {
+      for (const [rel, contents] of Object.entries(treeMap)) {
+        const dest = path.join(destDir, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.writeFileSync(dest, Buffer.isBuffer(contents) ? contents : Buffer.from(String(contents), 'utf8'));
+      }
+      throw new Error('failed after partial write (induced)');
+    };
+    const exporter = createProjectExport({ layout, writeExport: partialThenFail });
+    const result = exporter.export(PROJECT, { destDir: callerDest });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'WRITE_FAILED');
+
+    // Caller content survives; the export's own partial files are cleaned up.
+    assert.equal(fs.readFileSync(keepFile, 'utf8'), 'keep\n', 'caller file survives');
+    assert.ok(fs.existsSync(callerDest), 'caller destDir itself survives');
+    assert.ok(!fs.existsSync(path.join(callerDest, 'package.json')), 'export file cleaned');
+    assert.ok(!fs.existsSync(path.join(callerDest, 'src', 'index.js')), 'export file cleaned');
+    assert.ok(!fs.existsSync(path.join(callerDest, 'src', 'nested', 'deep.js')), 'nested export file cleaned');
+    // The export-created directories that are now empty are pruned; destDir stays.
+    assert.ok(!fs.existsSync(path.join(callerDest, 'src', 'nested')), 'empty export subdir pruned');
+    assert.ok(!fs.existsSync(path.join(callerDest, 'src')), 'empty export subdir pruned');
+  } finally {
+    fs.rmSync(callerDest, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
 // --- factory shape ----------------------------------------------------------
 
 test('createProjectExport is a frozen factory with injected limit + timeout', () => {

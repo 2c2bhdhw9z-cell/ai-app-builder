@@ -154,14 +154,57 @@ function renderEnvTemplate(names) {
 }
 
 /**
- * Best-effort recursive cleanup of a partial export destination we created.
- * Never throws — a failed cleanup must not mask the original abort cause.
+ * Best-effort recursive removal of a temp export destination WE created. Only
+ * ever called for a dest the export itself allocated via fs.mkdtemp, so removing
+ * it wholesale can never destroy caller-owned data. Never throws — a failed
+ * cleanup must not mask the original abort cause.
  */
-function cleanupDest(destDir) {
+function removeCreatedTempDest(destDir) {
   try {
     fs.rmSync(destDir, { recursive: true, force: true });
   } catch {
     /* best-effort: a failed cleanup must never mask the abort cause */
+  }
+}
+
+/**
+ * Best-effort removal of ONLY the files/dirs THIS export wrote into a
+ * caller-supplied destination — never the destination itself. A caller passing
+ * an existing, possibly non-empty directory keeps every file the export did not
+ * create; only the export's own partial output is cleaned up on abort. Never
+ * throws — a failed cleanup must not mask the original abort cause.
+ *
+ * @param {string} destDir      the caller-owned destination.
+ * @param {string[]} writtenRel the rel-paths (project files + env template) the
+ *        export attempted to materialize under destDir.
+ */
+function removeExportOutput(destDir, writtenRel) {
+  // Remove the files the export wrote, then prune now-empty directories it
+  // created (deepest first), stopping at destDir which we never remove.
+  const dirsToTry = new Set();
+  for (const rel of writtenRel) {
+    const full = path.join(destDir, rel);
+    try {
+      fs.rmSync(full, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    // Record every ancestor directory (between destDir and the file) to prune.
+    let dir = path.dirname(full);
+    const stop = path.resolve(destDir);
+    while (path.resolve(dir) !== stop && path.resolve(dir).startsWith(stop + path.sep)) {
+      dirsToTry.add(path.resolve(dir));
+      dir = path.dirname(dir);
+    }
+  }
+  // Prune deepest-first so a parent is only removed after its children.
+  const ordered = [...dirsToTry].sort((a, b) => b.length - a.length);
+  for (const dir of ordered) {
+    try {
+      fs.rmdirSync(dir); // only succeeds if empty — leaves caller files intact
+    } catch {
+      /* best-effort: non-empty (caller-owned content) or already gone */
+    }
   }
 }
 
@@ -296,12 +339,24 @@ export function createProjectExport({
 
     const start = now();
 
-    /** Abort helper: clean up any partial output we created, then return cause. */
+    // Rel-paths the export attempted to write; populated just before the write
+    // so a post-write abort cleans up ONLY the export's own output (never the
+    // caller-owned destination). Empty until the write is attempted.
+    let writtenRel = [];
+
+    /**
+     * Abort helper: clean up ONLY the partial output the export itself created,
+     * then return the structured cause. When WE created the temp dest, remove it
+     * wholesale (it is ours). When the caller supplied the dest, remove ONLY the
+     * files/dirs this export wrote — NEVER the caller-owned directory or any
+     * pre-existing content in it (non-destructive contract).
+     */
     const abort = (code, message, cause) => {
-      // Clean up partial export output. When WE created the temp dest, remove it
-      // wholesale; when the caller supplied a dest, best-effort remove it so no
-      // half-written export is left behind (the export owns its destination).
-      cleanupDest(destDir);
+      if (createdTempDest) {
+        removeCreatedTempDest(destDir);
+      } else {
+        removeExportOutput(destDir, writtenRel);
+      }
       const result = { ok: false, projectId, code, message };
       if (cause !== undefined) result.cause = cause;
       return result;
@@ -323,8 +378,9 @@ export function createProjectExport({
     // never silently truncate.
     const fc = checkFileCount(tree, fileCountLimit);
     if (!fc.ok) {
-      // Clean up any temp dest we created, then REPORT the excess (Req 11.9).
-      cleanupDest(destDir);
+      // Clean up ONLY a temp dest we created (nothing written yet), then REPORT
+      // the excess (Req 11.9). A caller-owned dest is left untouched.
+      if (createdTempDest) removeCreatedTempDest(destDir);
       return {
         ok: false,
         projectId,
@@ -397,8 +453,12 @@ export function createProjectExport({
     }
 
     // (6) Materialize the export into the SEPARATE destination. A failing writer
-    // (or any I/O error) aborts, cleans up partial output, and — because we only
-    // ever read the source tree — leaves the Project's stored state UNCHANGED.
+    // (or any I/O error) aborts, cleans up ONLY the export's own partial output
+    // (never a caller-owned dest), and — because we only ever read the source
+    // tree — leaves the Project's stored state UNCHANGED. Record the rel-paths
+    // the export will write BEFORE the attempt so a mid-write abort can target
+    // exactly what it created.
+    writtenRel = [...Object.keys(exportTree), ENV_TEMPLATE_FILENAME];
     try {
       writeExport(destDir, exportTree, envTemplate);
     } catch (err) {

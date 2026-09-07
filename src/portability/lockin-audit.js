@@ -304,18 +304,10 @@ export function createLockinAudit({
 
   /**
    * Run every detector across a single decoded TEXT file body. Pushes findings
-   * (with 1-indexed line numbers) onto `findings`. `envReadIndex` accumulates
-   * the set of env-var NAMEs referenced anywhere, for the unused-env detector.
+   * (with 1-indexed line numbers) onto `findings`.
    */
-  function scanFile(rel, body, findings, envReadIndex) {
+  function scanFile(rel, body, findings) {
     const lines = toLines(body);
-
-    // Record which env-var NAMEs are read anywhere (any file counts as a read),
-    // so the unused-env detector can tell declared-but-unread from used.
-    const envMatches = body.match(/[A-Z][A-Z0-9_]{2,}/g);
-    if (envMatches) {
-      for (const name of envMatches) envReadIndex.add(name);
-    }
 
     const isSource = SOURCE_EXT_RE.test(rel);
     const isJsx = JSX_EXT_RE.test(rel);
@@ -441,13 +433,40 @@ export function createLockinAudit({
   }
 
   /**
+   * Build the env-read index: the set of env-var NAMEs referenced anywhere in
+   * the given text files OUTSIDE an env-template declaration. A name that
+   * appears in any non-template file counts as "read". This is the cross-file
+   * context the unused-env detector consults, so it MUST be built from the FULL
+   * current tree (not a changed-files subset) or a declared var whose sole
+   * reader is an unchanged file would be wrongly flagged unused.
+   */
+  function buildEnvReadIndex(textFiles) {
+    const envReadIndex = new Set();
+    for (const [rel, body] of Object.entries(textFiles)) {
+      const base = rel.split('/').pop() ?? '';
+      if (ENV_TEMPLATE_BASENAMES.has(base)) continue; // a declaration is not a read
+      const matches = body.match(/[A-Z][A-Z0-9_]{2,}/g);
+      if (matches) {
+        for (const name of matches) envReadIndex.add(name);
+      }
+    }
+    return envReadIndex;
+  }
+
+  /**
    * The unused-env detector: for every env-var NAME declared in a
    * .env.template/.example/.sample file, if it is not read ANYWHERE in the tree
-   * report it (declared-but-unread). Uses the accumulated envReadIndex, but a
-   * name is "read" only if it appears OUTSIDE its own declaring template.
+   * report it (declared-but-unread). Consumes the pre-accumulated
+   * `envReadIndex` (a name is "read" only if it appears OUTSIDE its own
+   * declaring template), so callers can compute the index over the FULL tree
+   * even when only a subset of files is otherwise (re)scanned.
+   *
+   * @param {Object<string,string>} templateFiles  the env-template files whose
+   *        declared NAMEs to check (a subset of the tree in incremental mode).
+   * @param {Set<string>} envReadIndex  NAMEs read anywhere in the full tree.
    */
-  function scanUnusedEnv(textFiles, findings) {
-    for (const [rel, body] of Object.entries(textFiles)) {
+  function scanUnusedEnv(templateFiles, envReadIndex, findings) {
+    for (const [rel, body] of Object.entries(templateFiles)) {
       const base = rel.split('/').pop() ?? '';
       if (!ENV_TEMPLATE_BASENAMES.has(base)) continue;
       const lines = toLines(body);
@@ -455,18 +474,7 @@ export function createLockinAudit({
         const m = /^([A-Z][A-Z0-9_]*)=/.exec(lines[i]);
         if (!m) continue;
         const name = m[1];
-        // Is this name read anywhere OTHER than an env-template declaration?
-        let readElsewhere = false;
-        const nameRe = new RegExp(`\\b${escapeRegExp(name)}\\b`);
-        for (const [otherRel, otherBody] of Object.entries(textFiles)) {
-          const otherBase = otherRel.split('/').pop() ?? '';
-          if (ENV_TEMPLATE_BASENAMES.has(otherBase)) continue; // skip declarations
-          if (nameRe.test(otherBody)) {
-            readElsewhere = true;
-            break;
-          }
-        }
-        if (!readElsewhere) {
+        if (!envReadIndex.has(name)) {
           findings.push({
             signal: 'unused-env',
             severity: 'medium',
@@ -479,19 +487,10 @@ export function createLockinAudit({
     }
   }
 
-  /**
-   * The core in-process detection over a { relPath: contents } tree map.
-   * Returns { findings, unverifiedSurfaces }. A text file is scanned; a binary
-   * (Buffer) or otherwise undecodable in-scope file is reported as an
-   * UNVERIFIED SURFACE (Req 11.12), never silently omitted. Excluded paths are
-   * skipped as DELIBERATE exclusions (not unverified surfaces).
-   */
-  function detect(tree) {
-    const findings = [];
-    const unverifiedSurfaces = [];
-    const envReadIndex = new Set();
+  /** Partition a tree into in-scope text files and unverified surfaces. */
+  function partition(tree) {
     const textFiles = {};
-
+    const unverifiedSurfaces = [];
     for (const [rel, contents] of Object.entries(tree)) {
       if (isExcludedPath(rel)) continue; // deliberate exclusion, not unverified
       if (typeof contents === 'string') {
@@ -510,11 +509,45 @@ export function createLockinAudit({
         });
       }
     }
+    return { textFiles, unverifiedSurfaces };
+  }
+
+  /**
+   * The core in-process detection over a { relPath: contents } tree map.
+   * Returns { findings, unverifiedSurfaces }. A text file is scanned; a binary
+   * (Buffer) or otherwise undecodable in-scope file is reported as an
+   * UNVERIFIED SURFACE (Req 11.12), never silently omitted. Excluded paths are
+   * skipped as DELIBERATE exclusions (not unverified surfaces).
+   *
+   * The per-file detectors run over `scanFiles` (the changed subset in an
+   * incremental re-audit). The one CROSS-FILE detector (unused-env) needs the
+   * whole current tree to decide whether a declared var is read elsewhere, so
+   * it consults an env-read index built from `fullTextFiles` — the FULL current
+   * tree — not just `scanFiles`. When omitted, `fullTextFiles` defaults to the
+   * scanned files (a full, non-incremental audit).
+   *
+   * @param {Object<string,string|Buffer>} tree  the files to run per-file
+   *        detectors over (the changed subset in incremental mode).
+   * @param {Object<string,string>} [fullTextFiles]  the FULL current tree's
+   *        text files, for the cross-file unused-env pass. Defaults to `tree`'s
+   *        own text files (a non-incremental audit).
+   */
+  function detect(tree, fullTextFiles = null) {
+    const findings = [];
+    const { textFiles, unverifiedSurfaces } = partition(tree);
 
     for (const [rel, body] of Object.entries(textFiles)) {
-      scanFile(rel, body, findings, envReadIndex);
+      scanFile(rel, body, findings);
     }
-    scanUnusedEnv(textFiles, findings);
+
+    // The cross-file unused-env pass: the env-read index MUST span the FULL
+    // current tree so a var whose sole reader is an UNCHANGED file is not
+    // wrongly flagged unused in an incremental re-audit. The env-templates to
+    // CHECK are those in the scanned set (so a removed/edited template is
+    // re-evaluated), but "is it read?" is answered against the whole tree.
+    const crossFileText = fullTextFiles ?? textFiles;
+    const envReadIndex = buildEnvReadIndex(crossFileText);
+    scanUnusedEnv(textFiles, envReadIndex, findings);
 
     return { findings, unverifiedSurfaces };
   }
@@ -614,7 +647,12 @@ export function createLockinAudit({
       for (const rel of changedSet) {
         if (Object.prototype.hasOwnProperty.call(tree, rel)) changedTree[rel] = tree[rel];
       }
-      const rescanned = detect(changedTree);
+      // The cross-file unused-env pass needs the FULL current tree's text files
+      // (not just the changed subset), so a declared var whose sole reader is
+      // an UNCHANGED file is not wrongly flagged unused (the incremental
+      // cross-file gap). Per-file detectors still run over the changed subset.
+      const { textFiles: fullTextFiles } = partition(tree);
+      const rescanned = detect(changedTree, fullTextFiles);
       findings = [...carriedFindings, ...rescanned.findings];
       unverifiedSurfaces = [...carriedSurfaces, ...rescanned.unverifiedSurfaces];
     } else {

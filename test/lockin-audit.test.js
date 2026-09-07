@@ -276,6 +276,57 @@ test('an incremental re-audit reflects the current state (removed signal does no
   assert.equal(next.findings[0].file, 'b.ts', 'unchanged b.ts finding carried forward');
 });
 
+test('an incremental re-audit does NOT falsely flag unused-env when the sole reader is an unchanged file', () => {
+  const audit = createLockinAudit({ now: stepClock(1) });
+  // Prior: a template declares API_KEY, read only by an UNCHANGED reader file.
+  // Clean prior (the var IS read), so there is no carried unused-env finding.
+  const prior = audit.audit(PROJECT, {
+    tree: {
+      '.env.template': 'API_KEY=\n',
+      'src/reader.ts': 'export const k = process.env.API_KEY;\n',
+    },
+  });
+  assert.equal(prior.ok, true);
+  assert.equal(
+    prior.findings.filter((f) => f.signal === 'unused-env').length,
+    0,
+    'prior is clean: API_KEY is read by src/reader.ts',
+  );
+
+  // Change ONLY the template (add a comment / whitespace), rescanning just it.
+  // src/reader.ts is UNCHANGED and still reads API_KEY. Under the pre-fix bug
+  // the cross-file pass saw only the changed template and flagged API_KEY as
+  // unused-env; feeding the FULL tree to the cross-file pass keeps it clean.
+  const next = audit.audit(PROJECT, {
+    tree: {
+      '.env.template': '# app config\nAPI_KEY=\n',
+      'src/reader.ts': 'export const k = process.env.API_KEY;\n',
+    },
+    priorResult: prior,
+    changedFiles: ['.env.template'],
+  });
+  assert.equal(next.ok, true);
+  assert.equal(
+    next.findings.filter((f) => f.signal === 'unused-env').length,
+    0,
+    'API_KEY is still read by the unchanged src/reader.ts — must NOT be flagged unused',
+  );
+
+  // Positive control: the SAME incremental machinery DOES flag a genuinely
+  // unread declared var, so the clean result above is not vacuous.
+  const orphan = audit.audit(PROJECT, {
+    tree: {
+      '.env.template': '# app config\nAPI_KEY=\nORPHAN_KEY=\n',
+      'src/reader.ts': 'export const k = process.env.API_KEY;\n',
+    },
+    priorResult: prior,
+    changedFiles: ['.env.template'],
+  });
+  const orphanFindings = orphan.findings.filter((f) => f.signal === 'unused-env');
+  assert.equal(orphanFindings.length, 1, 'the genuinely-unread ORPHAN_KEY IS flagged');
+  assert.equal(orphanFindings[0].evidence, 'ORPHAN_KEY');
+});
+
 // --- CLEAN generated template positive control (Req 11.1, Property 15 basis) -
 
 test('every clean generated template reports no findings (detectors are not no-ops)', () => {
