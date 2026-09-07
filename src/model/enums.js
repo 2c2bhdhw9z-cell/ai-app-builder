@@ -75,6 +75,26 @@ export const Workspace_Experience = Object.freeze([
  */
 export const DEFAULT_WORKSPACE_EXPERIENCE = 'kiro-style';
 
+/**
+ * The three Work_Modes (Req 28.1), identified by name: `vibe`
+ * (describe-and-build), `spec` (plan/requirements-first then build), and
+ * `hybrid` (a blend of the two). A Work_Mode is pure interaction FLOW — it
+ * shapes only how the Builder Server frames the NEXT turn's prompt/flow and
+ * never rewrites history or mutates the tree, so selecting one changes the
+ * collaboration style and never any Project data or other setting (Req 28.6).
+ * The values are exactly those in the spec, in that order — do not add,
+ * remove, or reorder them without a spec change.
+ */
+export const Work_Mode = Object.freeze(['vibe', 'spec', 'hybrid']);
+
+/**
+ * The default Work_Mode applied to a new Session when the user makes no
+ * selection (Req 28.3). `vibe` is the documented default (the first,
+ * describe-and-build mode). Exported so the per-Session module and any caller
+ * share one source of truth for the default.
+ */
+export const DEFAULT_WORK_MODE = 'vibe';
+
 /** True when `value` is a legal Target_Category. */
 export function isValidTargetCategory(value) {
   return Target_Category.includes(value);
@@ -108,4 +128,9 @@ export function isValidClassifierOutcome(value) {
 /** True when `value` is a legal Workspace_Experience (Req 27.1/27.7). */
 export function isValidWorkspaceExperience(value) {
   return Workspace_Experience.includes(value);
+}
+
+/** True when `value` is a legal Work_Mode (Req 28.1/28.7). */
+export function isValidWorkMode(value) {
+  return Work_Mode.includes(value);
 }
