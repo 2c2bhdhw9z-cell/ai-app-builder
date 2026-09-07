@@ -57,6 +57,7 @@ import {
   defaultCustomLayout,
   createWorkModeSession,
 } from '../presentation/index.js';
+import { isValidWorkspaceExperience, isValidTheme, THEME_CATALOG } from '../model/enums.js';
 
 /** Cap on a POST body we will buffer, so a client cannot exhaust memory. */
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -290,6 +291,38 @@ export function sessionHeaderFrame({ mode, choices } = {}) {
 }
 
 /**
+ * Project a named color Theme onto a SAFE, broadcastable `theme` frame (spec
+ * Task 33, Req 29, Property 22). PURE, so the exact shape is unit-testable and
+ * cannot drift between the GET/POST /theme responses, the SSE broadcast, and the
+ * /events reconnection frame — mirrors how workspaceExperienceFrame/workModeFrame
+ * are written and re-exported.
+ *
+ * The frame carries ONLY visual data: the selected `theme` id, its rendered
+ * `palette` (the frozen color map from THEME_CATALOG), whether this is an
+ * UNCOMMITTED preview vs a committed value (`previewed`), and which
+ * `workspaceExperience` the theme applies to (a Theme is committed per
+ * (User_Account, Workspace_Experience) pair, Req 29.2/29.3). There is
+ * structurally NOTHING here that could change source code, agent state, Project
+ * data, Snapshots, models, Skills, Connectors, permissions, Work_Mode,
+ * Project_Origin, the Workspace_Experience layout, or ANOTHER experience's
+ * committed Theme (Req 29.6, Property 22) — it re-parametrizes surface colors
+ * only, and a `previewed:true` frame is reversible (the committed value in the
+ * store is untouched).
+ *
+ * @param {{ theme:string, palette:object, previewed?:boolean, experience:string }} args
+ * @returns {{ type:'theme', theme:string, palette:object, previewed:boolean, workspaceExperience:string }}
+ */
+export function themeFrame({ theme, palette, previewed, experience } = {}) {
+  return {
+    type: 'theme',
+    theme,
+    palette,
+    previewed: previewed === true,
+    workspaceExperience: experience,
+  };
+}
+
+/**
  * Create the Builder Server.
  *
  * @param {object} opts
@@ -382,6 +415,37 @@ export function sessionHeaderFrame({ mode, choices } = {}) {
  *        later Session re-applies the layout (Req 27.5). With NO store injected,
  *        neither route is routed and every existing route/behavior is
  *        byte-identical (backward compatible).
+ * @param {object} [opts.themeStore]  an OPTIONAL ThemeStore
+ *        (src/presentation/theme-store.js). When present, two STRICTLY ADDITIVE,
+ *        VISUALS-ONLY routes are enabled — GET /theme (read the current
+ *        committed Theme + its palette for a (User_Account, Workspace_Experience)
+ *        pair) and POST /theme (a two-step { action:'preview'|'commit' }
+ *        interaction) — and the result is broadcast as a visuals-only `theme`
+ *        frame on the SAME per-session SSE stream as the Activity_Stream so the
+ *        surface recolors immediately (Req 29, Property 22). A Theme is committed
+ *        per (User_Account, Workspace_Experience) pair; the experience is taken
+ *        from the request or, when omitted and a workspaceExperienceStore is
+ *        injected, defaulted to that account's CURRENT Workspace_Experience.
+ *        Presentation is PER-ACCOUNT (not per-project): both routes gate on
+ *        AUTHN ONLY via the existing gate(req, null) and touch NO Project.
+ *        A PREVIEW is REVERSIBLE and NON-PERSISTING: it sets per-session
+ *        `themePreview` state + broadcasts a `previewed:true` frame and writes
+ *        NOTHING (Req 29.4). A COMMIT is the ONLY writer: it persists via
+ *        themeStore.commit, clears the per-session preview, and broadcasts a
+ *        `previewed:false` frame (Req 29.4/29.5). An out-of-catalog Theme (on
+ *        preview OR commit) is refused 400 { code:'unsupported_theme' } with the
+ *        current committed Theme left in effect and NO write and NO preview
+ *        (Req 29.8). This surface is structurally incapable of mutating Project
+ *        state or enqueuing a loop turn: it NEVER calls session.agent.send,
+ *        NEVER sets session.running, and has NO code path to Project data or any
+ *        non-theme setting — selecting/switching a Workspace_Experience never
+ *        changes any committed Theme, and committing one experience's Theme
+ *        never changes another's (Req 29.6/29.7). A (re)connecting /events client
+ *        also learns the CURRENT COMMITTED theme frame (previewed:false) for the
+ *        account's current experience so a later Session re-applies it (Req 29.5);
+ *        a live preview is NOT inherited as committed. With NO themeStore
+ *        injected, neither route is routed and every existing route/behavior is
+ *        byte-identical (backward compatible).
  * @param {number} [opts.confirmTimeoutMs=60000]  fail-closed confirm ceiling.
  * @param {() => number} [opts.now]       injectable clock.
  * @returns {object} frozen server handle.
@@ -399,6 +463,7 @@ export function createBuilderServer(opts = {}) {
     observability,
     previewController,
     workspaceExperienceStore,
+    themeStore,
     provider,
     model,
     confirmTimeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS,
@@ -486,6 +551,15 @@ export function createBuilderServer(opts = {}) {
        * (Req 28.6). It persists NO Project data.
        */
       workMode: createWorkModeSession({ now: () => new Date(now()) }),
+      /**
+       * The per-Session UNCOMMITTED Theme preview (spec Task 33, Req 29.4), or
+       * null. A PREVIEW sets this to { experience, theme }; a COMMIT or a
+       * cancel/navigate-away clears it back to null. This is per-surface,
+       * uncommitted, REVERSIBLE visual state — the committed Theme lives ONLY in
+       * the ThemeStore (the store is the sole writer, Req 29.4/29.5). It holds
+       * only two strings and has NO path to any Project state (Req 29.6).
+       */
+      themePreview: null,
     };
 
     /** Send a raw view payload to every SSE client of THIS session. */
@@ -767,6 +841,17 @@ export function createBuilderServer(opts = {}) {
     }
     if (workspaceExperienceStore && req.method === 'POST' && pathname === '/workspace-experience') {
       return handleSelectWorkspaceExperience(req, res);
+    }
+    // Strictly additive: the visuals-only Theme surface is only routed when a
+    // ThemeStore is injected (spec Task 33, Req 29, Property 22). With none
+    // injected these paths fall through to 405 exactly as an unknown route
+    // always has. Presentation is per-account, so both routes are authn only and
+    // touch no Project.
+    if (themeStore && req.method === 'GET' && pathname === '/theme') {
+      return handleGetTheme(req, res);
+    }
+    if (themeStore && req.method === 'POST' && pathname === '/theme') {
+      return handleTheme(req, res);
     }
     // The per-Session Work_Mode surface (spec Task 32, Req 28). Work_Mode is a
     // CORE Session capability (every Session has one, defaulting to 'vibe'), so
@@ -1057,6 +1142,202 @@ export function createBuilderServer(opts = {}) {
     return sendJson(res, 200, { ...frame });
   }
 
+  // -------- Theme surface (spec Task 33, Req 29, Property 22) — visuals only
+
+  /**
+   * Resolve the Workspace_Experience for a Theme operation (the theme key is the
+   * (User_Account, Workspace_Experience) pair, Req 29.2). Prefer an explicit
+   * value from the request; when it is omitted AND a workspaceExperienceStore is
+   * injected, default to that account's CURRENT experience (Req 29.3). Returns
+   * { ok:true, experience } or a structured { ok:false, status, body } the
+   * caller sends verbatim. NEVER writes anything, NEVER touches a Project.
+   */
+  function resolveThemeExperience(accountId, requested) {
+    let experience = typeof requested === 'string' && requested !== '' ? requested : '';
+    if (experience === '') {
+      if (workspaceExperienceStore && typeof workspaceExperienceStore.getSettings === 'function') {
+        experience = workspaceExperienceStore.getSettings(accountId).workspaceExperience;
+      } else {
+        return {
+          ok: false,
+          status: 400,
+          body: { error: "a 'workspaceExperience' is required", code: 'workspace_experience_required' },
+        };
+      }
+    }
+    if (!isValidWorkspaceExperience(experience)) {
+      return {
+        ok: false,
+        status: 400,
+        body: { error: 'unsupported Workspace_Experience', code: 'unsupported_experience' },
+      };
+    }
+    return { ok: true, experience };
+  }
+
+  /**
+   * Project the CURRENT COMMITTED Theme for a (account, experience) pair onto a
+   * theme frame with previewed:false. The store yields the experience default
+   * when none is committed (Req 29.3) and defensively reads an out-of-catalog
+   * persisted value back as that default, so THEME_CATALOG[committed] is always
+   * present. Read-only: getCommitted's default read writes NOTHING.
+   */
+  function committedThemeFrame(accountId, experience) {
+    const committed = themeStore.getCommitted(accountId, experience);
+    return themeFrame({
+      experience,
+      theme: committed,
+      palette: THEME_CATALOG[committed].palette,
+      previewed: false,
+    });
+  }
+
+  /**
+   * Broadcast a visuals-only theme frame to EVERY live session whose accountId
+   * matches (a Theme is per-User_Account (per-experience), so it applies across
+   * that account's Project Sessions). Mirrors broadcastWorkspaceExperience: it
+   * reuses the EXISTING per-session session.broadcast SSE mechanism and enqueues
+   * NO turn — it NEVER calls session.agent.send and NEVER sets session.running.
+   * A no-op when the account has no live sessions (a later /events connect
+   * re-applies the COMMITTED theme via the reconnection frame set). An optional
+   * `mutate(session)` runs per matched session to set/clear the per-session
+   * themePreview holder alongside the broadcast.
+   */
+  function broadcastTheme(accountId, frame, mutate) {
+    for (const session of sessions.values()) {
+      if (session.accountId !== accountId) continue;
+      if (typeof mutate === 'function') mutate(session);
+      session.broadcast(frame);
+    }
+  }
+
+  /**
+   * GET /theme — read the CURRENT committed Theme + its palette for the
+   * AUTHENTICATED account and a Workspace_Experience (Req 29.2/29.3). Presentation
+   * is per-account, so this gates on AUTHN ONLY via the EXISTING gate(req, null)
+   * — no projectId, no Project touched. On denial it replies with the IDENTICAL
+   * non-disclosing 401 ACCESS_DENIED the other routes use. The experience is read
+   * from the `workspaceExperience` query param; when omitted and a
+   * workspaceExperienceStore is injected it defaults to the account's current
+   * experience, else a 400 requires it. An unsupported experience is a 400. The
+   * committed value defaults to the experience's default Theme when none is
+   * committed (the store returns it WITHOUT writing). Read-only: touches NO
+   * Project state, enqueues NO turn.
+   */
+  async function handleGetTheme(req, res) {
+    // Presentation state is per-account: authn only, no projectId, no Project.
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const accountId = result.account.id;
+    const url = new URL(req.url, 'http://localhost');
+    const resolved = resolveThemeExperience(accountId, url.searchParams.get('workspaceExperience'));
+    if (!resolved.ok) return sendJson(res, resolved.status, resolved.body);
+
+    return sendJson(res, 200, { ...committedThemeFrame(accountId, resolved.experience) });
+  }
+
+  /**
+   * POST /theme — the two-step { action:'preview'|'commit' } Theme interaction
+   * (spec Task 33, Req 29.4/29.8, Property 22). Body { action, workspaceExperience,
+   * theme }. Gates on AUTHN ONLY via the EXISTING gate(req, null) (no projectId,
+   * no Project) — identical non-disclosing 401 on denial.
+   *
+   * This is a VISUALS-ONLY surface event: it is STRUCTURALLY INCAPABLE of
+   * mutating Project state or enqueuing a loop turn — it never references the
+   * agent/loop/tree paths, NEVER calls session.agent.send, and NEVER sets
+   * session.running (Req 29.6). It has no code path to Project data or any
+   * non-theme setting.
+   *
+   * VALIDATION ordering: an out-of-range `action` is a 400. The experience is
+   * resolved/validated exactly as GET. An out-of-catalog `theme` (on EITHER
+   * preview OR commit) is refused 400 { code:'unsupported_theme', current } with
+   * the CURRENT committed Theme left in effect, WITHOUT writing and WITHOUT
+   * setting a preview (Req 29.8).
+   *
+   * PREVIEW: set session.themePreview={experience,theme} for EVERY live session
+   * of this account and broadcast themeFrame previewed:true — it calls NO writer
+   * and persists NOTHING; the preview is reversible (Req 29.4). Responds 200 with
+   * the previewed frame.
+   *
+   * COMMIT: themeStore.commit(accountId, experience, theme) is the ONLY writer.
+   * On success, clear session.themePreview for the account's sessions and
+   * broadcast themeFrame previewed:false (Req 29.4/29.5). Responds 200 with the
+   * committed frame + at.
+   */
+  async function handleTheme(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    // Presentation state is per-account: authn only, no projectId, no Project.
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const accountId = result.account.id;
+
+    const action = typeof body?.action === 'string' ? body.action : '';
+    if (action !== 'preview' && action !== 'commit') {
+      return sendJson(res, 400, {
+        error: "an 'action' of 'preview' or 'commit' is required",
+        code: 'unsupported_action',
+      });
+    }
+
+    const resolved = resolveThemeExperience(accountId, body?.workspaceExperience);
+    if (!resolved.ok) return sendJson(res, resolved.status, resolved.body);
+    const experience = resolved.experience;
+
+    const theme = typeof body?.theme === 'string' ? body.theme : '';
+    // An out-of-catalog Theme is refused on BOTH preview and commit, WITHOUT
+    // writing and WITHOUT setting a preview: the current committed Theme is left
+    // in effect and returned so a client can confirm nothing changed (Req 29.8).
+    if (!isValidTheme(theme)) {
+      return sendJson(res, 400, {
+        error: 'unsupported Theme',
+        code: 'unsupported_theme',
+        current: committedThemeFrame(accountId, experience),
+      });
+    }
+
+    const palette = THEME_CATALOG[theme].palette;
+
+    if (action === 'preview') {
+      // Reversible, NON-PERSISTING: set the per-session preview holder for every
+      // live session of this account and broadcast a previewed:true frame. NO
+      // writer is called; the committed value in the store is untouched (Req 29.4).
+      const frame = themeFrame({ experience, theme, palette, previewed: true });
+      broadcastTheme(accountId, frame, (session) => {
+        session.themePreview = { experience, theme };
+      });
+      return sendJson(res, 200, { ...frame });
+    }
+
+    // COMMIT: the store is the ONLY writer (Req 29.4/29.5). The theme + experience
+    // were already screened, so a failure here would only be a store-level bad
+    // value — surface its structured error verbatim without changing state.
+    const committed = themeStore.commit(accountId, experience, theme);
+    if (!committed.ok) {
+      return sendJson(res, 400, {
+        error: committed.message ?? 'unsupported Theme',
+        code: committed.code,
+        current: committedThemeFrame(accountId, experience),
+      });
+    }
+
+    // Persisted. Clear the per-session preview for the account's sessions (the
+    // commit supersedes any in-flight preview) and broadcast the committed
+    // previewed:false frame so every client re-renders it — no turn.
+    const frame = themeFrame({ experience, theme, palette, previewed: false });
+    broadcastTheme(accountId, frame, (session) => {
+      session.themePreview = null;
+    });
+    return sendJson(res, 200, { ...frame, at: committed.at });
+  }
+
   // -------- Work_Mode surface (spec Task 32, Req 28) — a core Session capability
 
   /**
@@ -1228,6 +1509,25 @@ export function createBuilderServer(opts = {}) {
           layout: layoutForSettings(settings),
         }),
       );
+    }
+    // When a ThemeStore is injected AND a WorkspaceExperienceStore is injected
+    // (so the account's CURRENT Workspace_Experience — the theme key — is
+    // determinable), a (re)connecting client also learns the CURRENT COMMITTED
+    // Theme frame (previewed:false) for that experience, so a later Session
+    // re-applies it (Req 29.5). A LIVE preview is deliberately NOT inherited by a
+    // reconnecting client as committed — the reconnection frame always reflects
+    // the committed value. Without a workspaceExperienceStore the (account,
+    // experience) pair is undetermined here, so the theme frame is skipped.
+    // Strictly additive: with no themeStore the reconnection frame set is
+    // unchanged.
+    if (
+      themeStore &&
+      typeof themeStore.getCommitted === 'function' &&
+      workspaceExperienceStore &&
+      typeof workspaceExperienceStore.getSettings === 'function'
+    ) {
+      const experience = workspaceExperienceStore.getSettings(result.account.id).workspaceExperience;
+      frames.push(committedThemeFrame(result.account.id, experience));
     }
     // A (re)connecting client ALWAYS learns the CURRENT active Work_Mode in the
     // Session_Header (spec Task 32, Req 28.4). This is per-Session (keyed off the

@@ -95,6 +95,212 @@ export const Work_Mode = Object.freeze(['vibe', 'spec', 'hybrid']);
  */
 export const DEFAULT_WORK_MODE = 'vibe';
 
+/**
+ * The Theme catalog (Req 29.1), identified by id. A Theme is a named visual
+ * appearance: a `light` or `dark` base mode PLUS a color palette that recolors
+ * the surface. The catalog is the base `light` and `dark` themes PLUS the six
+ * named color themes from Req 29's Definitions ("Pastel Pasture", "Out There",
+ * "Paranormal Purple", "Morning Dew", "Summer Sunset", "Peach Popsicle").
+ *
+ * This set is CLOSED but EXTENSIBLE ONLY BY A SPEC CHANGE — additional named
+ * themes are added by appending members to this frozen list (and to
+ * THEME_CATALOG), never by open-ended user input. An out-of-catalog value is
+ * rejected at the edges via isValidTheme. Do not add, remove, or reorder values
+ * without a spec change.
+ */
+export const Theme = Object.freeze([
+  'light',
+  'dark',
+  'pastel-pasture',
+  'out-there',
+  'paranormal-purple',
+  'morning-dew',
+  'summer-sunset',
+  'peach-popsicle',
+]);
+
+/**
+ * THE THEME CATALOG (Req 29.1): a frozen map keyed by each Theme id to a frozen
+ * descriptor `{ id, displayName, base, palette }` where `base` is `'light'` or
+ * `'dark'` and `palette` carries IDENTICAL keys across every theme so a client
+ * can render any theme uniformly:
+ *
+ *   { background, surface, accent, button, badge,
+ *     statusInfo, statusSuccess, statusWarning, statusError }
+ *
+ * All values are real hex colors. `light` and `dark` are the neutral bases; the
+ * six named themes carry distinctive palettes with a documented base mode. Each
+ * entry and its palette are deep-frozen. Extended ONLY by a spec change.
+ */
+export const THEME_CATALOG = Object.freeze({
+  light: Object.freeze({
+    id: 'light',
+    displayName: 'Light',
+    base: 'light',
+    palette: Object.freeze({
+      background: '#ffffff',
+      surface: '#f5f6f8',
+      accent: '#2563eb',
+      button: '#2563eb',
+      badge: '#e2e8f0',
+      statusInfo: '#2563eb',
+      statusSuccess: '#16a34a',
+      statusWarning: '#d97706',
+      statusError: '#dc2626',
+    }),
+  }),
+  dark: Object.freeze({
+    id: 'dark',
+    displayName: 'Dark',
+    base: 'dark',
+    palette: Object.freeze({
+      background: '#0b0f19',
+      surface: '#161b26',
+      accent: '#60a5fa',
+      button: '#3b82f6',
+      badge: '#1f2937',
+      statusInfo: '#60a5fa',
+      statusSuccess: '#4ade80',
+      statusWarning: '#fbbf24',
+      statusError: '#f87171',
+    }),
+  }),
+  'pastel-pasture': Object.freeze({
+    id: 'pastel-pasture',
+    displayName: 'Pastel Pasture',
+    base: 'light',
+    palette: Object.freeze({
+      background: '#f4faf1',
+      surface: '#e6f3e1',
+      accent: '#6bbf59',
+      button: '#7cc47a',
+      badge: '#cfe8c5',
+      statusInfo: '#5b9bd5',
+      statusSuccess: '#4f9d69',
+      statusWarning: '#e0b64c',
+      statusError: '#d97a7a',
+    }),
+  }),
+  'out-there': Object.freeze({
+    id: 'out-there',
+    displayName: 'Out There',
+    base: 'dark',
+    palette: Object.freeze({
+      background: '#050418',
+      surface: '#140f33',
+      accent: '#00e5ff',
+      button: '#7c3aed',
+      badge: '#241a4d',
+      statusInfo: '#22d3ee',
+      statusSuccess: '#34d399',
+      statusWarning: '#facc15',
+      statusError: '#fb7185',
+    }),
+  }),
+  'paranormal-purple': Object.freeze({
+    id: 'paranormal-purple',
+    displayName: 'Paranormal Purple',
+    base: 'dark',
+    palette: Object.freeze({
+      background: '#160d24',
+      surface: '#241537',
+      accent: '#b06cf0',
+      button: '#9333ea',
+      badge: '#3a2352',
+      statusInfo: '#a78bfa',
+      statusSuccess: '#4ade80',
+      statusWarning: '#fbbf24',
+      statusError: '#f472b6',
+    }),
+  }),
+  'morning-dew': Object.freeze({
+    id: 'morning-dew',
+    displayName: 'Morning Dew',
+    base: 'light',
+    palette: Object.freeze({
+      background: '#f0fbfb',
+      surface: '#dff3f4',
+      accent: '#14b8a6',
+      button: '#2dd4bf',
+      badge: '#c2ebe9',
+      statusInfo: '#0ea5e9',
+      statusSuccess: '#10b981',
+      statusWarning: '#f59e0b',
+      statusError: '#ef4444',
+    }),
+  }),
+  'summer-sunset': Object.freeze({
+    id: 'summer-sunset',
+    displayName: 'Summer Sunset',
+    base: 'light',
+    palette: Object.freeze({
+      background: '#fff6ee',
+      surface: '#ffe8d6',
+      accent: '#f97316',
+      button: '#fb7185',
+      badge: '#ffd3b6',
+      statusInfo: '#f59e0b',
+      statusSuccess: '#65a30d',
+      statusWarning: '#ea580c',
+      statusError: '#dc2626',
+    }),
+  }),
+  'peach-popsicle': Object.freeze({
+    id: 'peach-popsicle',
+    displayName: 'Peach Popsicle',
+    base: 'light',
+    palette: Object.freeze({
+      background: '#fff5f2',
+      surface: '#ffe3dc',
+      accent: '#ff8a7a',
+      button: '#ff9f8a',
+      badge: '#ffcabf',
+      statusInfo: '#f472b6',
+      statusSuccess: '#5eb98a',
+      statusWarning: '#f5a524',
+      statusError: '#e5484d',
+    }),
+  }),
+});
+
+/**
+ * The default Theme applied when a user first enters a Workspace_Experience for
+ * which they have committed no Theme (Req 29.3). Keyed by ALL FIVE
+ * Workspace_Experience values; each maps to a valid Theme id. Entering an
+ * experience with no committed Theme applies THAT experience's default; the
+ * user may then commit a different Theme for that experience. Exported so the
+ * ThemeStore and any caller share one source of truth (cross-ref Req
+ * 29.1-29.3/29.5).
+ */
+export const DEFAULT_THEME_BY_EXPERIENCE = Object.freeze({
+  'kiro-style': 'light',
+  'vibe-first': 'summer-sunset',
+  'technical-workbench': 'dark',
+  'mobile-command-center': 'morning-dew',
+  custom: 'light',
+});
+
+/** The documented global Theme fallback for an unknown experience (Req 29.3). */
+export const DEFAULT_THEME = 'light';
+
+/**
+ * defaultThemeFor(experience): the default Theme id for a Workspace_Experience
+ * (Req 29.3), or the documented global fallback (`light`) for an experience not
+ * in the map. Never throws.
+ */
+export function defaultThemeFor(experience) {
+  return DEFAULT_THEME_BY_EXPERIENCE[experience] ?? DEFAULT_THEME;
+}
+
+/**
+ * themeCatalogEntry(id): the frozen `{ id, displayName, base, palette }`
+ * descriptor for a Theme id, or `null` for an unknown id — so callers read the
+ * palette without reaching into the frozen catalog map directly.
+ */
+export function themeCatalogEntry(id) {
+  return THEME_CATALOG[id] ?? null;
+}
+
 /** True when `value` is a legal Target_Category. */
 export function isValidTargetCategory(value) {
   return Target_Category.includes(value);
@@ -133,4 +339,9 @@ export function isValidWorkspaceExperience(value) {
 /** True when `value` is a legal Work_Mode (Req 28.1/28.7). */
 export function isValidWorkMode(value) {
   return Work_Mode.includes(value);
+}
+
+/** True when `value` is a legal Theme id (Req 29.1/29.8). */
+export function isValidTheme(value) {
+  return Theme.includes(value);
 }
