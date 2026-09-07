@@ -1,0 +1,792 @@
+/**
+ * compose-runtime.js — the PROJECT-RUNTIME composition root (final wiring pass).
+ *
+ * THE GAP THIS CLOSES: every collaborator the Builder Server needs to run a real
+ * create -> build -> preview flow was BUILT and unit-tested, but no code path in
+ * src/ ever constructed one for production. `startPlatformServer` injected only
+ * { authService, provider, observability }, so in the live process:
+ *
+ *   - POST /projects was NOT ROUTED AT ALL (it is gated on an injected
+ *     projectManager), so a Project could not be created over HTTP;
+ *   - /preview, /preview/restart, /theme and /workspace-experience were likewise
+ *     unrouted;
+ *   - no QuotaManager gated the turn or create paths, so Rate_Limits and
+ *     Resource_Quotas were UNENFORCED in the only composition that matters;
+ *   - no projectResolver was injected, so the server's gate fell back to
+ *     `resource = { id: projectId, ownerId: account.id }` — SELF-OWNED BY
+ *     CONSTRUCTION. Any authenticated account could open a Session on ANY
+ *     projectId string. ProjectRegistry.resolver() was written for exactly this
+ *     seam (see its docstring) and was never connected;
+ *   - no sandboxManager or layout was injected, so the agent's working directory
+ *     resolution fell all the way through to `process.cwd()` — a live turn would
+ *     have run the Builder_Agent, with file-write tools, in the SERVER'S OWN
+ *     SOURCE TREE rather than in a Project sandbox.
+ *
+ * This module is that missing production wiring and nothing more. It composes the
+ * EXISTING factories through their EXISTING seams, in the style of
+ * src/ops/compose.js: one `compose*` factory taking a single destructured options
+ * object, every clock/collaborator/backend injected, duck-typed requirements
+ * validated up front, `Object.freeze` on the result, and a `serverOptions()`
+ * bundle designed to be spread straight into createBuilderServer.
+ *
+ * PER-OWNER STORES (a correctness trap this avoids). SnapshotStore,
+ * PersistenceStore and SecretStore each pin an `ownerId` AT CONSTRUCTION, and the
+ * layout derives their paths from it — `controlSnapshotRegistryPath(ownerId,
+ * projectId)`, `controlSecretPath(ownerId, projectId, name)`. ProjectManager and
+ * SandboxManager, however, are single instances serving every account. Handing
+ * them one store pinned to a placeholder owner would write every account's
+ * snapshot metadata and secrets into ONE owner directory, collapsing the
+ * per-owner storage-path isolation axis (Req 7.6). So instead this composes a
+ * per-owner INSTANCE CACHE behind an owner-agnostic facade that resolves each
+ * call's owner from the ProjectRegistry (projectId -> ownerId) and delegates to
+ * that owner's store. An unregistered projectId resolves to no owner and is
+ * refused rather than written somewhere arbitrary.
+ *
+ * SEAMS THAT REMAIN SEAMS. The DevServer (src/project/dev-server.js) is
+ * deliberately inert — it records intent and synthesizes a placeholder URL,
+ * launching nothing. Wiring it makes the Preview LIFECYCLE reachable (status
+ * frames, restart accounting, publish-on-commit) but does NOT serve a real
+ * preview; that needs a real dev-server implementation behind the same seam. The
+ * container backend IS the real docker CLI path, but it cannot be exercised in a
+ * hermetic test, so `createBackend` is injected. Neither is faked as working.
+ *
+ * Node stdlib only; adds no runtime dependency.
+ */
+
+import os from 'node:os';
+import path from 'node:path';
+
+import { PROVIDERS } from '../engine/plumby.js';
+import { DEFAULT_MAX_SANDBOXES } from '../sandbox/sandbox-manager.js';
+import { createStorageLayout } from '../storage/layout.js';
+import { createProjectRegistry } from '../project/project-registry.js';
+import { createProjectManager } from '../project/project-manager.js';
+import { createDevServer } from '../project/dev-server.js';
+import { createPreviewController } from '../project/preview-controller.js';
+import { createProjectOriginWithTemplates } from '../project/index.js';
+import { createSandboxManager } from '../sandbox/sandbox-manager.js';
+import { createContainerBackend } from '../sandbox/container-backend.js';
+import { createCommandGuard } from '../sandbox/command-guard.js';
+import { createQuotaManager } from '../ops/quota-manager.js';
+import { createSecretStore } from '../secrets/secret-store.js';
+import { createSnapshotStore } from '../persistence/snapshot-store.js';
+import { createPersistenceStore } from '../persistence/persistence-store.js';
+import { createThemeStore } from '../presentation/theme-store.js';
+import { createWorkspaceExperienceStore } from '../presentation/workspace-experience-store.js';
+
+/**
+ * Where the platform keeps its export trees + control plane, when AAB_DATA_DIR is
+ * unset.
+ *
+ * DELIBERATELY OUTSIDE THE SERVER'S OWN TREE. An earlier default of `.data`
+ * resolved to `<server cwd>/.data`, which put every Project's sandbox mount — the
+ * agent's writable working directory — INSIDE the server's source checkout. That
+ * is the very hazard this composition exists to remove (see the header note about
+ * cwd falling through to process.cwd()), so the default must not reintroduce a
+ * milder version of it. A real deployment should set AAB_DATA_DIR to a mounted
+ * volume; see docs/DEPLOY.md.
+ */
+export const DEFAULT_DATA_DIR = path.join(os.homedir(), '.ai-app-builder', 'data');
+
+/**
+ * Non-provider environment variables whose VALUES are platform credentials.
+ * Provider API-key names are DERIVED from plumby's own provider table (see
+ * platformSecretEnvNames) rather than hand-listed, because a hand-copied list
+ * silently drifts — it had already missed GOOGLE_API_KEY, which plumby accepts as
+ * a Gemini alias.
+ */
+const PLATFORM_SECRET_ENV_NAMES_BASE = Object.freeze([
+  'OIDC_CLIENT_SECRET',
+  'OIDC_STATE_SIGNING_KEY',
+]);
+
+/**
+ * Every environment variable whose VALUE is a platform credential and must
+ * therefore be redactable everywhere the AuditLog / Observability / CommandGuard
+ * write. Provider key names come from plumby's PROVIDERS table through the engine
+ * boundary, so adding a provider upstream cannot leave its key unredacted here.
+ *
+ * WHY THIS EXISTS: composePlatformOps builds the ONE central redactor from a
+ * seeded secret set, and the entry point previously called it with NO
+ * secretProvider — so redaction was a documented no-op in the only composition
+ * that ships. A redactor can only redact values it was constructed with.
+ *
+ * SCOPE, stated precisely: this covers the PLATFORM's own credentials, which are
+ * known at boot. It does NOT cover per-project Connector secrets — those are read
+ * from the per-owner SecretStore at exec time, long after the redactor is built,
+ * so a Connector credential appearing in captured stderr is NOT redacted by this.
+ * Feeding those in dynamically needs a provider seam on the redactor and is a
+ * documented follow-up, not something this pass claims.
+ */
+export const PLATFORM_SECRET_ENV_NAMES = Object.freeze([
+  ...new Set([
+    ...Object.values(PROVIDERS ?? {}).flatMap((p) => (Array.isArray(p?.keys) ? p.keys : [])),
+    ...PLATFORM_SECRET_ENV_NAMES_BASE,
+  ]),
+]);
+
+/**
+ * Sandbox egress postures.
+ *
+ * - 'none' (DEFAULT): empty allowlist, so the SandboxManager asks for network
+ *   `none` and the container runs with no network at all. Commands RUN; anything
+ *   needing the network (npm install) cannot.
+ * - 'registry': allow the package-registry hosts. This produces the
+ *   NETWORK_FILTERED mode, which the CLI container backend CANNOT enforce
+ *   (`supportsEgressFiltering: false`) and therefore FAILS CLOSED on — every exec
+ *   is refused. Only select this with a backend that can install per-host rules.
+ *
+ * WHY THE DEFAULT MATTERS: the SandboxManager's own default packageRegistryHosts
+ * is ['registry.npmjs.org'], which makes the allowlist non-empty, which selects
+ * `filtered`, which the real backend refuses. Composing with no egress config
+ * therefore produced a sandbox in which EVERY command was denied before launch —
+ * fail-closed, but totally non-functional, and invisible behind a test fake that
+ * accepted `filtered`. The composition now states the posture explicitly.
+ */
+export const SANDBOX_EGRESS_MODES = Object.freeze(['none', 'registry']);
+
+/**
+ * Build the live secret set to seed the central redactor, from the environment.
+ * Returns the { secretValues, secretNames } shape composePlatformOps accepts.
+ *
+ * @param {Record<string,string|undefined>} [env=process.env]
+ */
+export function platformSecretSet(env = process.env) {
+  const secretValues = [];
+  const secretNames = [];
+  for (const name of PLATFORM_SECRET_ENV_NAMES) {
+    const value = env[name];
+    secretNames.push(name);
+    if (typeof value === 'string' && value.trim() !== '') secretValues.push(value);
+  }
+  return { secretValues, secretNames };
+}
+
+/**
+ * Resolve the data directory. Absolute paths are honored; a relative value is
+ * resolved against the process cwd so the on-disk location is unambiguous.
+ *
+ * @param {Record<string,string|undefined>} [env=process.env]
+ */
+export function resolveDataDir(env = process.env) {
+  const raw = (env.AAB_DATA_DIR ?? '').trim();
+  return raw !== '' ? path.resolve(raw) : DEFAULT_DATA_DIR;
+}
+
+/** Parse a positive-integer env override, or undefined when unset/invalid. */
+function positiveInt(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * How long a Sandbox boundary may sit unused before it is reclaimed.
+ *
+ * THIS IS WHAT GIVES THE CONCURRENCY COUNT A DOWNWARD EDGE. See
+ * `trackSandboxUsage` for the full reasoning; in short, nothing releases a
+ * boundary on the success path, so without reclamation the "concurrent sandboxes"
+ * count only ever grows and the quota that reads it eventually refuses everything
+ * until the process restarts.
+ */
+export const DEFAULT_SANDBOX_IDLE_MS = 15 * 60 * 1000;
+
+/**
+ * The composed global concurrent-Sandbox ceiling.
+ *
+ * Chosen to sit WELL BELOW the SandboxManager's own capacity
+ * (DEFAULT_MAX_SANDBOXES = 256) on purpose. Setting the ceiling equal to that
+ * capacity is a trap: the quota denies at `current >= max` BEFORE the acquire
+ * that would have triggered LRU eviction at `size > maxSandboxes`, so eviction
+ * can never run from a request path and the count sticks at the ceiling forever.
+ * With the ceiling below capacity, LRU is never the binding mechanism — idle
+ * reclamation is — and the ceiling is both enforceable and survivable.
+ */
+export const DEFAULT_MAX_CONCURRENT_SANDBOXES = Math.floor(DEFAULT_MAX_SANDBOXES / 4);
+
+/**
+ * Resolve the Resource_Quota config from the environment.
+ *
+ * WHY THE CEILING DIFFERS FROM THE MODULE DEFAULT. The quota is enforced against
+ * `sandboxManager.activeProjectIds().length`, and that set is a cache of SANDBOX
+ * BOUNDARY HANDLES, not a count of running containers: a handle is created on
+ * project create and on the first turn (resolving the agent cwd), and nothing
+ * releases it on the success path. The module's default ceiling of 10 against a
+ * monotonically growing set wedges the whole platform once ten Projects have been
+ * touched — every later create AND every turn 429s until a restart. The fix is a
+ * downward edge (idle reclamation, see trackSandboxUsage) plus a ceiling below the
+ * manager's capacity so LRU eviction is never what has to save us.
+ *
+ * maxConcurrentSandboxesPerAccount stays UNSET by default — the concrete value is
+ * a deferred product decision (see quota-manager.js), and inventing one here would
+ * be policy, not wiring. Setting it enables the Req 23 anti-starvation ceiling,
+ * without which one account can consume the whole global allowance.
+ */
+export function resolveQuotaConfig(env = process.env) {
+  const maxConcurrent = positiveInt(env.AAB_MAX_CONCURRENT_SANDBOXES) ?? DEFAULT_MAX_CONCURRENT_SANDBOXES;
+  const perAccount = positiveInt(env.AAB_MAX_CONCURRENT_SANDBOXES_PER_ACCOUNT);
+  const maxProjects = positiveInt(env.AAB_MAX_TOTAL_PROJECTS);
+  return {
+    quota: {
+      maxConcurrentSandboxes: maxConcurrent,
+      ...(perAccount !== undefined ? { maxConcurrentSandboxesPerAccount: perAccount } : {}),
+      ...(maxProjects !== undefined ? { maxTotalProjects: maxProjects } : {}),
+    },
+  };
+}
+
+/**
+ * Resolve the sandbox egress posture (see SANDBOX_EGRESS_MODES). An unrecognized
+ * value falls back to the restrictive 'none' rather than guessing.
+ */
+export function resolveEgressConfig(env = process.env) {
+  const mode = (env.AAB_SANDBOX_EGRESS ?? '').trim().toLowerCase();
+  const selected = SANDBOX_EGRESS_MODES.includes(mode) ? mode : 'none';
+  return {
+    mode: selected,
+    // 'none' => empty allowlist => the SandboxManager asks for network `none`.
+    // 'registry' => leave the manager's own default hosts in place (filtered).
+    ...(selected === 'none' ? { packageRegistryHosts: [] } : {}),
+  };
+}
+
+/**
+ * Compose the project runtime.
+ *
+ * @param {object} args
+ * @param {object} args.composed  the composePlatformOps result (audit/observability/redactor
+ *        + the *Options() bundles). REQUIRED: every choke point here routes through it.
+ * @param {Record<string,string|undefined>} [args.env=process.env]
+ * @param {() => number} [args.now]  injectable ms clock. SCOPE, precisely: it
+ *        drives the collaborators composed HERE — quota windows, preview/project
+ *        SLOs and idle-sandbox reclamation. It does NOT reach createBuilderServer
+ *        (the caller passes that separately) nor the ISO-timestamp clocks inside
+ *        the Snapshot/Persistence stores, which still read real time.
+ * @param {(opts:object)=>object} [args.createBackend]  container-backend factory.
+ *        Defaults to the REAL docker-CLI backend; injected in tests, which cannot
+ *        run a container.
+ * @param {(baseDir:string)=>object} [args.createLayout]  StorageLayout factory.
+ * @returns {object} frozen runtime composition
+ */
+export function composeProjectRuntime({
+  composed,
+  env = process.env,
+  now = () => Date.now(),
+  createBackend = createContainerBackend,
+  createLayout = createStorageLayout,
+} = {}) {
+  if (!composed || !composed.auditLog || typeof composed.commandGuardOptions !== 'function') {
+    throw new TypeError(
+      'composeProjectRuntime requires the composePlatformOps result as `composed` ' +
+        '(so audit/observability/redaction route through the SAME wired instances)',
+    );
+  }
+  if (typeof now !== 'function') {
+    throw new TypeError('composeProjectRuntime: now must be a function returning ms');
+  }
+
+  const dataDir = resolveDataDir(env);
+  const layout = createLayout(dataDir);
+
+  // The registry is the projectId -> ownerId authority, so it is built first: the
+  // auth gate, the quota counters and every per-owner store dispatch depend on it.
+  const registry = createProjectRegistry({ layout });
+
+  /**
+   * Resolve a projectId's owning account, or null when it is not registered.
+   *
+   * A registry read touches the filesystem, so it can THROW (corrupt or
+   * unreadable control plane). That must not propagate: the same function backs
+   * the server's projectResolver, and an escaping error would surface as a 500
+   * whose message contains the absolute control-plane path. Failing to resolve is
+   * therefore treated as "no owner" — which denies at the gate and refuses at the
+   * per-owner facades, the correct fail-closed direction.
+   */
+  function ownerOf(projectId) {
+    if (typeof projectId !== 'string' || projectId === '') return null;
+    try {
+      const resolved = registry.resolver(projectId);
+      return resolved && typeof resolved.ownerId === 'string' ? resolved.ownerId : null;
+    } catch (err) {
+      // Deny, but NOT silently: a corrupt/unreadable control plane would otherwise
+      // be indistinguishable from "no such project" — identical 401s to the
+      // operator, and a misleading "not in the ProjectRegistry" from the per-owner
+      // facades for a project that IS registered. The message is redacted through
+      // the central redactor by the AuditLog before it is recorded.
+      composed.auditLog.record({
+        type: 'PROJECT_REGISTRY_UNREADABLE',
+        at: now(),
+        projectId,
+        reason: err?.message ?? String(err),
+      });
+      return null;
+    }
+  }
+
+  /** The server's projectResolver seam: deny (null) rather than throw. */
+  function projectResolver(projectId) {
+    const ownerId = ownerOf(projectId);
+    return ownerId ? { id: projectId, ownerId } : null;
+  }
+
+  /**
+   * A per-owner instance cache. `create(ownerId)` is called at most once per
+   * owner; the returned `forProject(projectId)` resolves the owner from the
+   * registry and returns THAT owner's instance, or null when the project is
+   * unregistered (so nothing is ever written under a placeholder owner).
+   */
+  function perOwner(create) {
+    const cache = new Map();
+    function forOwner(ownerId) {
+      let instance = cache.get(ownerId);
+      if (!instance) {
+        instance = create(ownerId);
+        cache.set(ownerId, instance);
+      }
+      return instance;
+    }
+    return {
+      forOwner,
+      forProject(projectId) {
+        const ownerId = ownerOf(projectId);
+        return ownerId ? forOwner(ownerId) : null;
+      },
+      ownerCount: () => cache.size,
+    };
+  }
+
+  const secretStores = perOwner((ownerId) =>
+    createSecretStore({ layout, ownerId, ...composed.secretStoreOptions() }),
+  );
+  const persistenceStores = perOwner((ownerId) => createPersistenceStore({ layout, ownerId }));
+  // The owner's SnapshotStore is paired with THAT owner's PersistenceStore, so
+  // resume() can fall back to the most recent persisted tree for a project that
+  // has no snapshot yet (Req 19.6) instead of finding nothing.
+  const snapshotStores = perOwner((ownerId) =>
+    createSnapshotStore({ layout, ownerId, persistenceStore: persistenceStores.forOwner(ownerId) }),
+  );
+
+  /**
+   * SecretStore facade for the SandboxManager, which only needs
+   * envForProject(projectId) to inject a project's secret env at exec time. An
+   * unregistered project yields NO secret env rather than another owner's.
+   */
+  const secretStore = Object.freeze({
+    envForProject(projectId) {
+      const store = secretStores.forProject(projectId);
+      return store ? store.envForProject(projectId) : {};
+    },
+  });
+
+  /** Fail loudly rather than silently writing a registered project's data nowhere. */
+  function requireStore(store, projectId, what) {
+    if (!store) {
+      throw new Error(
+        `${what}: project ${JSON.stringify(projectId)} is not in the ProjectRegistry, ` +
+          'so its owning account cannot be resolved and no per-owner store can be selected',
+      );
+    }
+    return store;
+  }
+
+  /**
+   * Build an owner-dispatching facade over a per-owner store.
+   *
+   * Methods are forwarded GENERICALLY with their arguments untouched, keyed on the
+   * projectId in the first positional argument. Hand-copying each signature was
+   * the alternative and it is a standing drift hazard — every one of these stores
+   * takes `(projectId, ...rest)`, so forwarding preserves the real contract even
+   * if a method gains a parameter later.
+   *
+   * `softMethods` answer without an owner (there is genuinely nothing to report
+   * for an unregistered project); every other method REFUSES rather than writing a
+   * registered account's data under a placeholder owner.
+   */
+  function ownerDispatchingFacade({ stores, label, methods, softMethods = {}, objectArgMethods = [] }) {
+    const facade = {};
+    for (const name of methods) {
+      facade[name] = (projectId, ...rest) => {
+        const store = stores.forProject(projectId);
+        if (!store && Object.hasOwn(softMethods, name)) return softMethods[name];
+        return requireStore(store, projectId, label)[name](projectId, ...rest);
+      };
+    }
+    // onTurnComplete-style methods take a single { projectId, ... } object.
+    for (const name of objectArgMethods) {
+      facade[name] = (args = {}) => {
+        // Report the ACTUAL fault. Resolving the owner first would blame a missing
+        // registry entry ("project undefined is not in the ProjectRegistry") for a
+        // call whose real problem is that no projectId was passed at all. With a
+        // valid projectId the owner resolves and the store raises its OWN
+        // validation error for the rest of the payload, unchanged.
+        if (typeof args?.projectId !== 'string' || args.projectId === '') {
+          throw new TypeError(`${label}: projectId is required to select the owning account's store`);
+        }
+        return requireStore(stores.forProject(args.projectId), args.projectId, label)[name](args);
+      };
+    }
+    return Object.freeze(facade);
+  }
+
+  const snapshotStore = ownerDispatchingFacade({
+    stores: snapshotStores,
+    label: 'SnapshotStore',
+    methods: ['commitSnapshot', 'commitExplicit', 'restore', 'resume', 'listSnapshots', 'latestSnapshot', 'deleteSnapshots'],
+    objectArgMethods: ['onTurnComplete'],
+  });
+
+  const persistenceStore = ownerDispatchingFacade({
+    stores: persistenceStores,
+    label: 'PersistenceStore',
+    methods: ['persist', 'persistPartial', 'persistNow', 'flush', 'hasPending', 'readPersistedTree', 'deleteProjectTree'],
+    // An unregistered project has no pending write, which is a true answer.
+    softMethods: { hasPending: false },
+  });
+
+  // The REAL container runtime path. Construction does not shell out, so a host
+  // with no docker still boots and answers /healthz; a Sandbox acquire then fails
+  // with the existing SANDBOX_ACQUIRE_FAILED 503 rather than a silent success.
+  //
+  // NOT DONE HERE, deliberately: `sandboxManager.reapAllOrphans()` is never called
+  // at startup, so containers left behind by a crashed previous process are not
+  // reaped. Calling it would put container-runtime I/O on the boot path, which is
+  // exactly what must not happen (/healthz has to answer on a host with no
+  // runtime). A reaper belongs on a schedule or an explicit admin trigger; per
+  // project orphan cleanup still happens on release. See docs/DEPLOY.md.
+  const containerBin = (env.CONTAINER_BIN ?? '').trim() || undefined;
+  const containerImage = (env.SANDBOX_IMAGE ?? '').trim() || undefined;
+  const backend = createBackend({
+    ...(containerBin ? { bin: containerBin } : {}),
+    ...(containerImage ? { image: containerImage } : {}),
+  });
+
+  // The egress posture is stated EXPLICITLY rather than inherited: the manager's
+  // own default allowlist selects a network mode the real CLI backend refuses,
+  // which denies every command in every sandbox. See SANDBOX_EGRESS_MODES.
+  const egress = resolveEgressConfig(env);
+  const baseSandboxManager = createSandboxManager({
+    layout,
+    backend,
+    secretStore,
+    config: { ...(egress.packageRegistryHosts ? { packageRegistryHosts: egress.packageRegistryHosts } : {}) },
+  });
+
+  /**
+   * Give the live-Sandbox set a DOWNWARD EDGE by reclaiming idle boundaries.
+   *
+   * THE PROBLEM THIS SOLVES. `sandboxManager.acquire(projectId)` creates a
+   * long-lived boundary record, and nothing releases it on any success path: a
+   * create acquires one, and so does the first turn (the server resolves the
+   * agent's cwd through acquire). The concurrent-Sandbox Resource_Quota is
+   * enforced against the size of that set, so the count only ever grows — and
+   * once it reaches the ceiling, EVERY create and EVERY turn is refused until the
+   * process restarts. The SandboxManager's LRU eviction cannot rescue it either,
+   * because the quota denies at `current >= max` before the acquire that would
+   * trigger eviction at `size > maxSandboxes`.
+   *
+   * THE FIX, at the composition level (no built module changes). Boundaries are
+   * cheap bookkeeping — the container backend is one-shot per exec, so an idle
+   * boundary holds a mount path, not a running container. So track last use and
+   * release boundaries idle beyond `idleMs`. The count now falls on its own, the
+   * ceiling becomes survivable (recovery is time-bounded, not restart-only), and
+   * every bit of it is driven by the INJECTED clock, so tests advance time instead
+   * of waiting.
+   *
+   * KNOWN LIMITATION, stated rather than hidden: at exactly the ceiling, a turn on
+   * a project that ALREADY holds a boundary is also refused, because the quota
+   * seam takes no per-project context (`concurrencyCount()` receives no projectId)
+   * and so cannot exclude the requester. Idle reclamation clears that within
+   * idleMs instead of requiring a restart. Fixing it properly means a per-project
+   * exclusion in the QuotaManager/Builder Server, which is beyond a wiring pass.
+   */
+  function trackSandboxUsage(manager, idleMs) {
+    /** projectId -> last-use ms, on the injected clock. */
+    const lastUsedAt = new Map();
+
+    /**
+     * Boundaries reclaimed but whose async teardown has not landed yet.
+     *
+     * REQUIRED FOR CORRECTNESS, not bookkeeping neatness: `release()` is async, so
+     * a reclaimed projectId is still in `manager.activeProjectIds()` for a while.
+     * Without this set, the next in-use scan would find no last-use entry for it,
+     * hit the defensive "never seen, assume in use" branch, and RESURRECT it as
+     * in-use — making the count oscillate and the ceiling stick.
+     */
+    const reclaiming = new Set();
+
+    /**
+     * projectId -> count of exec() runs currently in flight.
+     *
+     * Reclamation must never tear down a boundary that is running a command. The
+     * SandboxManager's own LRU eviction explicitly skips boundaries with in-flight
+     * work; a purely time-based sweep has no such signal, so the wrapper counts its
+     * own. Without this, lowering AAB_SANDBOX_IDLE_MS below a command's wall-clock
+     * time would force-remove containers mid-run.
+     */
+    const inFlight = new Map();
+
+    function touch(projectId) {
+      if (typeof projectId === 'string' && projectId !== '') {
+        // Using a boundary again cancels its pending reclamation.
+        reclaiming.delete(projectId);
+        lastUsedAt.set(projectId, now());
+      }
+      return projectId;
+    }
+
+    /**
+     * The boundaries actually IN USE — acquired or exec'd within idleMs.
+     *
+     * This, not the raw boundary set, is what "concurrent sandboxes" means for a
+     * quota, and it is what makes the count fall SYNCHRONOUSLY: `release()` is
+     * async (it removes and reaps containers before dropping its entry), so a
+     * sweep cannot shrink `activeProjectIds()` in time for the synchronous quota
+     * check that triggered it. Excluding idle boundaries from the count is exact
+     * and immediate; the release that follows is cleanup.
+     */
+    function activeProjectIdsInUse() {
+      const cutoff = now() - idleMs;
+      return manager.activeProjectIds().filter((projectId) => {
+        // Already reclaimed; its teardown is simply still in flight.
+        if (reclaiming.has(projectId)) return false;
+        const at = lastUsedAt.get(projectId);
+        if (at === undefined) {
+          // A boundary we never saw acquired (defensive): start its clock now
+          // rather than treating something possibly in use as idle.
+          lastUsedAt.set(projectId, now());
+          return true;
+        }
+        return at > cutoff;
+      });
+    }
+
+    /** Release every boundary unused for longer than idleMs. Returns the count. */
+    function reclaimIdle() {
+      const cutoff = now() - idleMs;
+      let reclaimed = 0;
+      // Forget boundaries the BASE manager dropped on its own (exec auto-release,
+      // LRU eviction) — those bypass this wrapper's release(), so their entries
+      // would otherwise accumulate for the process lifetime.
+      const live = new Set(manager.activeProjectIds());
+      for (const projectId of lastUsedAt.keys()) {
+        if (!live.has(projectId)) lastUsedAt.delete(projectId);
+      }
+
+      for (const projectId of manager.activeProjectIds()) {
+        if (reclaiming.has(projectId)) continue; // teardown already in flight
+        // Never tear down a boundary with a command in flight — the manager's own
+        // eviction refuses to, and so must this.
+        if ((inFlight.get(projectId) ?? 0) > 0) continue;
+        const at = lastUsedAt.get(projectId);
+        if (at === undefined) {
+          lastUsedAt.set(projectId, now());
+          continue;
+        }
+        if (at <= cutoff) {
+          lastUsedAt.delete(projectId);
+          reclaiming.add(projectId);
+          reclaimed += 1;
+          // Fire-and-forget: release() is async and its container teardown must
+          // not block the request that triggered the sweep. The boundary is
+          // already out of the in-use count, so the count falls immediately.
+          Promise.resolve()
+            .then(() => {
+              // CANCELLATION GUARD. The commonest trigger for this whole sweep is
+              // the first turn after an idle period: POST /message runs the quota
+              // check (which schedules this release) and THEN acquires the boundary
+              // for the agent's cwd. Without this guard the release lands after
+              // that re-acquire, deletes the fresh record, and reaps the project's
+              // containers BY LABEL — killing the command the turn just launched.
+              // touch() is the only thing that re-adds a last-use entry, so its
+              // presence means "re-acquired since we scheduled this": stand down.
+              if (lastUsedAt.has(projectId)) return null;
+              return manager.release(projectId);
+            })
+            .then((result) => {
+              // release() reports non-throwing teardown/reap failures in `errors`.
+              if (result && Array.isArray(result.errors) && result.errors.length > 0) {
+                composed.auditLog.record({
+                  type: 'SANDBOX_RECLAIM_INCOMPLETE',
+                  at: now(),
+                  projectId,
+                  reason: result.errors.join('; '),
+                });
+              }
+            })
+            .catch((err) => {
+              // Never silent: a container that fails to tear down would otherwise
+              // accumulate with no signal, in a composition where every other
+              // anomaly reaches the audit log.
+              composed.auditLog.record({
+                type: 'SANDBOX_RECLAIM_FAILED',
+                at: now(),
+                projectId,
+                reason: err?.message ?? String(err),
+              });
+            })
+            .finally(() => reclaiming.delete(projectId));
+        }
+      }
+      return reclaimed;
+    }
+
+    return Object.freeze({
+      ...manager,
+      acquire(projectId) {
+        touch(projectId);
+        return manager.acquire(projectId);
+      },
+      async exec(projectId, ...rest) {
+        touch(projectId);
+        inFlight.set(projectId, (inFlight.get(projectId) ?? 0) + 1);
+        try {
+          return await manager.exec(projectId, ...rest);
+        } finally {
+          const remaining = (inFlight.get(projectId) ?? 1) - 1;
+          if (remaining > 0) inFlight.set(projectId, remaining);
+          else inFlight.delete(projectId);
+          // A long command counts as use at COMPLETION too, so a run that spans
+          // the idle window does not leave the boundary instantly reclaimable.
+          touch(projectId);
+        }
+      },
+      release(projectId) {
+        lastUsedAt.delete(projectId);
+        reclaiming.delete(projectId);
+        return manager.release(projectId);
+      },
+      reclaimIdle,
+      activeProjectIdsInUse,
+      idleMs,
+    });
+  }
+
+  const sandboxIdleMs = positiveInt(env.AAB_SANDBOX_IDLE_MS) ?? DEFAULT_SANDBOX_IDLE_MS;
+  const sandboxManager = trackSandboxUsage(baseSandboxManager, sandboxIdleMs);
+
+  // Rate_Limits and Resource_Quotas, counted from the REAL registry and the REAL
+  // set of live sandboxes rather than from constants.
+  const quotaManager = createQuotaManager({
+    config: resolveQuotaConfig(env),
+    sandboxManager,
+    projectCounter: (accountId) => registry.countForOwner(accountId),
+    // Sweep idle boundaries BEFORE counting, so the count reflects sandboxes
+    // actually in use rather than every project ever touched since boot. This is
+    // the downward edge that keeps the ceiling from becoming permanent.
+    concurrencyCount: () => {
+      sandboxManager.reclaimIdle();
+      return sandboxManager.activeProjectIdsInUse().length;
+    },
+    accountConcurrencyCount: (accountId) =>
+      sandboxManager.activeProjectIdsInUse().filter((projectId) => ownerOf(projectId) === accountId).length,
+    auditSink: composed.auditLog,
+    now,
+  });
+
+  // Command execution choke point: confirm-class decisions land on the wired
+  // AuditLog with the command redacted through the central redactor.
+  const commandGuard = createCommandGuard({
+    manager: sandboxManager,
+    ...composed.commandGuardOptions(),
+  });
+
+  const devServer = createDevServer();
+  const previewController = createPreviewController({ devServer, sandboxManager, now });
+
+  const projectOrigin = createProjectOriginWithTemplates({
+    persistenceStore,
+    snapshotStore,
+    sandboxManager,
+    projectRegistry: registry,
+    now,
+  });
+
+  const projectManager = createProjectManager({
+    registry,
+    sandboxManager,
+    quotaManager,
+    snapshotStore,
+    projectOrigin,
+    persistenceStore,
+    previewController,
+    devServer,
+    now,
+  });
+
+  const themeStore = createThemeStore({ layout });
+  const workspaceExperienceStore = createWorkspaceExperienceStore({ layout });
+
+  /**
+   * The bundle to spread into createBuilderServer:
+   *   createBuilderServer({ authService, provider, ...runtime.serverOptions() })
+   *
+   * `projectResolver` is registry.resolver — the seam the ProjectRegistry
+   * docstring was written for. With it, a Project owned by another account (or a
+   * projectId that does not exist) yields the SAME non-disclosing access-denied
+   * as an unauthenticated request, instead of being treated as self-owned.
+   */
+  function serverOptions() {
+    return {
+      layout,
+      sandboxManager,
+      commandGuard,
+      projectResolver,
+      quotaManager,
+      projectManager,
+      previewController,
+      themeStore,
+      workspaceExperienceStore,
+    };
+  }
+
+  return Object.freeze({
+    dataDir,
+    layout,
+    registry,
+    backend,
+    sandboxManager,
+    secretStore,
+    snapshotStore,
+    persistenceStore,
+    quotaManager,
+    commandGuard,
+    devServer,
+    previewController,
+    projectOrigin,
+    projectManager,
+    themeStore,
+    workspaceExperienceStore,
+    serverOptions,
+    egressMode: egress.mode,
+    /**
+     * Owner-SCOPED store access, for the surfaces that operate on an account
+     * rather than on one project — notably RetentionService (Req 24 account/project
+     * deletion), which deletes an owner's data and only then unregisters, at which
+     * point the projectId-keyed facades can no longer resolve an owner. Not wired
+     * to a route in this pass; exposed so it can be, without reaching around the
+     * per-owner isolation this composition establishes.
+     */
+    storesForOwner(ownerId) {
+      // These are WRITE-capable handles keyed by an ownerId that becomes a path
+      // component, so reject a missing/blank one. NOTE: this does NOT verify the
+      // owner exists in the registry — an unknown ownerId yields usable handles
+      // over an empty owner. Path traversal is impossible regardless: the layout
+      // refuses any ownerId that is not a single safe path segment.
+      if (typeof ownerId !== 'string' || ownerId.trim() === '') {
+        throw new TypeError('storesForOwner: ownerId must be a non-empty string');
+      }
+      return Object.freeze({
+        secretStore: secretStores.forOwner(ownerId),
+        snapshotStore: snapshotStores.forOwner(ownerId),
+        persistenceStore: persistenceStores.forOwner(ownerId),
+      });
+    },
+    // Introspection for the composition tests (per-owner dispatch correctness).
+    _ownerOf: ownerOf,
+    _ownerCounts: () => ({
+      secrets: secretStores.ownerCount(),
+      snapshots: snapshotStores.ownerCount(),
+      persistence: persistenceStores.ownerCount(),
+    }),
+  });
+}

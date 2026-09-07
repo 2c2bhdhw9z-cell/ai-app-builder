@@ -36,6 +36,7 @@ import { createAuthService } from '../auth/index.js';
 import { resolveIdpVerifier, createFailClosedIdpVerifier } from '../auth/oidc-verifier.js';
 import { resolveLoginFlow } from '../auth/login-flow.js';
 import { composePlatformOps } from '../ops/index.js';
+import { composeProjectRuntime, platformSecretSet } from './compose-runtime.js';
 import {
   createAnthropicProvider,
   createGeminiProvider,
@@ -117,6 +118,11 @@ export function resolveProvider(env = process.env) {
  * @param {object} [deps]
  * @param {Record<string,string|undefined>} [deps.env=process.env]
  * @param {(opts:object)=>object} [deps.createServer=createBuilderServer]
+ * @param {(args:object)=>object} [deps.createRuntime=composeProjectRuntime]
+ *        the project-runtime composition root. Injected by tests so the container
+ *        backend and the data directory are controlled (a real container cannot
+ *        run in a hermetic test).
+ * @param {() => number} [deps.now]  injectable ms clock threaded into the runtime.
  * @param {object} [deps.idpVerifier]  override the env-resolved IdP verifier
  *        (tests inject a fake); omitted ⇒ resolveIdpVerifier(env), which is
  *        FAIL-CLOSED unless OIDC_* is fully configured.
@@ -129,14 +135,23 @@ export function resolveProvider(env = process.env) {
 export async function startPlatformServer({
   env = process.env,
   createServer = createBuilderServer,
+  createRuntime = composeProjectRuntime,
   idpVerifier,
   loginFlow,
+  now: nowFn,
   logger = console,
 } = {}) {
+  // The model the default agent path builds with, when pinned by the deployment.
+  const model = (env.AAB_MODEL ?? '').trim() !== '' ? env.AAB_MODEL.trim() : undefined;
   const { port, host } = resolveBindConfig(env);
 
-  // The composition root wires ONE redactor + audit log + observability.
-  const composed = composePlatformOps();
+  // The composition root wires ONE redactor + audit log + observability, SEEDED
+  // with the platform's own credentials (model API key, OIDC secret, state key).
+  // A redactor can only redact values it was constructed with, and this call
+  // previously passed none — so redaction was a documented no-op in the only
+  // composition that ships. Seeding it makes substring redaction of a live
+  // credential in a stderr line or audit entry an ACTIVE control.
+  const composed = composePlatformOps({ secretProvider: platformSecretSet(env) });
 
   // IDENTITY. Auth gates every non-health request, so this decides whether the
   // deployment is usable at all. A real, env-driven OIDC/OAuth verifier is built
@@ -175,17 +190,29 @@ export async function startPlatformServer({
 
   const provider = resolveProvider(env);
 
+  // THE PROJECT RUNTIME. Without this the live process routed no POST /projects,
+  // enforced no quota, authorized every projectId as self-owned, and resolved the
+  // agent's cwd to process.cwd() — the server's own source tree. See
+  // compose-runtime.js for what each collaborator closes.
+  const runtime = createRuntime({ composed, env, ...(nowFn ? { now: nowFn } : {}) });
+  logger.log(`ai-app-builder data directory ${runtime.dataDir}`);
+
   const api = createServer({
     authService,
     ...(flow ? { loginFlow: flow } : {}),
     provider,
     observability: composed.observability,
+    ...runtime.serverOptions(),
+    ...(model !== undefined ? { model } : {}),
   });
 
   const address = await api.listen(port, host);
   logger.log(`ai-app-builder listening on http://${address.host}:${address.port}`);
 
-  return { api, address };
+  // The composed graph is returned alongside the server so an embedding caller
+  // (and the wiring tests) can observe WHAT was composed — e.g. that the central
+  // redactor really was seeded with the live credentials.
+  return { api, address, runtime, composed, authService };
 }
 
 /**
