@@ -823,7 +823,14 @@ test('CONTAINER_BIN and SANDBOX_IMAGE are threaded into the backend factory', ()
         return fakeBackend();
       },
     });
-    assert.deepEqual(built, [{ bin: 'podman', image: 'node:24-slim' }]);
+    assert.equal(built.length, 1);
+    assert.equal(built[0].bin, 'podman');
+    assert.equal(built[0].image, 'node:24-slim');
+    // Every container is also stamped with this deployment slot's identity, so a
+    // startup reap can tell OUR crashed predecessor's containers from a live
+    // sibling instance's.
+    assert.equal(built[0].instanceId, runtime.instanceId);
+    assert.ok(runtime.instanceId, 'an instance id is always resolved');
     assert.ok(runtime.sandboxManager);
   } finally {
     cleanup();

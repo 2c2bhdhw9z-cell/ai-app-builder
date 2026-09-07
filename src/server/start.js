@@ -37,6 +37,7 @@ import { resolveIdpVerifier, createFailClosedIdpVerifier } from '../auth/oidc-ve
 import { resolveLoginFlow } from '../auth/login-flow.js';
 import { composePlatformOps } from '../ops/index.js';
 import { composeProjectRuntime, platformSecretSet } from './compose-runtime.js';
+import { resolveStartupReapConfig, runStartupReap } from './startup-reap.js';
 import {
   createAnthropicProvider,
   createGeminiProvider,
@@ -209,10 +210,31 @@ export async function startPlatformServer({
   const address = await api.listen(port, host);
   logger.log(`ai-app-builder listening on http://${address.host}:${address.port}`);
 
+  /**
+   * THE OPTIONAL STARTUP ORPHAN REAP — deliberately started HERE, after listen().
+   *
+   * A process that died uncleanly leaves its sandbox containers running, and
+   * nothing collects them (release() never ran). This clears them. It is placed
+   * after `listen()` and is NOT awaited, so:
+   *   - /healthz is already answering before any container-runtime call is made;
+   *   - a host with no runtime is a no-op, not a boot failure;
+   *   - runStartupReap never rejects, so this can never fail boot.
+   * The promise is returned on the result object so a caller (and the tests) can
+   * await the outcome WITHOUT it being on the critical path.
+   */
+  const reapConfig = resolveStartupReapConfig(env);
+  const startupReap = runStartupReap({
+    ...reapConfig,
+    instanceId: runtime.instanceId,
+    sandboxManager: runtime.sandboxManager,
+    backend: runtime.backend,
+    logger,
+  });
+
   // The composed graph is returned alongside the server so an embedding caller
   // (and the wiring tests) can observe WHAT was composed — e.g. that the central
   // redactor really was seeded with the live credentials.
-  return { api, address, runtime, composed, authService };
+  return { api, address, runtime, composed, authService, startupReap };
 }
 
 /**

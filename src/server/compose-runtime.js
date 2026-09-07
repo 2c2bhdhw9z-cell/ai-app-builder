@@ -189,6 +189,27 @@ export function resolvePreviewConfig(env = process.env) {
   };
 }
 
+/**
+ * Resolve THIS platform instance's identity — the "deployment slot" every container
+ * we create is stamped with (see INSTANCE_LABEL).
+ *
+ * It must be STABLE across a process restart in the same slot (so a restarted
+ * process recognizes the containers its crashed predecessor left behind) and
+ * DISTINCT between concurrently-running instances (so a startup reap cannot destroy
+ * a live sibling's sandboxes). The hostname satisfies both in the deployments that
+ * matter: a supervisor restarting the process inside the same container/pod keeps
+ * it, and two pods have different ones. `AAB_INSTANCE_ID` overrides it for a
+ * deployment where the hostname is not the right slot key.
+ *
+ * Sanitized to the character set a container label value can carry without
+ * quoting, and truncated, so it can never distort the argv it lands in.
+ */
+export function resolveInstanceId(env = process.env) {
+  const raw = (env.AAB_INSTANCE_ID ?? '').trim() || os.hostname() || '';
+  const cleaned = raw.replace(/[^A-Za-z0-9_.-]/g, '-').replace(/^-+/, '').slice(0, 64);
+  return cleaned !== '' ? cleaned : 'aab-instance';
+}
+
 /** Parse a legal TCP port, or undefined when unset/invalid/out of range. */
 function tcpPort(raw) {
   const n = positiveInt(raw);
@@ -522,12 +543,13 @@ export function composeProjectRuntime({
   // with no docker still boots and answers /healthz; a Sandbox acquire then fails
   // with the existing SANDBOX_ACQUIRE_FAILED 503 rather than a silent success.
   //
-  // NOT DONE HERE, deliberately: `sandboxManager.reapAllOrphans()` is never called
-  // at startup, so containers left behind by a crashed previous process are not
-  // reaped. Calling it would put container-runtime I/O on the boot path, which is
-  // exactly what must not happen (/healthz has to answer on a host with no
-  // runtime). A reaper belongs on a schedule or an explicit admin trigger; per
-  // project orphan cleanup still happens on release. See docs/DEPLOY.md.
+  // ORPHAN REAPING, and why it is not here: container-runtime I/O must not sit on
+  // the boot path, because /healthz has to answer on a host with no runtime. The
+  // startup reap therefore lives in src/server/start.js, where it is kicked off
+  // AFTER listen() resolves and is never awaited — see src/server/startup-reap.js
+  // for the three properties it guarantees (never blocks /healthz, never fails
+  // boot, a missing runtime is a no-op). Construction here still does no I/O.
+  // Per-project orphan cleanup continues to happen on release().
   const containerBin = (env.CONTAINER_BIN ?? '').trim() || undefined;
   const containerImage = (env.SANDBOX_IMAGE ?? '').trim() || undefined;
 
@@ -552,14 +574,20 @@ export function composeProjectRuntime({
    * filtered exec), so a host with no runtime still boots and answers /healthz.
    */
   const egressAllowedHosts = [...DEFAULT_PACKAGE_REGISTRY_HOSTS, ...(egress.extraHosts ?? [])];
+  // Stamped on every container we create, so an orphan of a CRASHED PRIOR PROCESS
+  // in this slot is distinguishable from a LIVE SIBLING instance's container. See
+  // resolveInstanceId and src/server/startup-reap.js.
+  const instanceId = resolveInstanceId(env);
   const backend =
     egress.mode === 'registry'
       ? createFilteringBackend({
           allowedHosts: egressAllowedHosts,
+          instanceId,
           ...(containerBin ? { bin: containerBin } : {}),
           ...(containerImage ? { image: containerImage } : {}),
         })
       : createBackend({
+          instanceId,
           ...(containerBin ? { bin: containerBin } : {}),
           ...(containerImage ? { image: containerImage } : {}),
         });
@@ -903,6 +931,8 @@ export function composeProjectRuntime({
      */
     previewMode: preview.enabled ? 'container' : 'inert',
     previewNetwork: preview.network,
+    /** This deployment slot's identity, stamped on every container we create. */
+    instanceId,
     /**
      * Owner-SCOPED store access, for the surfaces that operate on an account
      * rather than on one project — notably RetentionService (Req 24 account/project

@@ -642,10 +642,16 @@ export function createSandboxManager({ layout, backend, config = {}, bindingsFor
   /**
    * Reap ALL orphaned sandbox containers we own (any project). Useful at
    * startup to clear boundaries left by a crashed prior process.
+   *
+   * @param {object} [opts]
+   * @param {string} [opts.instanceId]  narrow the sweep to containers created by
+   *        ONE platform instance. Without it every container carrying the owner
+   *        label is swept, which on a host shared with another live instance would
+   *        destroy that instance's sandboxes — so a startup reap passes it.
    */
-  async function reapAllOrphans() {
+  async function reapAllOrphans(opts = {}) {
     if (typeof backend.reapOrphans !== 'function') return { reaped: [] };
-    return backend.reapOrphans();
+    return backend.reapOrphans(undefined, opts);
   }
 
   return Object.freeze({
