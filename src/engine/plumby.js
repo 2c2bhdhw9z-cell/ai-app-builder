@@ -40,6 +40,24 @@ export { createAnthropicProvider } from 'plumby/src/providers/anthropic.js';
 export { createGeminiProvider } from 'plumby/src/providers/gemini.js';
 export { createOpenRouterProvider } from 'plumby/src/providers/openrouter.js';
 
+// PROVIDER-RESOLUTION seams (as opposed to the live provider FACTORIES above).
+// Re-exported so the ProviderResolver (src/server/provider-resolver.js) can
+// reuse plumby's CANONICAL resolution logic — which providers this process can
+// use, in what environment order, and the exact env var each needs — instead of
+// hardcoding a provider list or duplicating plumby's env-precedence. These drive
+// the builder's own provider/model selection (Req 21.1/21.5/21.6):
+//   - PROVIDERS: the {anthropic,gemini,openrouter} map (insertion order IS the
+//     env-resolution order); each entry carries `keys` + `defaultModel`.
+//   - describeProviders({env}): per-provider {available, reason, model, create}.
+//   - resolveBootChoice(...): the full boot precedence resolver.
+//   - keyNameFor(provider): the exact env var name, for error text.
+export {
+  PROVIDERS,
+  describeProviders,
+  resolveBootChoice,
+  keyNameFor,
+} from 'plumby/src/cli/provider_choice.js';
+
 // The permission model: the command classifier and its rule tables.
 export {
   classifyCommand,
