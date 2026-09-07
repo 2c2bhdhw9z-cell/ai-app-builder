@@ -185,18 +185,21 @@ export function createShareLinkService({
    * modify(recipient, token) — Req 26.5.
    *
    * The service exposes NO mutation path via a Share_Link; this method exists
-   * only to prove a recipient's modification attempt is rejected. It authorizes
-   * a 'write' action through the REAL authorize with the link as a grant — which
-   * denies, because only the 'read' action is grantable. Always returns a
-   * generic deny; the Project is never touched.
+   * only to prove a recipient's modification attempt is rejected. A Share_Link
+   * grants ONLY the 'read' action, so there is no authorize seam that could ever
+   * yield a write capability — the method therefore refuses unconditionally with
+   * the generic deny and never touches the Project. It deliberately does NOT
+   * call authorize: doing so would emit an AUTHZ_DECISION audit event for a
+   * decision that is never consulted, muddying the audit trail of this
+   * security-sensitive subsystem. The absence of any mutation path IS the
+   * enforcement here, not a runtime authorization check.
    */
   function modify(recipient, token) {
     const link = store.get(token);
     if (!link) return denied();
     const project = projectResolver(link.projectId);
     if (!project) return denied();
-    // A non-read action can never be granted by a Share_Link -> AccessDenied.
-    authorizer.authorize(recipient, 'write', project, { grants: [link] });
+    // No 'write' seam exists for a Share_Link (read-only grant) -> refuse.
     return denied();
   }
 

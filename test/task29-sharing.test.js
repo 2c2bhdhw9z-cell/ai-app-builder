@@ -248,21 +248,29 @@ test('access() with malformed/unknown tokens denies generically WITHOUT throwing
 // unchanged (only 'read' is grantable via a Share_Link).
 // ─────────────────────────────────────────────────────────────────────────
 test('a recipient modification attempt via a share link is rejected; Project unchanged (Req 26.5)', () => {
-  const { layout, service } = harness();
+  const { layout, service, audit } = harness();
   const shared = service.share(acct(OWNER), PROJECT);
   assert.equal(shared.ok, true);
 
   const projectFile = layout.controlProjectRegistryPath(OWNER);
   const before = readBytes(projectFile);
+  const authzBefore = audit.ofType(AUDIT_EVENTS.AUTHZ_DECISION).length;
 
   const res = service.modify(acct(RECIPIENT), shared.link.token);
-  // Mutation check: if a non-read action were grantable, authorize would Allow
-  // and the service could expose a mutation path — this deny flips.
+  // Mutation check: a Share_Link exposes no 'write' seam, so modify must refuse.
+  // Re-introducing an authorize-and-allow path would flip this deny.
   assert.equal(res.ok, false);
   assert.equal(res.code, 'denied');
 
   const after = readBytes(projectFile);
   assert.deepEqual(after, before, 'Project registry bytes must be unchanged by a modify attempt');
+
+  // Audit accuracy: modify() consults no authorization decision, so it must NOT
+  // emit an AUTHZ_DECISION event. Mutation check: re-adding the discarded
+  // authorize(...,'write',...) call flips this by recording a stray decision
+  // for the recipient that the service never consulted.
+  const authzAfter = audit.ofType(AUDIT_EVENTS.AUTHZ_DECISION).length;
+  assert.equal(authzAfter, authzBefore, 'modify() must not emit a stray AUTHZ_DECISION event');
 });
 
 // ─────────────────────────────────────────────────────────────────────────
