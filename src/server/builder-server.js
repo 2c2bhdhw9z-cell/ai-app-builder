@@ -52,6 +52,10 @@ import {
   subagentTools,
 } from '../engine/plumby.js';
 import { createActivityStream } from './activity-stream.js';
+import {
+  workspaceExperienceLayouts,
+  defaultCustomLayout,
+} from '../presentation/index.js';
 
 /** Cap on a POST body we will buffer, so a client cannot exhaust memory. */
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -210,6 +214,37 @@ export function restartStatusFrame(result = {}) {
 }
 
 /**
+ * Project a Workspace_Experience selection onto a SAFE, LAYOUT-ONLY,
+ * broadcastable `workspace_experience` frame (spec Task 31, Req 27, Property 20).
+ * PURE, so the exact shape is unit-testable and cannot drift between the POST
+ * /workspace-experience response, the SSE broadcast, and the /events
+ * reconnection frame.
+ *
+ * The frame carries ONLY layout/organization data: the selected `experience`
+ * name and its `layout` descriptor (which surfaces are shown and where). For the
+ * `technical-workbench` experience the layout descriptor already carries a
+ * presentational, non-affiliated `attribution` credit as DATA (Req 27.8); when
+ * an `attribution` is supplied it is surfaced on the frame verbatim. There is
+ * structurally NOTHING here that could change a Theme, a Work_Mode, source code,
+ * agent state, Project data, models, Skills, Connectors, permissions, or
+ * Project_Origin (Req 27.2/27.3, Property 20) — it re-parametrizes layout only.
+ *
+ * @param {{ experience:string, layout:object, attribution?:string }} args
+ * @returns {{ type:'workspace_experience', experience:string, layout:object, attribution?:string }}
+ */
+export function workspaceExperienceFrame({ experience, layout, attribution } = {}) {
+  const frame = { type: 'workspace_experience', experience, layout };
+  if (typeof attribution === 'string' && attribution !== '') {
+    frame.attribution = attribution;
+  } else if (layout && typeof layout.attribution === 'string' && layout.attribution !== '') {
+    // A layout descriptor may itself carry the presentational credit as data
+    // (the technical-workbench case). Surface it so a client can render it.
+    frame.attribution = layout.attribution;
+  }
+  return frame;
+}
+
+/**
  * Create the Builder Server.
  *
  * @param {object} opts
@@ -282,6 +317,26 @@ export function restartStatusFrame(result = {}) {
  *        error-frame pattern. With NO previewController injected, the /preview and
  *        /preview/restart routes are NOT routed and every existing route/behavior
  *        is byte-identical (backward compatible).
+ * @param {object} [opts.workspaceExperienceStore]  an OPTIONAL
+ *        WorkspaceExperienceStore (src/presentation/workspace-experience-store.js).
+ *        When present, two STRICTLY ADDITIVE, LAYOUT-ONLY routes are enabled —
+ *        GET /workspace-experience (read the current per-User_Account
+ *        Workspace_Experience + its resolved layout descriptor) and POST
+ *        /workspace-experience (select/switch it, or save a `custom` layout) —
+ *        and the selection is broadcast as a layout-only `workspace_experience`
+ *        frame on the SAME per-session SSE stream as the Activity_Stream so the
+ *        surface re-arranges immediately (Req 27, Property 20). Presentation is
+ *        PER-ACCOUNT (not per-project): both routes gate on AUTHN ONLY via the
+ *        existing gate(req, null) and touch NO Project. This surface is
+ *        structurally incapable of mutating Project state or enqueuing a loop
+ *        turn: it NEVER calls session.agent.send, NEVER sets session.running,
+ *        and NEVER touches any Project file or agent state — it carries ONLY
+ *        layout/organization data (plus the technical-workbench presentational
+ *        credit as data). A (re)connecting /events client also learns the
+ *        current workspace_experience frame among its reconnection frames so a
+ *        later Session re-applies the layout (Req 27.5). With NO store injected,
+ *        neither route is routed and every existing route/behavior is
+ *        byte-identical (backward compatible).
  * @param {number} [opts.confirmTimeoutMs=60000]  fail-closed confirm ceiling.
  * @param {() => number} [opts.now]       injectable clock.
  * @returns {object} frozen server handle.
@@ -298,6 +353,7 @@ export function createBuilderServer(opts = {}) {
     projectManager,
     observability,
     previewController,
+    workspaceExperienceStore,
     provider,
     model,
     confirmTimeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS,
@@ -648,6 +704,17 @@ export function createBuilderServer(opts = {}) {
     if (previewController && req.method === 'POST' && pathname === '/preview/restart') {
       return handlePreviewRestart(req, res);
     }
+    // Strictly additive: the layout-only Workspace_Experience surface is only
+    // routed when a WorkspaceExperienceStore is injected (Req 27, Property 20).
+    // With none injected these paths fall through to 405 exactly as an unknown
+    // route always has. Presentation is per-account, so both routes are authn
+    // only and touch no Project.
+    if (workspaceExperienceStore && req.method === 'GET' && pathname === '/workspace-experience') {
+      return handleGetWorkspaceExperience(req, res);
+    }
+    if (workspaceExperienceStore && req.method === 'POST' && pathname === '/workspace-experience') {
+      return handleSelectWorkspaceExperience(req, res);
+    }
 
     res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'GET, POST' });
     res.end('method not allowed');
@@ -792,6 +859,138 @@ export function createBuilderServer(opts = {}) {
     return sendJson(res, 200, { restart });
   }
 
+  // -------- Workspace_Experience surface — only routed when a store is injected
+
+  /**
+   * Resolve the LAYOUT-ONLY descriptor for a Workspace_Experience selection from
+   * the store's full UserPresentationSettings document. For `custom` this is the
+   * user's saved arrangement (settings.customLayout) or the documented
+   * defaultCustomLayout when they have not arranged one yet (Req 27.4); for every
+   * other experience it is the platform's own clean-room descriptor from
+   * workspaceExperienceLayouts. Pure lookup — carries only layout/organization
+   * data (plus the technical-workbench presentational credit as data).
+   */
+  function layoutForSettings(settings) {
+    const experience = settings.workspaceExperience;
+    if (experience === 'custom') {
+      const saved = settings.customLayout;
+      return saved && typeof saved === 'object' && !Array.isArray(saved)
+        ? saved
+        : defaultCustomLayout;
+    }
+    return workspaceExperienceLayouts[experience] ?? defaultCustomLayout;
+  }
+
+  /**
+   * Broadcast a layout-only workspace_experience frame to EVERY live session
+   * whose accountId matches (presentation is per-User_Account, so it applies
+   * across that account's Project Sessions). This reuses the EXISTING per-session
+   * session.broadcast SSE mechanism and enqueues NO turn: it NEVER calls
+   * session.agent.send and NEVER sets session.running. A no-op when the account
+   * has no live sessions (a later /events connect re-applies via the
+   * reconnection frame set).
+   */
+  function broadcastWorkspaceExperience(accountId, frame) {
+    for (const session of sessions.values()) {
+      if (session.accountId === accountId) session.broadcast(frame);
+    }
+  }
+
+  /**
+   * GET /workspace-experience — read the current per-User_Account
+   * Workspace_Experience selection + its resolved layout descriptor for the
+   * AUTHENTICATED account (Req 27.1/27.5/27.6). Presentation is per-account, so
+   * this gates on AUTHN ONLY via the EXISTING gate(req, null) — no projectId, no
+   * Project touched. On denial it replies with the IDENTICAL non-disclosing 401
+   * ACCESS_DENIED the other routes use. The documented default is applied when
+   * the user has made no selection (the store returns it without writing).
+   */
+  async function handleGetWorkspaceExperience(req, res) {
+    // Presentation state is per-account: authn only, no projectId, no Project.
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const settings = workspaceExperienceStore.getSettings(result.account.id);
+    const layout = layoutForSettings(settings);
+    return sendJson(res, 200, {
+      ...workspaceExperienceFrame({ experience: settings.workspaceExperience, layout }),
+    });
+  }
+
+  /**
+   * POST /workspace-experience — select/switch the per-User_Account
+   * Workspace_Experience, or save a `custom` layout (Req 27.4/27.5/27.7). This
+   * is a LAYOUT-ONLY surface event: it persists ONLY the presentation selection
+   * via the store, broadcasts a layout-only workspace_experience frame to the
+   * account's live SSE clients, and is STRUCTURALLY INCAPABLE of mutating Project
+   * state or enqueuing a loop turn — it never references the agent/loop/tree
+   * paths, never calls session.agent.send, and never sets session.running.
+   *
+   * Gates on AUTHN ONLY via the EXISTING gate(req, null) (no projectId, no
+   * Project). A body carrying `customLayout` (a plain layout object) is routed to
+   * the store's saveCustomLayout and selects `custom` per account. Otherwise the
+   * body's `experience` is validated via the store's select(): an out-of-enum
+   * value responds 400 (unsupported) WITHOUT writing and returns the STILL-CURRENT
+   * experience so a client can confirm nothing changed (Req 27.7); a valid value
+   * persists and responds 200 with the new experience + its layout descriptor.
+   */
+  async function handleSelectWorkspaceExperience(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    // Presentation state is per-account: authn only, no projectId, no Project.
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const accountId = result.account.id;
+
+    // A `custom` arrangement carried in the body is saved per account (Req 27.4)
+    // and selects the `custom` experience. Layout-only: the store writes ONLY the
+    // UserPresentationSettings document.
+    const hasCustomLayout =
+      body && typeof body.customLayout === 'object' && body.customLayout !== null && !Array.isArray(body.customLayout);
+    if (hasCustomLayout) {
+      const saved = workspaceExperienceStore.saveCustomLayout(accountId, body.customLayout);
+      if (!saved.ok) {
+        return sendJson(res, 400, { error: saved.message, code: saved.code });
+      }
+      const frame = workspaceExperienceFrame({ experience: 'custom', layout: saved.customLayout });
+      broadcastWorkspaceExperience(accountId, frame);
+      return sendJson(res, 200, { ...frame });
+    }
+
+    const experience = typeof body?.experience === 'string' ? body.experience : '';
+    const selected = workspaceExperienceStore.select(accountId, experience);
+    if (!selected.ok) {
+      // Out-of-enum value: the store refused to write and the current experience
+      // is left in effect. Respond 400 (unsupported) and return the STILL-CURRENT
+      // experience + layout so a client can confirm nothing changed (Req 27.7).
+      const settings = workspaceExperienceStore.getSettings(accountId);
+      return sendJson(res, 400, {
+        error: selected.message ?? 'unsupported Workspace_Experience',
+        code: selected.code,
+        current: workspaceExperienceFrame({
+          experience: settings.workspaceExperience,
+          layout: layoutForSettings(settings),
+        }),
+      });
+    }
+
+    // Persisted. Resolve the layout descriptor for the new selection and
+    // broadcast a layout-only frame to the account's live sessions — no turn.
+    const settings = workspaceExperienceStore.getSettings(accountId);
+    const frame = workspaceExperienceFrame({
+      experience: selected.experience,
+      layout: layoutForSettings(settings),
+    });
+    broadcastWorkspaceExperience(accountId, frame);
+    return sendJson(res, 200, { ...frame });
+  }
+
   // -------- GET /events (SSE)
 
   async function handleEvents(req, res) {
@@ -831,6 +1030,21 @@ export function createBuilderServer(opts = {}) {
     // no previewController the reconnection frame set is unchanged.
     if (previewController && typeof previewController.servedPreview === 'function') {
       frames.push(previewStatusFrame(previewController.servedPreview(projectId)));
+    }
+    // When a WorkspaceExperienceStore is injected, a (re)connecting client also
+    // learns the CURRENT per-User_Account Workspace_Experience + its resolved
+    // layout, so a later Session re-applies the layout (Req 27.5). This is
+    // layout-only and per-account (keyed off the authenticated account, not the
+    // project). Strictly additive: with no store the reconnection frame set is
+    // unchanged.
+    if (workspaceExperienceStore && typeof workspaceExperienceStore.getSettings === 'function') {
+      const settings = workspaceExperienceStore.getSettings(result.account.id);
+      frames.push(
+        workspaceExperienceFrame({
+          experience: settings.workspaceExperience,
+          layout: layoutForSettings(settings),
+        }),
+      );
     }
     for (const payload of session.pendingConfirmPayloads.values()) frames.push(payload);
     for (const payload of frames) {
