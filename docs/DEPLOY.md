@@ -56,7 +56,9 @@ valid. Anything else logs `identity: LOGIN DISABLED — <reason>` and leaves
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CONTAINER_BIN` | `docker` | Container CLI. Set to `podman` on a podman host. Not probed at boot, so the server still starts (and `/healthz` still answers) on a host with no runtime — the failure surfaces as a `503` from `POST /projects` instead. One consequence of not probing: containers left behind by a crashed previous process are **not** reaped at startup (per-project orphan cleanup still happens on release). Run `docker ps -a --filter label=aab.sandbox` after an unclean restart if you want to check. |
+| `CONTAINER_BIN` | `docker` | Container CLI. Set to `podman` on a podman host. Not probed at boot, so the server still starts (and `/healthz` still answers) on a host with no runtime — the failure surfaces as a `503` from `POST /projects` instead. Containers left by a crashed previous process can be cleared with `AAB_STARTUP_REAP` (see below); without it, per-project cleanup still happens on release. Inspect with `docker ps -a --filter label=aab.sandbox`. |
+| `AAB_STARTUP_REAP` | `off` | Clear sandbox containers left behind by a **crashed previous process**. `off` (default): no reap. `instance` (also selected by `1`/`true`/`yes`/`on`): reap only containers stamped with **this deployment slot's** instance id — safe alongside other live instances, and the right choice for a crash-restart. `all`: reap every container carrying the `aab.sandbox` label regardless of who created it — **only** where this process is the sole platform instance using the runtime, since it will otherwise destroy a live sibling's running sandboxes. An unrecognized value falls back to `off`. The reap starts **after** the listening socket is open and is never awaited, so it cannot delay `/healthz`; a host with no container runtime is a **no-op**, not an error; and no failure in it can fail boot. |
+| `AAB_INSTANCE_ID` | the hostname | This deployment slot's identity, stamped on every container we create as `aab.instance=<id>`. It is what makes "an orphan of *our* crashed predecessor" distinguishable from "a *live sibling's* container", which is what `AAB_STARTUP_REAP=instance` relies on. It must be **stable across a process restart in the same slot** and **distinct between concurrently running instances**. The hostname default is only distinct **per host or pod** — so **set this explicitly, per instance, whenever more than one instance shares a container runtime** (two units on one VM, blue/green, `hostNetwork: true`, a compose service with an explicit `hostname:`). Otherwise both instances resolve the same id and `instance` silently degrades to `all` between them. Sanitized to `[A-Za-z0-9_.-]` and truncated to 64 characters. |
 | `SANDBOX_IMAGE` | `node:22-slim` | Image each Project sandbox runs. |
 | `AAB_SANDBOX_EGRESS` | `none` | Sandbox network posture. `none` (default) = `--network none`: commands run, but there is no network at all, so **`npm install` cannot work**. `registry` = the sandbox may reach the package-registry hosts and **nothing else**, which makes `npm install` work without opening general egress; see *Registry-only egress* below for how that is enforced. Any unrecognized value falls back to `none`. |
 | `AAB_SANDBOX_EGRESS_HOSTS` | unset | Extra hosts added to the sandbox allowlist, comma-separated (a private registry mirror, or a connector endpoint a build genuinely needs). **Only honored in `registry` mode** — in `none` there is no network to allow anything on, so these are ignored rather than quietly re-enabling egress. Host-local *literals* (loopback, RFC1918, link-local, `169.254.169.254`, `host.docker.internal`, and alternate encodings like `2130706433`) are stripped at configuration time, and a *name* that resolves to such an address is refused at connection time — the proxy is the one component with real egress, so allowlisting a metadata address through it would be a credential-exfiltration path. **This allowlist is platform-wide, not per-project** — see the caveat below. |
@@ -87,7 +89,7 @@ Fail-closed throughout:
 
 Every decision is logged by the proxy, so a denial is diagnosable: `docker logs aab-egress-proxy`.
 
-Two caveats worth knowing. The allowlist is **platform-wide, not per-project**: in `registry` mode every sandbox shares the same allowed hosts, so a connector host added via `AAB_SANDBOX_EGRESS_HOSTS` is reachable from *every* project. Deny-by-default against the open internet still holds, and projects remain isolated from each other; per-project allowlists would need a proxy per project and are a remaining follow-up. And **nothing tears the proxy or the per-project networks down today** — they are labelled `aab.sandbox`, so a reaper *can* collect them, but per-project cleanup on release is scoped to that project's label and never matches the proxy. If the proxy is removed by hand, the next filtered command detects it and rebuilds it.
+Two caveats worth knowing. The allowlist is **platform-wide, not per-project**: in `registry` mode every sandbox shares the same allowed hosts, so a connector host added via `AAB_SANDBOX_EGRESS_HOSTS` is reachable from *every* project. Deny-by-default against the open internet still holds, and projects remain isolated from each other; per-project allowlists would need a proxy per project and are a remaining follow-up. And the proxy and the per-project networks are **not** torn down by per-project cleanup — that is scoped to a project's own label and never matches the proxy. A startup reap (`AAB_STARTUP_REAP`, see above) does collect the proxy, since it carries the same `aab.sandbox` owner label and the same instance stamp; either way, the next filtered command detects it is gone and rebuilds it, so removing it by hand is safe. Note the proxy's name is fixed and a sibling instance may have adopted the one *you* created — see the reap caveats. The per-project **networks** are labelled but nothing removes them yet, so they accumulate across projects — harmless, but worth a periodic `docker network prune --filter label=aab.sandbox`.
 
 ### Preview (the served dev server)
 
@@ -406,9 +408,58 @@ register exactly that URL with your identity provider.
   confirm `docker logs aab-egress-proxy` shows `ALLOW registry.npmjs.org` — then
   exec `curl https://example.com` in the sandbox and confirm it fails while the
   install succeeded.
-- **Orphan containers are not reaped at startup.** Deliberate: probing the
-  container runtime during boot would stop `/healthz` from answering on a host
-  without one. Per-project cleanup still happens on release.
+- ~~**Orphan containers are not reaped at startup.**~~ **Done** — set
+  `AAB_STARTUP_REAP=instance` (see above) and containers left by a crashed prior
+  process in this deployment slot are cleared on boot. It stays **off by default**,
+  because a reap is destructive and the safe scope depends on whether other
+  instances share the runtime.
+
+  The three properties that had kept this undone are what the implementation is
+  built around, and each is tested: the reap is started **after** `listen()` resolves
+  and never awaited, so `/healthz` answers while it is still running (proven by
+  fetching it over real HTTP against a real server with the reap deliberately
+  stalled); a host with **no container runtime is a no-op**, not an error, because
+  availability is probed before any sweep is attempted; and it **cannot fail boot** —
+  a throwing probe, a throwing reap, a failed container listing, a junk result and
+  even a throwing logger all resolve to a structured result.
+
+  Scoping is the safety story. `aab.sandbox` alone cannot distinguish an orphan of
+  *our* crashed predecessor from a *live sibling instance's* container, so an
+  unscoped sweep on a shared host would kill a neighbour's sandboxes mid-turn. Every
+  container we create now also carries `aab.instance=<slot>`; at boot this process
+  has created none, so anything already bearing our own id is by definition an
+  orphan of a prior process in this slot. A bare `AAB_STARTUP_REAP=1` therefore
+  selects `instance`, never `all` — the destructive scope has to be named.
+
+  Three limits of the safe scope, each of which leaves containers only `all` can
+  reach — and each of which is now **counted and logged** at boot rather than being
+  indistinguishable from a clean host:
+
+  - a slot that is **recreated** rather than restarted in place (a rescheduled pod,
+    `docker compose up` recreating the container, `docker run` without a fixed
+    `--hostname`) gets a *new* id, so its predecessor's containers are unclaimable;
+  - containers created **before this feature shipped** carry no instance label at all,
+    so the first restart after enabling the reap skips them — run `all` once, when you
+    know no sibling is live;
+  - the **egress proxy** from *Registry-only egress* has a fixed name and is adopted
+    by whichever instance finds it healthy, but stays labelled with its *creator's*
+    slot. So the creator's restart can remove a proxy a sibling is routing through;
+    that sibling's next filtered command detects it and rebuilds it, at the cost of
+    the in-flight install.
+
+  Two things protect live work from the sweep itself: a container **this process
+  launched** is never removed (the window between the socket opening and the listing
+  returning is seconds wide on a cold daemon, and a request landing in it creates a
+  container wearing our own id), and every candidate's instance label is
+  **re-checked** before `rm -f` rather than the runtime's label filtering being taken
+  on trust.
+
+  **What only a real container host can prove:** that the runtime's label filters
+  select exactly these containers and that `rm -f` collects them. To check it: kill
+  the platform with `SIGKILL` while a turn is running, confirm
+  `docker ps --filter label=aab.sandbox` still lists the container, restart with
+  `AAB_STARTUP_REAP=instance`, and confirm the boot log reports the removal and the
+  list is empty.
 - **Single instance assumed.** Accounts, sessions and the login-state key are
   in-process. Behind a load balancer, either pin sessions to one instance or set
   `OIDC_STATE_SIGNING_KEY` — and note that accounts and sessions are still

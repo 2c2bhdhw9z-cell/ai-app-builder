@@ -184,6 +184,11 @@ test('DEPLOY.md states the fail-closed posture and the honest limits', () => {
   assert.match(deployDoc, /AAB_SANDBOX_EGRESS_HOSTS/, 'the allowlist knob must be documented');
   assert.match(deployDoc, /--internal/, 'the enforcement primitive must be stated, not just claimed');
   assert.match(deployDoc, /platform-wide, not per-project/i, 'the allowlist scope caveat must stay visible');
+  // The startup-reap follow-up is DONE, so the doc must document the knob AND the
+  // reason the destructive scope is not the default.
+  assert.match(deployDoc, /AAB_STARTUP_REAP/, 'the reap knob must be documented');
+  assert.match(deployDoc, /off by default/i, 'a destructive cleanup must be documented as opt-in');
+  assert.match(deployDoc, /live sibling/i, 'the scoping hazard must stay visible');
   // The Preview follow-up is DONE, so the doc must no longer claim otherwise —
   // but it must still be honest about the two things that replaced that claim:
   // the default is still the inert placeholder, and the live path is a decision

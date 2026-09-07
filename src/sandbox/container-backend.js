@@ -109,6 +109,19 @@ export const DEFAULT_IMAGE = 'node:22-slim';
 export const OWNER_LABEL = 'aab.sandbox';
 
 /**
+ * Label key recording WHICH platform instance created a container.
+ *
+ * This is what makes "a container left behind by a crashed PRIOR process"
+ * distinguishable from "a container belonging to a LIVE sibling instance". The
+ * owner label alone cannot tell them apart, so a startup reap filtered only on
+ * `aab.sandbox` would kill a healthy neighbour's sandboxes. The instance id is a
+ * per-DEPLOYMENT-SLOT identity (hostname by default, see resolveInstanceId), so a
+ * process that restarts in the same slot reuses it — and therefore recognizes its
+ * own orphans — while a sibling on another host/pod carries a different one.
+ */
+export const INSTANCE_LABEL = 'aab.instance';
+
+/**
  * The ONLY runtime verbs `rawExec` will run: read-only inspection and network
  * plumbing. Deliberately an allowlist — see rawExec.
  */
@@ -384,7 +397,34 @@ export function createContainerBackend({
   exec = runCli,
   permittedNetworks = CLI_ENFORCEABLE_NETWORKS,
   isNetworkPermitted,
+  instanceId,
 } = {}) {
+  /**
+   * Labels applied to EVERY container this backend creates. The instance label is
+   * added here rather than at each call site so nothing we launch can escape it —
+   * an unlabelled container would be invisible to an instance-scoped reap and
+   * therefore leak forever.
+   */
+  const ownInstanceId = typeof instanceId === 'string' && instanceId.trim() !== '' ? instanceId.trim() : null;
+  const ownLabels = ownInstanceId ? { [INSTANCE_LABEL]: ownInstanceId } : undefined;
+  // ownLabels is spread LAST so a caller cannot override the backend's own stamp: an
+  // instance-scoped reap decides what to destroy from that label, so it must not be
+  // caller-settable.
+  const withOwnLabels = (labels) =>
+    ownLabels || labels ? { ...(labels ?? {}), ...(ownLabels ?? {}) } : undefined;
+
+  /**
+   * Names of containers THIS process launched.
+   *
+   * The instance-scoping argument ("at boot we have created none, so anything with
+   * our id is a predecessor's orphan") is true at an instant, but the sweep spans an
+   * interval — the availability probe plus the listing can take tens of seconds on
+   * exactly the cold/wedged daemon this feature exists for. A request that acquires
+   * a Sandbox in that window creates a container stamped with OUR id, which the
+   * listing would then pick up and `rm -f` mid-command. Excluding what we launched
+   * closes that race without putting anything on the boot path.
+   */
+  const launchedNames = new Set();
   // The set of network modes THIS instance will launch into. Defaults to the
   // CLI-enforceable set ('none' only), so a plain backend keeps failing closed on
   // everything else. A filtering-capable composition (see
@@ -442,6 +482,7 @@ export function createContainerBackend({
   async function runOneShot({
     name,
     labelValue,
+    labels,
     mountSource,
     command = [],
     limits = {},
@@ -484,11 +525,15 @@ export function createContainerBackend({
       // the per-project orphan cleanup release() performs — matched NOTHING. It
       // falls back to `name` only when no label value was supplied.
       labelValue: labelValue ?? name,
+      ...(withOwnLabels(labels) ? { labels: withOwnLabels(labels) } : {}),
       command,
       env: hasEnv ? env : undefined,
     };
 
     // First attempt: WITH the requested cgroup flags (if any).
+    // Record before launching: a container that exists must never be missing from
+    // this set, or a concurrent reap could remove it.
+    if (name) launchedNames.add(name);
     let res = await exec(bin, buildRunArgs({ ...baseSpec, cgroupFlags }), { timeoutMs, signal, childEnv });
 
     // Graceful degrade: if the ONLY reason we failed to launch is that the
@@ -569,17 +614,78 @@ export function createContainerBackend({
    * a single label value (one project). Used for orphan cleanup after a failed
    * import/acquire (Req 6.5) and by release().
    */
-  async function reapOrphans(labelValue) {
+  /**
+   * List the containers we own that a reap would consider, WITH the facts needed to
+   * decide about each one.
+   *
+   * It deliberately does not stop at `ps -q`. That returns bare ids, so a
+   * destructive sweep would go straight to `rm -f` on whatever came back — with no
+   * way to notice if the label filtering had not actually narrowed the set. (It does
+   * narrow: docker and podman both AND repeated `--filter label=` flags. But a
+   * runtime version or an API shim getting that wrong would silently widen the sweep
+   * to a live sibling's containers, which is precisely what the filter was added to
+   * prevent.) So each candidate is inspected and the decision is re-derived here.
+   *
+   * @returns {Promise<{ ok:boolean, candidates:Array<{id,name,instanceId}>, code?, stderr? }>}
+   */
+  async function listOrphans(labelValue, { instanceId: onlyInstance } = {}) {
     const filter = labelValue ? `${OWNER_LABEL}=${labelValue}` : OWNER_LABEL;
-    const list = await exec(bin, ['ps', '-a', '-q', '--filter', `label=${filter}`], { timeoutMs: 15_000 });
-    if (list.code !== 0) return { reaped: [], code: list.code, stderr: list.stderr };
+    const args = ['ps', '-a', '-q', '--filter', `label=${filter}`];
+    const scoped = typeof onlyInstance === 'string' && onlyInstance.trim() !== '' ? onlyInstance.trim() : null;
+    if (scoped) args.push('--filter', `label=${INSTANCE_LABEL}=${scoped}`);
+
+    const list = await exec(bin, args, { timeoutMs: 15_000 });
+    if (list.code !== 0) return { ok: false, candidates: [], code: list.code, stderr: list.stderr };
+
     const ids = list.stdout.split(/\s+/).map((s) => s.trim()).filter(Boolean);
-    const reaped = [];
+    const candidates = [];
     for (const id of ids) {
-      const res = await exec(bin, ['rm', '-f', id], { timeoutMs: 15_000 });
-      if (res.code === 0 || /no such container|not found/i.test(res.stderr)) reaped.push(id);
+      const info = await exec(
+        bin,
+        ['inspect', '--format', `{{index .Config.Labels "${INSTANCE_LABEL}"}} {{.Name}}`, id],
+        { timeoutMs: 10_000 },
+      );
+      if (info.code !== 0) continue; // vanished between listing and inspection
+      const [rawInstance, rawName = ''] = info.stdout.trim().split(/\s+/);
+      const name = rawName.replace(/^\//, '');
+      const containerInstance = rawInstance === '<no value>' || rawInstance === '' ? null : rawInstance;
+      // ENFORCE the narrowing rather than trusting it.
+      if (scoped && containerInstance !== scoped) continue;
+      candidates.push({ id, name, instanceId: containerInstance });
     }
-    return { reaped };
+    return { ok: true, candidates };
+  }
+
+  /**
+   * Reap orphaned containers we own (labelled OWNER_LABEL). Optionally scoped to a
+   * single label value (one project) and/or to one platform instance.
+   *
+   * Containers THIS process launched are never removed, so a sweep running
+   * concurrently with live work cannot destroy it.
+   */
+  async function reapOrphans(labelValue, { instanceId: onlyInstance } = {}) {
+    const listed = await listOrphans(labelValue, { instanceId: onlyInstance });
+    if (listed.ok !== true) return { reaped: [], failed: [], skipped: [], code: listed.code, stderr: listed.stderr };
+
+    const reaped = [];
+    const failed = [];
+    const skipped = [];
+    for (const candidate of listed.candidates) {
+      if (candidate.name && launchedNames.has(candidate.name)) {
+        // Ours, from THIS process — live work, not an orphan.
+        skipped.push(candidate.name);
+        continue;
+      }
+      const res = await exec(bin, ['rm', '-f', candidate.id], { timeoutMs: 15_000 });
+      if (res.code === 0 || /no such container|not found/i.test(res.stderr)) {
+        reaped.push(candidate.id);
+      } else {
+        // A removal that failed for an unexpected reason must be REPORTED, not
+        // silently dropped from the result as if it had never been a candidate.
+        failed.push({ id: candidate.id, code: res.code, stderr: String(res.stderr ?? '').trim() });
+      }
+    }
+    return { reaped, failed, skipped };
   }
 
   /**
@@ -655,12 +761,13 @@ export function createContainerBackend({
       network,
       readOnlyMount,
       labelValue: labelValue ?? name,
-      ...(labels ? { labels } : {}),
+      ...(withOwnLabels(labels) ? { labels: withOwnLabels(labels) } : {}),
       command,
       publish: publishList,
       env: hasEnv ? env : undefined,
     };
 
+    launchedNames.add(name);
     let res = await exec(bin, buildServiceArgs({ ...baseSpec, cgroupFlags }), { timeoutMs, signal, childEnv });
 
     // Same graceful cgroup degrade as runOneShot. One extra step matters here: a
@@ -754,6 +861,7 @@ export function createContainerBackend({
     runOneShot,
     remove,
     reapOrphans,
+    listOrphans,
     rawExec,
     // Long-running service containers (the Dev_Server behind a Preview).
     startService,
@@ -768,6 +876,10 @@ export function createContainerBackend({
     supportsServices: true,
     // The network modes this instance will launch a one-shot command into.
     permittedNetworks: permitted,
+    // The deployment-slot identity stamped on every container we create. `null` when
+    // none was configured — which is what lets a reaper REFUSE an instance-scoped
+    // sweep rather than filter on a label nothing carries.
+    instanceId: ownInstanceId,
     // Exposed for tests / introspection.
     buildRunArgs,
     buildServiceArgs,

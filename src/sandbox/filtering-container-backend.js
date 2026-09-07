@@ -111,6 +111,7 @@ export function createFilteringContainerBackend({
   image = DEFAULT_IMAGE,
   proxyImage,
   exec,
+  instanceId,
   networkPrefix = DEFAULT_EGRESS_NETWORK_PREFIX,
   proxyName = DEFAULT_PROXY_CONTAINER,
   proxyPort = DEFAULT_PROXY_PORT,
@@ -153,6 +154,11 @@ export function createFilteringContainerBackend({
     bin,
     image,
     ...(exec ? { exec } : {}),
+    // FORWARDED, and re-exported below. Dropping it made every container in this
+    // mode unstamped, so an instance-scoped startup reap filtered on a label nothing
+    // carried and reported "no orphans" while every orphan kept running — in the one
+    // mode a deployment needs for `npm install`.
+    ...(instanceId ? { instanceId } : {}),
     isNetworkPermitted: (network) => network === NETWORK_DENY_ALL || ownNetworks.has(network),
   });
 
@@ -489,6 +495,10 @@ export function createFilteringContainerBackend({
     runOneShot,
     remove: base.remove,
     reapOrphans: base.reapOrphans,
+    listOrphans: base.listOrphans,
+    // Re-exported so a reaper can CONFIRM this backend stamps what it filters on,
+    // rather than discovering the mismatch as an empty, successful-looking sweep.
+    instanceId: base.instanceId,
     startService: base.startService,
     serviceStatus: base.serviceStatus,
     serviceLogs: base.serviceLogs,
