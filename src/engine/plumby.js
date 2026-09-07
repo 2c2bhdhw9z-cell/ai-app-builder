@@ -45,9 +45,15 @@ export { verifyTool } from 'plumby/src/tools/verify.js';
 export { loadSkillTool } from 'plumby/src/tools/load_skill.js';
 export { editFileTool } from 'plumby/src/tools/edit_file.js';
 
-// Skill discovery: the surface loader and the core indexer.
+// Skill discovery: the surface loader, the core indexer, the startup listing
+// block renderer (500-char description clip + 16 KiB listing cap live here),
+// and the available-name lister used for error messages.
 export { loadSkills } from 'plumby/src/cli/project_context.js';
-export { indexSkills } from 'plumby/src/core/skills.js';
+export {
+  indexSkills,
+  buildSkillsBlock,
+  skillNames,
+} from 'plumby/src/core/skills.js';
 
 // Web surface helpers: event projection and diff computation.
 export { toViewEvent, RESULT_PREVIEW_CHARS } from 'plumby/src/web/events.js';
