@@ -11,7 +11,8 @@
   "scripts": {
     "start": "node src/server/start.js",
     "test": "node --test test/*.test.js",
-    "eval": "node eval/run.js"
+    "eval": "node eval/run.js",
+    "vendor:skills": "node scripts/vendor-skills.js"
   },
   "dependencies": {
     "plumby": "file:../plumby"

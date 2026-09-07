@@ -1,0 +1,6 @@
+{
+  "//": "acme is our vendor, but this structural rule does not mandate importing it.",
+  "name": "keep-store-adapter-shape",
+  "paths": "src/store.ts",
+  "must": { "importFrom": ["@tanstack/react-query"] }
+}
