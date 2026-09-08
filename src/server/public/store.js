@@ -700,3 +700,20 @@ export function selectPreview(state) {
 export function selectPreviewMobile(state) {
   return state.preview.mobile;
 }
+
+/**
+ * The pending Confirm_Prompts, keyed by requestId (Req 5.3, 5.4). The reference
+ * only changes when a confirm is added or cleared, so a view subscribed to this
+ * selector re-renders exactly when the set of pending confirms changes — and an
+ * idempotent replay of an identical confirm is a no-op (the store returns the
+ * SAME object reference), so the confirm view never stacks duplicates on
+ * reconnect replay.
+ */
+export function selectPendingConfirms(state) {
+  return state.session.pendingConfirms;
+}
+
+/** The open Project_Session's projectId (needed for the POST /confirm body). */
+export function selectProjectId(state) {
+  return state.session.projectId;
+}

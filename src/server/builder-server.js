@@ -117,6 +117,8 @@ const STATIC_ASSETS = {
   '/preview-poll.js': 'preview-poll.js', // Task 5.2
   '/qr.js': 'qr.js', // Task 5.3
   '/views/preview-pane.js': 'views/preview-pane.js', // Task 5.3
+  '/confirm.js': 'confirm.js', // Task 6.1
+  '/views/confirm.js': 'views/confirm.js', // Task 6.1
 };
 
 /** Content-Type by file extension for the served static assets. */

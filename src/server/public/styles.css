@@ -250,3 +250,84 @@ body {
   background-color: #ffffff;
   image-rendering: pixelated;
 }
+
+
+/*
+ * Confirm view (spec Task 6.1, Req 5.1 / 5.3 / 11.3). One card per pending
+ * Confirm_Prompt; palette-driven colors only (var(--color-*)); approve/deny
+ * controls are touch-sized (>=44px hit target) so they are operable by touch on
+ * a phone. Full-width, border-box, single column — no horizontal overflow of
+ * the primary column at a 360px viewport.
+ */
+.confirm {
+  display: block;
+  width: 100%;
+  max-width: 48rem;
+  margin: 0 auto;
+  padding: 0.75rem;
+}
+
+.confirm[hidden] {
+  display: none;
+}
+
+.confirm__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.confirm__card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-status-warning);
+  border-radius: 0.5rem;
+}
+
+.confirm__command {
+  margin: 0;
+  font-weight: 600;
+  color: var(--color-accent);
+  word-break: break-word;
+}
+
+.confirm__reason {
+  margin: 0;
+  color: var(--color-status-info);
+  word-break: break-word;
+}
+
+.confirm__controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.confirm__approve,
+.confirm__deny {
+  /* Touch target: comfortably >=44px tall/wide (Req 11.3). */
+  min-height: 2.75rem;
+  min-width: 2.75rem;
+  padding: 0.6rem 1.25rem;
+  font: inherit;
+  font-weight: 600;
+  border: none;
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+.confirm__approve {
+  color: var(--color-background);
+  background-color: var(--color-button);
+}
+
+.confirm__deny {
+  color: var(--color-background);
+  background-color: var(--color-status-error);
+}

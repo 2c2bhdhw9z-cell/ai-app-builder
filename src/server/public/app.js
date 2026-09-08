@@ -28,12 +28,14 @@ import { createBuilderController } from './builder.js';
 import { createSseClient } from './sse.js';
 import { createPreviewController } from './preview.js';
 import { createPreviewPoll } from './preview-poll.js';
+import { createConfirmController } from './confirm.js';
 import { createPromptView } from './views/prompt.js';
 import {
   createActivityStreamView,
   connectActivityStream,
 } from './views/activity-stream.js';
 import { createPreviewPaneView } from './views/preview-pane.js';
+import { createConfirmView } from './views/confirm.js';
 
 /** The DOM node the client mounts into (declared in index.html). */
 const ROOT_ID = 'app';
@@ -76,7 +78,13 @@ export function createClient(deps = {}) {
   // (Task 8) fills the getToken seam.
   const preview = deps.preview ?? createPreviewController({ store, api });
   const previewPoll = deps.previewPoll ?? createPreviewPoll({ store, api, controller: preview });
-  return { store, api, builder, sse, preview, previewPoll };
+  // The confirm controller (Task 6.1) turns an approve/deny intent into a
+  // POST /confirm carrying the frame's requestId + the Bearer, sharing the SAME
+  // store + gated api client so the Bearer flows once the Token_Store (Task 8)
+  // fills the getToken seam. The confirm_request/confirm_timeout frames are
+  // already dispatched into store.pendingConfirms by frames.js (Task 4).
+  const confirm = deps.confirm ?? createConfirmController({ store, api });
+  return { store, api, builder, sse, preview, previewPoll, confirm };
 }
 
 /**
@@ -169,6 +177,21 @@ export function createInitialView(doc, client) {
     });
     main.append(preview.el);
     views.push(preview);
+  }
+
+  // Mount the Confirm view (Task 6.1) so a `confirm_request` frame renders its
+  // approve/deny controls, stays visible while unanswered (Req 5.3), and is
+  // re-displayed idempotently on reconnect replay keyed by requestId (Req 5.4).
+  // The controller posts the decision to /confirm; the view reads the
+  // store.pendingConfirms slice frames.js populates.
+  if (client && client.store && client.confirm) {
+    const confirm = createConfirmView({
+      doc,
+      store: client.store,
+      controller: client.confirm,
+    });
+    main.append(confirm.el);
+    views.push(confirm);
   }
 
   return { el: main, views };
