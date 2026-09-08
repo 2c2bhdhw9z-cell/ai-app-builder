@@ -53,6 +53,7 @@
  * Node stdlib only; adds no runtime dependency.
  */
 
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -63,6 +64,9 @@ import { createProjectRegistry } from '../project/project-registry.js';
 import { createProjectManager } from '../project/project-manager.js';
 import { createDevServer } from '../project/dev-server.js';
 import { createContainerDevServer } from '../project/container-dev-server.js';
+import { createBuildService } from '../project/build-service.js';
+import { createContainerBuild } from '../project/container-build.js';
+import { createSelfHostedDeploy } from '../project/self-hosted-deploy.js';
 import { createPreviewController } from '../project/preview-controller.js';
 import { createProjectOriginWithTemplates } from '../project/index.js';
 import { createSandboxManager } from '../sandbox/sandbox-manager.js';
@@ -287,6 +291,41 @@ export function resolveDataDir(env = process.env) {
 export function resolveShareLinkBaseUrl(env = process.env) {
   const raw = (env.AAB_SHARE_BASE_URL ?? env.PUBLIC_BASE_URL ?? '').trim();
   return raw !== '' ? raw.replace(/\/+$/, '') : undefined;
+}
+
+/**
+ * Resolve the public base URL a PUBLISHED (self-hosted deployed) site is rendered
+ * against. Same shape and precedence as resolveShareLinkBaseUrl: when set, a deploy
+ * returns an ABSOLUTE URL a user can open from outside the deploy; when unset the
+ * publisher returns a relative `/live/...` path, which is genuinely usable from the
+ * Web UI's own origin. A blank value is treated as unset.
+ *
+ * @param {Record<string,string|undefined>} [env=process.env]
+ * @returns {string|undefined}
+ */
+export function resolvePublishedBaseUrl(env = process.env) {
+  const raw = (env.AAB_PUBLISHED_BASE_URL ?? env.PUBLIC_BASE_URL ?? '').trim();
+  return raw !== '' ? raw.replace(/\/+$/, '') : undefined;
+}
+
+/**
+ * Resolve the key a published site's URL capability signature is derived from.
+ *
+ * The signature is what makes `/live/<projectId>/<target>/<signature>/` a capability
+ * rather than an enumerable path, so the key must be a real secret. Set
+ * `AAB_PUBLISHED_SIGNING_KEY` (>= 32 characters) for a URL that survives a restart
+ * and is identical across replicas. With none set — or one too short to be a
+ * credential — a random per-process key is generated: publishing still works, but
+ * every previously issued deploy URL stops resolving after a restart. Reported so a
+ * deployment can see which posture it got, exactly like the OIDC state key.
+ *
+ * @param {Record<string,string|undefined>} [env=process.env]
+ * @returns {{ key:string, source:'configured'|'ephemeral' }}
+ */
+export function resolvePublishedSigningKey(env = process.env) {
+  const raw = (env.AAB_PUBLISHED_SIGNING_KEY ?? '').trim();
+  if (raw.length >= 32) return { key: raw, source: 'configured' };
+  return { key: crypto.randomBytes(32).toString('base64'), source: 'ephemeral' };
 }
 
 /** Parse a positive-integer env override, or undefined when unset/invalid. */
@@ -1105,17 +1144,223 @@ export function composeProjectRuntime({
   });
   const shareLinkBaseUrl = resolveShareLinkBaseUrl(env);
 
-  // ---- build / deploy: DELIBERATELY UNWIRED (Req 15.1/15.2) ----------------
-  // There is NO real build/deploy engine in this repo — no module composes a
-  // Deployment_Artifact or performs a deploy. Wiring a fake `projectLifecycle`
-  // that pretended to build/deploy would be a dishonest success (and an exit-tax
-  // hazard the anti-lock-in policy forbids). So `projectLifecycle` is left
-  // UNINJECTED: POST /settings/build and /settings/deploy honestly stay 405 in
-  // the live boot, truthfully reflecting that the engine does not exist yet,
-  // instead of returning a fabricated { outcome:'succeeded' }. When a real
-  // ProjectLifecycle exists it composes here and the routes light up with no
-  // change to createBuilderServer. This is the same honesty the DevServer seam
-  // keeps (inert unless a real preview backend is configured).
+  // ==========================================================================
+  // BUILD / DEPLOY — THE REAL ENGINE (Req 15.1/15.2, 18.1-18.8)
+  //
+  // This used to be deliberately UNWIRED: `build-service.js` implemented the
+  // build/deploy LIFECYCLE for real but both of its work boundaries were inert
+  // seams that synthesized a result and launched nothing, so injecting a
+  // `projectLifecycle` over them would have returned a fabricated success. Both
+  // boundaries now have REAL implementations behind the SAME seams:
+  //
+  //   buildBoundary  -> src/project/container-build.js — resolves the project's own
+  //     build script and runs `npm run <script>` INSIDE the project's
+  //     Isolation_Boundary through the existing SandboxManager.exec seam, then
+  //     packages the detected build output into the artifact bytes build-service
+  //     writes to disk. A project with no build script / no output / uninstalled
+  //     dependencies is REFUSED with a named reason, never faked.
+  //   deployBoundary -> src/project/self-hosted-deploy.js — publishes the artifact
+  //     to a control-plane location THIS platform serves and returns that URL. No
+  //     hosting vendor, no credentials, no new dependency (anti-lock-in); an
+  //     external provider stays a future adapter behind this same seam.
+  //
+  // PER-OWNER, and why it matters here more than almost anywhere else. A
+  // BuildService keeps per-project artifact + deployed-URL state AND writes real
+  // artifact bytes to disk. Its default artifact path is keyed by projectId alone,
+  // so ONE shared instance would put every account's build products in one
+  // directory tree, collapsing the per-owner storage-path isolation axis (Req 7.6)
+  // that every store above preserves. So BuildServices are a per-owner instance
+  // cache whose artifact path is layout.controlBuildArtifactPath(ownerId, ...), and
+  // the publisher resolves each project's owner through the SAME registry before
+  // choosing layout.controlPublishedSitePath(ownerId, ...).
+  const containerBuild = createContainerBuild({
+    layout,
+    // The Isolation_Boundary, WITH the idle-reclamation wrapper — a build is real
+    // work on a project's tree and must count as use of its boundary.
+    sandboxManager,
+    now,
+    // Build logs are surfaced as failure causes, so they go through the SAME
+    // central redactor every other wired sink uses.
+    redact: (text) => composed.redactor.redact(text),
+  });
+
+  const publishedSigningKey = resolvePublishedSigningKey(env);
+  const publishedBaseUrl = resolvePublishedBaseUrl(env);
+  const selfHostedDeploy = createSelfHostedDeploy({
+    layout,
+    // Published output is per-owner on disk; the registry is the owner authority.
+    ownerOf,
+    signingKey: publishedSigningKey.key,
+    ...(publishedBaseUrl !== undefined ? { baseUrl: publishedBaseUrl } : {}),
+    now,
+  });
+
+  const buildServices = perOwner((ownerId) =>
+    createBuildService({
+      layout,
+      buildBoundary: containerBuild.build,
+      deployBoundary: selfHostedDeploy.deploy,
+      // A deploy that supplies a COMMAND is gated by the same wired CommandGuard
+      // the rest of the runtime uses. The self-hosted publish runs no command at
+      // all (it writes files), so there is nothing for the classifier to gate —
+      // the guard is wired for the provider adapters that will run one.
+      commandGuard,
+      now,
+      artifactPathFor: ({ projectId, target }) => layout.controlBuildArtifactPath(ownerId, projectId, target),
+      audit: composed.auditLog,
+    }),
+  );
+
+  /**
+   * Which Target a /settings/build or /settings/deploy request builds.
+   *
+   * The routes carry only a projectId, so the Target comes from the PROJECT's own
+   * registry record, in this order:
+   *
+   *   1. its DECLARED `targets`, preferring the servable ones (web, then shared,
+   *      then backend). This is the authoritative statement when a project has one;
+   *   2. otherwise its `targetCategory`, because ProjectManager creates a Project
+   *      with `targets: []` and the category is then the only thing the Project
+   *      actually says about its shape: `web`/`full-stack-web`/`multi-target` all
+   *      have `web` as their servable Target.
+   *
+   * Nothing is guessed beyond that: a project we cannot resolve, and a `mobile`
+   * project (whose build has its own queue-aware service and is not driven by this
+   * route), are refused with a reason rather than built as something else.
+   */
+  function lifecycleTargetFor(projectId) {
+    let record = null;
+    try {
+      record = registry.get(projectId);
+    } catch {
+      record = null;
+    }
+    if (!record) {
+      return {
+        ok: false,
+        outcome: 'unavailable',
+        summary: 'this project is not in the ProjectRegistry, so no build Target can be resolved',
+      };
+    }
+    const declared = Array.isArray(record.targets) ? record.targets : [];
+    const fromDeclared = ['web', 'shared', 'backend'].find((candidate) => declared.includes(candidate));
+    if (fromDeclared) return { ok: true, target: fromDeclared };
+
+    if (declared.length === 0 && record.targetCategory !== 'mobile') {
+      const fromCategory = { web: 'web', 'full-stack-web': 'web', 'multi-target': 'web' }[record.targetCategory];
+      if (fromCategory) return { ok: true, target: fromCategory };
+    }
+    return {
+      ok: false,
+      outcome: 'unsupported',
+      summary:
+        record.targetCategory === 'mobile' || declared.includes('mobile')
+          ? 'a mobile Target is built by the mobile build service, which this route does not drive'
+          : `this project declares no buildable Target (declared: ${declared.join(', ') || 'none'}, ` +
+            `category: ${record.targetCategory})`,
+    };
+  }
+
+  /**
+   * Reduce any internal cause to the bounded, single-line, REDACTED summary the
+   * route is allowed to surface. Never forwards a raw multi-line cause (which could
+   * carry a build log, a path or a secret a build script echoed).
+   */
+  function safeSummary(text) {
+    const oneLine = composed.redactor.redact(String(text ?? '')).replace(/\s+/g, ' ').trim();
+    return oneLine.length > 300 ? `${oneLine.slice(0, 297)}...` : oneLine;
+  }
+
+  /**
+   * Can the engine operate at all right now? Checked AT REQUEST TIME, not at boot:
+   * a host with no container runtime must still boot and answer /healthz (the same
+   * rule the SandboxManager composition follows), so an unusable backend becomes an
+   * honest structured refusal on the build request rather than a boot failure — and
+   * never a fabricated success.
+   */
+  function engineUnavailable() {
+    if (typeof backend.runOneShot !== 'function') {
+      return {
+        outcome: 'unavailable',
+        summary:
+          'the composed container backend cannot run commands, so no build can be performed; ' +
+          'a build runs only inside a project Isolation_Boundary',
+      };
+    }
+    return null;
+  }
+
+  /**
+   * The `projectLifecycle` the /settings/build + /settings/deploy routes consume.
+   * A THIN adapter: it maps the BuildService's richer structured results onto the
+   * exact { outcome, summary?, url? } shape the routes surface, and nothing else.
+   *
+   * HONEST BY CONSTRUCTION: a refusal maps to a NON-SUCCESS outcome carrying a safe
+   * reason. There is no path through this adapter that reports success for work that
+   * did not happen.
+   */
+  const projectLifecycle = Object.freeze({
+    async build({ projectId } = {}) {
+      const unavailable = engineUnavailable();
+      if (unavailable) return unavailable;
+      const service = buildServices.forProject(projectId);
+      if (!service) {
+        return {
+          outcome: 'unavailable',
+          summary: 'this project is not in the ProjectRegistry, so no owner-scoped build service can be selected',
+        };
+      }
+      const resolved = lifecycleTargetFor(projectId);
+      if (resolved.ok !== true) return { outcome: resolved.outcome, summary: resolved.summary };
+
+      const result = await service.build({ projectId, target: resolved.target });
+      if (result.ok === true) {
+        return {
+          outcome: 'succeeded',
+          summary: `built the ${resolved.target} Target in ${result.buildMs}ms; Deployment_Artifact recorded`,
+        };
+      }
+      return { outcome: 'failed', summary: safeSummary(`${result.code}: ${result.message}`) };
+    },
+
+    async deploy({ projectId, service: destination } = {}) {
+      const unavailable = engineUnavailable();
+      if (unavailable) return unavailable;
+      const service = buildServices.forProject(projectId);
+      if (!service) {
+        return {
+          outcome: 'unavailable',
+          summary: 'this project is not in the ProjectRegistry, so no owner-scoped build service can be selected',
+        };
+      }
+      const resolved = lifecycleTargetFor(projectId);
+      if (resolved.ok !== true) return { outcome: resolved.outcome, summary: resolved.summary };
+
+      // Deploying without a build is refused BEFORE any deploy work, by the
+      // BuildService itself (Req 18.8). Surfacing it here makes the reason
+      // actionable instead of a bare code.
+      const artifact = service.artifactFor(projectId, resolved.target);
+      if (!artifact) {
+        return {
+          outcome: 'failed',
+          summary: `no Deployment_Artifact exists for the ${resolved.target} Target — run a build first`,
+        };
+      }
+      const result = await service.deploy({
+        projectId,
+        artifact,
+        destination: typeof destination === 'string' && destination !== '' ? destination : 'self-hosted',
+      });
+      if (result.ok === true) {
+        return {
+          outcome: 'deployed',
+          summary: `published the ${resolved.target} Target to this platform in ${result.deployMs}ms`,
+          url: result.url,
+        };
+      }
+      return { outcome: 'failed', summary: safeSummary(`${result.code}: ${result.message}`) };
+    },
+  });
 
   /**
    * The bundle to spread into createBuilderServer:
@@ -1139,9 +1384,7 @@ export function composeProjectRuntime({
       workspaceExperienceStore,
       // Web UI settings surfaces (Req 12-15). Spread straight into
       // createBuilderServer by start.js with no change required there. Each
-      // option name matches the createBuilderServer contract exactly. Note the
-      // DELIBERATE absence of `projectLifecycle` (build/deploy) — see the wiring
-      // section above for why it stays unwired (405) in an honest deploy.
+      // option name matches the createBuilderServer contract exactly.
       providerResolver,
       connectorService,
       connectorBindingStore,
@@ -1150,6 +1393,12 @@ export function composeProjectRuntime({
       projectExporter,
       lockinAudit,
       shareLinkService,
+      // Build/deploy is now REAL and therefore routed: POST /settings/build and
+      // /settings/deploy are reachable instead of 405. An engine that genuinely
+      // cannot operate refuses at REQUEST time with a structured reason.
+      projectLifecycle,
+      // The read side of a self-hosted deploy: GET /live/<project>/<target>/<sig>/…
+      publishedSites: selfHostedDeploy,
       ...(shareLinkBaseUrl !== undefined ? { shareLinkBaseUrl } : {}),
     };
   }
@@ -1183,6 +1432,19 @@ export function composeProjectRuntime({
     lockinAudit,
     shareLinkService,
     shareLinkBaseUrl,
+    // The REAL build/deploy engine (Req 15.1/15.2, 18.x), exposed so a deployment /
+    // the wiring tests can observe WHAT was composed rather than probing a route.
+    projectLifecycle,
+    containerBuild,
+    selfHostedDeploy,
+    buildServiceFor: (ownerId) => buildServices.forOwner(ownerId),
+    /**
+     * Do deploy URLs survive a restart? 'configured' when AAB_PUBLISHED_SIGNING_KEY
+     * supplied the capability key; 'ephemeral' when a per-process key was generated,
+     * in which case previously issued deploy URLs stop resolving after a restart.
+     */
+    publishedUrlMode: publishedSigningKey.source,
+    publishedBaseUrl,
     serverOptions,
     egressMode: egress.mode,
     /**

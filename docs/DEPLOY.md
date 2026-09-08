@@ -170,13 +170,11 @@ not stop the server from booting — it fails when a turn actually runs.
 ### Web UI settings surfaces
 
 The `/settings/*` routes (provider selection, connectors, skills, memory, export,
-lock-in audit, share links) are wired into the live process: each is enabled only
-when its backing service is composed, which the production composition now does.
-The one route group deliberately **not** wired is **build / deploy** — there is no
-real build/deploy engine in the repo yet, so `POST /settings/build` and
-`POST /settings/deploy` honestly stay `405` rather than returning a fabricated
-success. When a real lifecycle engine exists it composes in the same place and
-those routes light up with no other change.
+lock-in audit, share links, **build and deploy**) are all wired into the live
+process: each is enabled only when its backing service is composed, which the
+production composition now does. `POST /settings/build` and `POST /settings/deploy`
+used to stay `405` because the build/deploy engine did not exist; it does now — see
+*Build and deploy* below.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -185,9 +183,83 @@ those routes light up with no other change.
 
 The connectors, skills and memory settings are **per-account** — a connector
 credential or User_Skill you add is stored under **your own** account's control-plane
-directory and is never visible to another account; export, lock-in audit and share
-are **per-project** and require full authorization for the target project, denying a
-non-owner with the same non-disclosing `401` as every other project route.
+directory and is never visible to another account; export, lock-in audit, share,
+build and deploy are **per-project** and require full authorization for the target
+project, denying a non-owner with the same non-disclosing `401` as every other
+project route.
+
+### Build and deploy
+
+Both halves are real. A **build** resolves the Project's *own* build script and runs
+it as `npm run <script>` **inside that Project's Isolation_Boundary** (the same
+one-shot container, the same project-only bind mount, the same deny-by-default
+egress and the same requested cgroup limits as any other command — a build never
+runs on the host, and the script *body* is never spliced into a command, so
+generated content is interpreted by npm inside the container). A **deploy**
+publishes the resulting artifact to a location **this platform itself serves** and
+returns that URL.
+
+Resolution rules, in order, so there is no guessing:
+
+- **Build script:** `build:<target>` first (so a multi-target project builds the
+  right one), then plain `build`. Nothing else — no `compile`/`bundle` guessing.
+- **Output directory:** `dist`, then `build`, then `out`, first non-empty wins.
+- **Target:** the Project's declared `targets`, preferring `web`, then `shared`,
+  then `backend`; when a Project declares none (the state `ProjectManager` creates
+  it in) its `targetCategory` decides, and `web`/`full-stack-web`/`multi-target` all
+  resolve to `web`.
+
+Each of these has an **honest refusal** rather than a fabricated success: no
+`package.json`, no build script, a build script that exits 0 without producing any
+conventional output directory, declared dependencies with no installed
+`node_modules` (install them via the package-manager path first), or a `mobile`
+Target (which has its own queue-aware build service) all come back as a **non-success
+outcome naming the reason**. A failed build reports the script's own exit status with
+a **bounded, redacted log tail**, and writes **no** artifact.
+
+**Deploy is vendor-neutral by design.** The first-class target is self-hosted: no
+hosting-provider SDK, no vendor credentials, no added dependency. An external
+provider (Vercel/Netlify/object storage/an image registry) is a *future adapter
+behind the same `deployBoundary` seam*, which is why asking for one today is
+**refused** rather than silently self-hosted. Publishing is atomic: a complete new
+release is staged beside the live one and made live by a single `rename` over a
+`current` symlink, so **a failed publish leaves the previously deployed release
+byte-for-byte unchanged and still served**.
+
+A published site is served at
+`/live/<projectId>/<target>/<signature>/…`. The `signature` is an unguessable,
+key-derived capability over (owner, project, target) — the same capability model as a
+read-only Share_Link — so the URL opens in a browser (which could never send a
+Bearer token) without anything that previously required authorization becoming
+reachable. The route does **no filesystem work**: the request path is only ever a
+**key into the manifest written at publish time**, so there is no traversal surface,
+there is never a directory listing, and every miss (bad capability, unlisted path,
+unknown project) is the same generic `404`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AAB_PUBLISHED_SIGNING_KEY` | unset → **a random per-process key** | Key the published-site capability signature is derived from. **Set it (≥ 32 characters) on any real deploy:** with it, a deployed URL survives a restart and is identical across replicas. Without it — or with a value too short to be a credential — a per-process key is generated: publishing still works, but every previously issued deploy URL stops resolving after a restart. `runtime.publishedUrlMode` reports which posture you got (`'configured'` or `'ephemeral'`). Generate with `openssl rand -base64 32`. |
+| `AAB_PUBLISHED_BASE_URL` | unset → **relative `/live/…` URL** | Public origin a deployed URL is rendered against, so `POST /settings/deploy` returns an absolute, copyable link. Falls back to `PUBLIC_BASE_URL` when unset (`AAB_PUBLISHED_BASE_URL` wins when both are set). A trailing slash is trimmed; a blank value is treated as unset. |
+
+Two limits, stated rather than hidden. **A published document is served inert.** The
+platform serves it from its *own* origin, so a published response carries the
+baseline CSP **plus** the `sandbox` directive: generated script does not execute and
+the document gets an opaque origin, which is what stops a deployed page from reading
+the Web UI's session storage (i.e. stealing the visitor's Bearer token). Nothing is
+relaxed relative to the baseline — it is strictly stricter — but a deployed app whose
+JavaScript must actually *run* needs a **separate origin**, which is a follow-up. Use
+the Preview (above) for a running app in the meantime. And **only `web`/`shared`
+Targets are publishable**: a `backend` build is a server, not a site, so publishing
+it as static files under a URL implying a running service is refused.
+
+**What only a real container host can prove:** that the runtime accepts the emitted
+argv, that `npm run <script>` resolves a generated project's toolchain inside the
+image, and that a real framework build writes into one of those output directories.
+To check it on a container host: create a project, run a turn that scaffolds a
+buildable `package.json`, install its dependencies, then `POST /settings/build`
+followed by `POST /settings/deploy` and open the returned URL — it must serve the
+built `index.html`, and the artifact must exist under
+`$AAB_DATA_DIR/control-plane/build-artifacts/<owner>/<project>/web.artifact`.
 
 ## Setting up the provider
 
@@ -482,14 +554,49 @@ register exactly that URL with your identity provider.
   `docker ps --filter label=aab.sandbox` still lists the container, restart with
   `AAB_STARTUP_REAP=instance`, and confirm the boot log reports the removal and the
   list is empty.
-- **No build/deploy engine.** The `/settings/build` and `/settings/deploy` routes
-  exist and are auth-gated, but no module actually builds a Deployment_Artifact or
-  performs a deploy, so the production composition injects no `projectLifecycle` and
-  both routes stay `405` — an honest "not implemented yet" rather than a fabricated
-  success. This is the same discipline as the inert Preview default: the seam is
-  ready, the engine behind it is the remaining work. All the other `/settings/*`
-  surfaces (provider, connectors, skills, memory, export, lock-in audit, share) are
-  wired and reachable.
+- ~~**No build/deploy engine.**~~ **Done** — both work boundaries behind
+  `src/project/build-service.js` are real now: `src/project/container-build.js` runs
+  the Project's own build script inside its Isolation_Boundary and packages the
+  detected output into the Deployment_Artifact's bytes, and
+  `src/project/self-hosted-deploy.js` publishes that artifact to a control-plane
+  location the platform serves. The production composition injects the resulting
+  `projectLifecycle`, so `POST /settings/build` and `POST /settings/deploy` are
+  reachable instead of `405`. See *Build and deploy* above for the resolution rules,
+  the refusals, and the two stated limits (inert serving on the platform origin;
+  `web`/`shared` Targets only).
+
+  What is proven without a container, against the **real** `SandboxManager`,
+  `BuildService`, `StorageLayout` and `CommandGuard` with only the container CLI
+  faked: command and output-directory resolution and every refusal (no manifest, no
+  script, blank script, no output, uninstalled dependencies, `mobile`); that a
+  refusal spends no container launch; that a successful build emits an argv vector
+  into a container mounting *only* that project's tree on a total-deny network and
+  writes a **real** artifact file under the per-**owner** control path carrying the
+  **actual** built bytes (text and binary); that a failed build surfaces the script's
+  own exit status with a bounded, redacted tail and writes **no** artifact; that a
+  build killed at the boundary and one that crosses the 300s SLO on the injected
+  clock both yield no artifact; that a boundary denial is not misreported as the
+  script failing; that a publish is served by the returned URL, that a bad
+  capability / unlisted path / traversal / directory / prototype key / unknown
+  project all serve nothing, that a **failed publish leaves the live release
+  byte-for-byte unchanged** while a good one swaps atomically, and that a vendor
+  destination and a non-servable Target are refused. End to end over real HTTP
+  through the composed runtime: both routes answer instead of `405`, the deployed URL
+  really serves the built bytes under the sandboxed CSP, an unauthenticated caller
+  and a non-owner get the same non-disclosing `401`, a refusal never surfaces as a
+  success, and two accounts never share an artifact or published directory.
+
+  **What only a real container host can prove:** as listed under *Build and deploy*.
+- **A deployed app's JavaScript does not run.** Published documents are served from
+  the platform's own origin under an additionally sandboxed CSP, which is what keeps
+  a generated page from reading the Web UI's session storage. Serving a *running*
+  deployed app needs a separate origin (a distinct host or port fronted by your
+  proxy, as the Preview already gets by being a different port). That is additive —
+  the publish itself, the release layout and the manifest are unchanged by it.
+- **Dependency installation is not part of a build.** A build refuses when a Project
+  declares dependencies with no installed `node_modules`, rather than running a build
+  doomed to fail inside npm. Wiring the package-manager install step into the build
+  route is a follow-up.
 - **Single instance assumed.** Accounts, sessions and the login-state key are
   in-process. Behind a load balancer, either pin sessions to one instance or set
   `OIDC_STATE_SIGNING_KEY` — and note that accounts and sessions are still
