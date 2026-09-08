@@ -136,6 +136,28 @@ export const ACTIONS = Object.freeze({
   THEME_PREVIEWED: 'theme/previewed', // previewed:true frame — never touches committed
   THEME_COMMITTED: 'theme/committed', // committed frame / read — overwrites committed
   THEME_PREVIEW_CANCELLED: 'theme/previewCancelled', // revert to committed
+
+  // ---- Activity_Stream + SSE frame-driven actions (Task 4.2) ----------
+  // Append one normalized Activity_Stream item, ordered by monotonic seq
+  // (Req 3.3). A duplicate seq is ignored so a replay never double-renders.
+  ACTIVITY_APPENDED: 'activity/appended',
+  // Reset the Activity_Stream (e.g. on a fresh session open).
+  ACTIVITY_CLEARED: 'activity/cleared',
+
+  // Apply a preview_status frame (Req 4.1–4.6). Preview reducers proper land
+  // in Task 5; Task 4 only needs the frame to update the mirrored slice so a
+  // reconnect replay shows the current preview state.
+  PREVIEW_STATUS_SET: 'preview/statusSet',
+
+  // Work_Mode / Session_Header frame application (Req 10.1, 10.2).
+  WORK_MODE_SET: 'workMode/set',
+
+  // Workspace_Experience frame application — LAYOUT ONLY (Req 8.3, 8.4).
+  WORKSPACE_EXPERIENCE_SET: 'workspace/experienceSet',
+
+  // Pending confirm add / clear, keyed by requestId (Req 5.3, 5.4).
+  CONFIRM_ADDED: 'confirm/added',
+  CONFIRM_CLEARED: 'confirm/cleared',
 });
 
 // ------------------------------------------------------------------ Reducer
@@ -307,12 +329,178 @@ export function reducer(state, action) {
         theme: { ...state.theme, previewedTheme: null, previewedPalette: null },
       };
 
+    // ---- Activity_Stream ordered append (Req 3.3) -----------------------
+    case ACTIONS.ACTIVITY_APPENDED: {
+      const item = action.item;
+      // Defensive: an item without a usable normalized shape is ignored. The
+      // frame dispatcher (frames.js) is what builds well-formed items; this
+      // guard just keeps the reducer total.
+      if (!item || typeof item !== 'object') return state;
+
+      const seq = typeof item.seq === 'number' && Number.isFinite(item.seq) ? item.seq : null;
+
+      // De-duplicate by seq (Req 3.7 replay must not double-render): a frame
+      // whose seq is already present is a no-op (SAME state ref, no notify).
+      if (seq !== null && state.session.activity.some((a) => a.seq === seq)) {
+        return state;
+      }
+
+      // Insert so the activity array stays sorted strictly ascending by seq
+      // (Req 3.3), regardless of arrival order. Items without a seq (defensive)
+      // are appended at the end in arrival order. A stable insertion (find the
+      // first strictly-greater seq) keeps equal-less items ahead.
+      const next = state.session.activity.slice();
+      if (seq === null) {
+        next.push(item);
+      } else {
+        let idx = next.length;
+        for (let i = 0; i < next.length; i += 1) {
+          const s = typeof next[i].seq === 'number' ? next[i].seq : Infinity;
+          if (s > seq) {
+            idx = i;
+            break;
+          }
+        }
+        next.splice(idx, 0, item);
+      }
+
+      const highest =
+        seq !== null
+          ? state.session.lastSeq === null
+            ? seq
+            : Math.max(state.session.lastSeq, seq)
+          : state.session.lastSeq;
+
+      return {
+        ...state,
+        session: { ...state.session, activity: next, lastSeq: highest },
+      };
+    }
+
+    case ACTIONS.ACTIVITY_CLEARED:
+      return {
+        ...state,
+        session: { ...state.session, activity: [], lastSeq: null },
+      };
+
+    // ---- preview_status frame (Req 4.1–4.6; full reducers in Task 5) ----
+    case ACTIONS.PREVIEW_STATUS_SET: {
+      const p = action.preview ?? {};
+      return {
+        ...state,
+        preview: {
+          ...state.preview,
+          status: typeof p.status === 'string' ? p.status : state.preview.status,
+          url: 'url' in p ? (typeof p.url === 'string' ? p.url : null) : state.preview.url,
+          snapshotId:
+            'snapshotId' in p
+              ? typeof p.snapshotId === 'string'
+                ? p.snapshotId
+                : null
+              : state.preview.snapshotId,
+          showingPrior: p.showingPrior === true,
+          // Only a SAFE single-line cause summary is ever stored (Req 3.8/4.4).
+          cause: typeof p.cause === 'string' && p.cause !== '' ? p.cause : null,
+          restartOffered: p.restartOffered === true,
+          source: p.source === 'poll' ? 'poll' : 'sse',
+        },
+      };
+    }
+
+    // ---- work_mode / session_header frame (Req 10.1, 10.2) --------------
+    case ACTIONS.WORK_MODE_SET:
+      return {
+        ...state,
+        workMode: {
+          active: typeof action.active === 'string' ? action.active : state.workMode.active,
+          choices: Array.isArray(action.choices)
+            ? [...action.choices]
+            : state.workMode.choices,
+        },
+      };
+
+    // ---- workspace_experience frame — LAYOUT ONLY (Req 8.3, 8.4) --------
+    case ACTIONS.WORKSPACE_EXPERIENCE_SET:
+      // INVARIANT (Req 8.3): applying a workspace_experience frame changes the
+      // layout slice ONLY. It MUST NOT touch theme, workMode, session, preview,
+      // or auth — even if the action carelessly carried such fields, only the
+      // three layout fields below are read.
+      return {
+        ...state,
+        workspace: {
+          experience:
+            typeof action.experience === 'string'
+              ? action.experience
+              : state.workspace.experience,
+          layout: action.layout ?? state.workspace.layout,
+          attribution:
+            typeof action.attribution === 'string' && action.attribution !== ''
+              ? action.attribution
+              : null,
+        },
+      };
+
+    // ---- pending confirm add / clear (Req 5.3, 5.4) ---------------------
+    case ACTIONS.CONFIRM_ADDED: {
+      const requestId = action.requestId;
+      if (typeof requestId !== 'string' || requestId === '') return state;
+      // Idempotent re-display on replay (Req 5.4): re-adding the SAME requestId
+      // with an equal payload is a no-op so a reconnect does not churn state.
+      const existing = state.session.pendingConfirms[requestId];
+      const payload = action.payload ?? null;
+      if (existing !== undefined && shallowEqualConfirm(existing, payload)) {
+        return state;
+      }
+      return {
+        ...state,
+        session: {
+          ...state.session,
+          pendingConfirms: { ...state.session.pendingConfirms, [requestId]: payload },
+        },
+      };
+    }
+
+    case ACTIONS.CONFIRM_CLEARED: {
+      const requestId = action.requestId;
+      if (
+        typeof requestId !== 'string' ||
+        state.session.pendingConfirms[requestId] === undefined
+      ) {
+        return state;
+      }
+      const nextConfirms = { ...state.session.pendingConfirms };
+      delete nextConfirms[requestId];
+      return {
+        ...state,
+        session: { ...state.session, pendingConfirms: nextConfirms },
+      };
+    }
+
     default:
       return state;
   }
 }
 
 // ------------------------------------------------------------------ Helpers
+
+/**
+ * Shallow-equal two confirm payloads on the SAFE display fields only. Used so a
+ * reconnect replay that re-delivers an identical pending confirm is an
+ * idempotent no-op (Req 5.4) rather than a state churn.
+ * @param {any} a
+ * @param {any} b
+ * @returns {boolean}
+ */
+function shallowEqualConfirm(a, b) {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  return (
+    a.requestId === b.requestId &&
+    a.command === b.command &&
+    a.category === b.category &&
+    a.reason === b.reason
+  );
+}
 
 /**
  * Coerce a palette-like input into a plain 9-key palette object, or null when
@@ -401,4 +589,14 @@ export function selectCommittedPalette(state) {
 /** The active palette to render: previewed if previewing, else committed. */
 export function selectActivePalette(state) {
   return state.theme.previewedPalette ?? state.theme.committedPalette;
+}
+
+/** The ordered Activity_Stream items (ascending by seq) (Req 3.3). */
+export function selectActivity(state) {
+  return state.session.activity;
+}
+
+/** The current SSE connection status of the open session (Req 3.2, 3.6). */
+export function selectConnection(state) {
+  return state.session.connection;
 }

@@ -22,10 +22,15 @@
  * document.documentElement via the CSSOM.
  */
 
-import { createStore } from './store.js';
+import { createStore, ACTIONS } from './store.js';
 import { createApiClient } from './api.js';
 import { createBuilderController } from './builder.js';
+import { createSseClient } from './sse.js';
 import { createPromptView } from './views/prompt.js';
+import {
+  createActivityStreamView,
+  connectActivityStream,
+} from './views/activity-stream.js';
 
 /** The DOM node the client mounts into (declared in index.html). */
 const ROOT_ID = 'app';
@@ -52,7 +57,34 @@ export function createClient(deps = {}) {
       getToken: deps.getToken ?? (() => null),
     });
   const builder = deps.builder ?? createBuilderController({ store, api });
-  return { store, api, builder };
+  // The SSE client shares the SAME token seam as the api client (Req 6.4), so
+  // the Bearer is attached to the /events stream once the Token_Store (Task 8)
+  // fills the getToken seam. Injected timer/fetch/AbortController default to the
+  // browser globals in production.
+  const sse =
+    deps.sse ??
+    createSseClient({
+      getToken: deps.getToken ?? (() => null),
+    });
+  return { store, api, builder, sse };
+}
+
+/**
+ * Open a Project_Session: reset the per-session activity slice, mark the session
+ * open (which the store defaults to Work_Mode 'vibe'), then wire and open the
+ * SSE Activity_Stream for the project (Req 3.1). Returns the SSE wiring teardown
+ * so a session close (or a re-open) can disconnect cleanly. This is the single
+ * place session-open side effects live; the project-creation controller (Task 9)
+ * calls it on a 201.
+ *
+ * @param {{ store: object, sse: object }} client
+ * @param {string} projectId
+ * @returns {{ disconnect: () => void }}
+ */
+export function openSession(client, projectId) {
+  client.store.dispatch({ type: ACTIONS.SESSION_OPEN, projectId });
+  client.store.dispatch({ type: ACTIONS.ACTIVITY_CLEARED });
+  return connectActivityStream({ store: client.store, sse: client.sse, projectId });
 }
 
 /**
@@ -88,6 +120,19 @@ export function createInitialView(doc, client) {
     });
     main.append(prompt.el);
     views.push(prompt);
+  }
+
+  // Mount the Activity_Stream view (Task 4.3) alongside the prompt so the live
+  // reasoning/tool/diff feed and the connection state render in the shell. The
+  // SSE stream itself is opened by openSession() when a Project_Session opens.
+  if (client && client.store) {
+    const activity = createActivityStreamView({
+      doc,
+      store: client.store,
+      sse: client.sse,
+    });
+    main.append(activity.el);
+    views.push(activity);
   }
 
   return { el: main, views };

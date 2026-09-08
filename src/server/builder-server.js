@@ -110,6 +110,9 @@ const STATIC_ASSETS = {
   '/api.js': 'api.js', // Task 2.2
   '/builder.js': 'builder.js', // Task 3.1
   '/views/prompt.js': 'views/prompt.js', // Task 3.2
+  '/sse.js': 'sse.js', // Task 4.1
+  '/frames.js': 'frames.js', // Task 4.2
+  '/views/activity-stream.js': 'views/activity-stream.js', // Task 4.3
 };
 
 /** Content-Type by file extension for the served static assets. */
