@@ -24,6 +24,8 @@
 
 import { createStore, ACTIONS } from './store.js';
 import { createApiClient } from './api.js';
+import { createTokenStore } from './token-store.js';
+import { createAuthController } from './auth.js';
 import { createBuilderController } from './builder.js';
 import { createSseClient } from './sse.js';
 import { createPreviewController } from './preview.js';
@@ -55,21 +57,30 @@ const APP_TITLE = 'AI App Builder';
  */
 export function createClient(deps = {}) {
   const store = deps.store ?? createStore();
+  // The Token_Store (Task 8.1) is the client-side Bearer_Token holder. Its
+  // `getToken` is THE seam api.js and sse.js read to attach `Authorization:
+  // Bearer <token>` to every gated request and the `/events` connect (Req 6.4).
+  // In-memory primary + optional sessionStorage continuity; never document.cookie
+  // (Req 16.3). A test may inject its own tokenStore or a bare getToken.
+  const tokenStore = deps.tokenStore ?? createTokenStore();
+  // Prefer an explicitly injected getToken (tests); otherwise read the REAL
+  // Token_Store, so once the auth controller stores a token it flows into both
+  // transports with no rewire.
+  const getToken = deps.getToken ?? (() => tokenStore.getToken());
   const api =
     deps.api ??
     createApiClient({
-      // Token_Store wiring lands in Task 8; for now no token is held.
-      getToken: deps.getToken ?? (() => null),
+      getToken,
     });
   const builder = deps.builder ?? createBuilderController({ store, api });
   // The SSE client shares the SAME token seam as the api client (Req 6.4), so
-  // the Bearer is attached to the /events stream once the Token_Store (Task 8)
-  // fills the getToken seam. Injected timer/fetch/AbortController default to the
-  // browser globals in production.
+  // the Bearer is attached to the /events stream from the Token_Store's
+  // getToken. Injected timer/fetch/AbortController default to the browser
+  // globals in production.
   const sse =
     deps.sse ??
     createSseClient({
-      getToken: deps.getToken ?? (() => null),
+      getToken,
     });
   // The preview controller (Task 5.1) owns the restart control + the store
   // projection of preview_status; the poller (Task 5.2) is the safety net for
@@ -84,7 +95,22 @@ export function createClient(deps = {}) {
   // fills the getToken seam. The confirm_request/confirm_timeout frames are
   // already dispatched into store.pendingConfirms by frames.js (Task 4).
   const confirm = deps.confirm ?? createConfirmController({ store, api });
-  return { store, api, builder, sse, preview, previewPoll, confirm };
+  // The auth controller (Task 8.2) owns the Login_Flow + the Token_Store
+  // lifecycle. It registers the api.js `onAccessDenied` seam so ANY gated 401
+  // clears the token and returns to login (Req 6.7), navigates to /auth/login on
+  // the login control (Req 6.1), applies the /auth/callback branches (Req
+  // 6.2/6.3/6.5/6.6), and clears on expiry/logout (Req 6.7/6.9). It shares the
+  // SAME store, api client, and tokenStore so token presence, auto-attach, and
+  // clearing all stay consistent.
+  const auth =
+    deps.auth ??
+    createAuthController({
+      store,
+      api,
+      tokenStore,
+      ...(deps.navigate ? { navigate: deps.navigate } : {}),
+    });
+  return { store, api, builder, sse, preview, previewPoll, confirm, tokenStore, auth };
 }
 
 /**

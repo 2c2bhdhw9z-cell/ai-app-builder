@@ -119,6 +119,8 @@ const STATIC_ASSETS = {
   '/views/preview-pane.js': 'views/preview-pane.js', // Task 5.3
   '/confirm.js': 'confirm.js', // Task 6.1
   '/views/confirm.js': 'views/confirm.js', // Task 6.1
+  '/token-store.js': 'token-store.js', // Task 8.1
+  '/auth.js': 'auth.js', // Task 8.2
 };
 
 /** Content-Type by file extension for the served static assets. */

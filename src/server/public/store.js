@@ -281,6 +281,10 @@ export function reducer(state, action) {
             kind: action.kind ?? 'error',
             message: action.message ?? '',
             limit: action.limit ?? null,
+            // A generic flag the login view reads to render a Login_Flow restart
+            // control on a protocol-fault login failure (Req 6.6). It is a plain
+            // boolean and NEVER carries a backend `code` or any body detail.
+            offerRestart: action.offerRestart === true,
           },
         },
       };
