@@ -43,6 +43,9 @@
 
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   createAgent,
@@ -74,6 +77,41 @@ const DEFAULT_CONFIRM_TIMEOUT_MS = 60_000;
  * replaced with a compact notice so the stream stays alive without blowing up.
  */
 const MAX_SSE_FRAME_BYTES = 256 * 1024;
+
+/**
+ * The Web UI static assets live here, alongside this module, in src/server/public/.
+ * Resolved from THIS file's location (not process.cwd()) so serving is correct
+ * regardless of where the server is launched from.
+ */
+const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
+
+/**
+ * The FIXED allow-list of Web UI static assets the Builder_Server will serve
+ * (spec Task 1.1, Req 1.1/1.3/1.5). A request path is only served if it maps to
+ * exactly one entry here — there is NO directory walk, NO path joining of the
+ * request path, and thus no traversal surface: `/` and `/index.html` both map to
+ * the shell, and every other served path maps 1:1 to a known file. A path not in
+ * this map is a generic 404 (no listing, no existence disclosure). Kept as a
+ * pure module constant so the served set is auditable at a glance and cannot
+ * drift per-request.
+ *
+ * @type {Record<string, string>}
+ */
+const STATIC_ASSETS = {
+  '/': 'index.html',
+  '/index.html': 'index.html',
+  '/app.js': 'app.js',
+  '/styles.css': 'styles.css',
+  '/manifest.webmanifest': 'manifest.webmanifest',
+};
+
+/** Content-Type by file extension for the served static assets. */
+const CONTENT_TYPE_BY_EXT = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
+};
 
 /**
  * The baseline security headers every response carries. Pure, so the exact set
@@ -838,6 +876,19 @@ export function createBuilderServer(opts = {}) {
       return handleLoginCallback(req, res, url);
     }
 
+    // The Web UI static shell (spec Task 1.1, Req 1.1/1.3/1.5). Placed AFTER the
+    // unauthenticated /healthz and /auth/* paths and BEFORE every auth-gated
+    // route, so the browser can load the HTML shell + its module JS/CSS with NO
+    // Bearer_Token — exactly how a same-origin SPA bootstraps before it has a
+    // token to attach. GET only; the fixed STATIC_ASSETS allow-list means an
+    // unknown path is NOT served here and falls through to the existing 405, so
+    // non-asset unknown routes still 405 as before. The same baselineHeaders
+    // (the CSP set once at the top of the request) apply, so the shell is served
+    // under the IDENTICAL Content-Security-Policy as every other response.
+    if (req.method === 'GET' && Object.prototype.hasOwnProperty.call(STATIC_ASSETS, pathname)) {
+      return handleStaticAsset(res, pathname);
+    }
+
     if (req.method === 'GET' && pathname === '/events') return handleEvents(req, res);
     if (req.method === 'POST' && pathname === '/message') return handleMessage(req, res);
     if (req.method === 'POST' && pathname === '/confirm') return handleConfirm(req, res);
@@ -892,6 +943,45 @@ export function createBuilderServer(opts = {}) {
 
     res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8', allow: 'GET, POST' });
     res.end('method not allowed');
+  }
+
+  // -------- Web UI static shell (spec Task 1.1) — unauthenticated, GET only
+
+  /**
+   * Serve one Web UI static asset from the fixed STATIC_ASSETS allow-list
+   * (Req 1.1/1.3/1.5). The `pathname` has ALREADY been confirmed to be a key of
+   * STATIC_ASSETS by handle(), so the file name is a KNOWN constant — the request
+   * path is never joined onto disk, so there is no path-traversal surface. The
+   * baseline securityHeaders() (the CSP) were already set on this response at the
+   * top of the request, so the shell is served under the identical CSP as every
+   * other route; here we add only the content-type and a conservative
+   * cache-control. A file that is (unexpectedly) absent yields a GENERIC 404 with
+   * a fixed body — never a directory listing and never the resolved path — so a
+   * missing asset discloses nothing.
+   */
+  function handleStaticAsset(res, pathname) {
+    const fileName = STATIC_ASSETS[pathname];
+    const filePath = path.join(PUBLIC_DIR, fileName);
+    const ext = path.extname(fileName);
+    const contentType = CONTENT_TYPE_BY_EXT[ext] ?? 'application/octet-stream';
+
+    let body;
+    try {
+      body = fs.readFileSync(filePath);
+    } catch {
+      // Missing/unreadable asset → single generic 404. No path, no listing.
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('not found');
+      return;
+    }
+
+    res.writeHead(200, {
+      'content-type': contentType,
+      // The shell + modules are same-origin static assets; a short cache keeps
+      // reloads cheap without pinning a stale client across a deploy.
+      'cache-control': 'no-cache',
+    });
+    res.end(body);
   }
 
   // -------- delegated login — only routed when a LoginFlow is injected

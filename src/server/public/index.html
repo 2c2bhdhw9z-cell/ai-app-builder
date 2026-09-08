@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>AI App Builder</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/styles.css" />
+    <!--
+      CSP-clean shell (spec Task 1.2, Req 1.4): the ONLY script is a same-origin
+      ES module and the ONLY styles come from a same-origin stylesheet + CSS
+      custom properties applied later via the CSSOM. There is deliberately no
+      inline <script> and no inline <style>, so the document loads under
+      script-src 'self' / style-src 'self' with no 'unsafe-inline' exception.
+    -->
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <!--
+      The client mounts the live UI into this root. Server-rendered fallback text
+      makes GET / a real HTML shell (not JSON) even before the module runs; the
+      bootstrap replaces it once loaded.
+    -->
+    <div id="app" data-app-root>
+      <main class="app-shell">
+        <h1 class="app-shell__title">AI App Builder</h1>
+        <p class="app-shell__status">Loading&hellip;</p>
+      </main>
+    </div>
+    <noscript>
+      This application requires JavaScript (a same-origin ES module) to run.
+    </noscript>
+  </body>
+</html>

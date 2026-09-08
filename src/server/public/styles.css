@@ -1,0 +1,96 @@
+/*
+ * styles.css — Web UI base stylesheet (spec Task 1.2, Req 1.4 / 9.1).
+ *
+ * Palette-driven by design: every color below is read from a `--color-*` CSS
+ * custom property, NEVER a hard-coded hex. A Theme is applied later by setting
+ * those nine custom properties on `document.documentElement` via the CSSOM
+ * (which is NOT an inline <style> element, so it stays CSP-legal under
+ * style-src 'self'). The nine names mirror the backend THEME_CATALOG Palette
+ * keys (background, surface, accent, button, badge, statusInfo, statusSuccess,
+ * statusWarning, statusError) so a `theme` frame's palette maps 1:1.
+ *
+ * The :root fallbacks here are a neutral light default only — they are the
+ * bootstrap colors shown before the committed Theme's palette is applied, and
+ * are overwritten wholesale once a palette is set on documentElement.
+ */
+
+:root {
+  --color-background: #ffffff;
+  --color-surface: #f4f5f7;
+  --color-accent: #2f6feb;
+  --color-button: #2f6feb;
+  --color-badge: #6b7280;
+  --color-status-info: #2f6feb;
+  --color-status-success: #1a7f37;
+  --color-status-warning: #9a6700;
+  --color-status-error: #cf222e;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-accent);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.5;
+  /* Room for notches / rounded corners on phones (mobile-command-center). */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+/* The app root fills the viewport so mounted views can lay themselves out. */
+#app,
+[data-app-root] {
+  display: block;
+  min-height: 100vh;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 1.5rem;
+  text-align: center;
+}
+
+.app-shell__title {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--color-accent);
+}
+
+.app-shell__status {
+  margin: 0;
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  background-color: var(--color-surface);
+  color: var(--color-status-info);
+  font-size: 0.95rem;
+}
+
+/*
+ * Mobile Command Center baseline (Req 11.2): the primary column must not
+ * horizontally scroll at a 360px viewport. A single-column, full-width shell
+ * with border-box sizing satisfies that at the shell level; later views inherit
+ * the same constraint.
+ */
+@media (max-width: 480px) {
+  .app-shell {
+    padding: 1rem;
+  }
+}
