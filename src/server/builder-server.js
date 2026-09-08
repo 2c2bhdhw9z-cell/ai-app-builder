@@ -113,6 +113,10 @@ const STATIC_ASSETS = {
   '/sse.js': 'sse.js', // Task 4.1
   '/frames.js': 'frames.js', // Task 4.2
   '/views/activity-stream.js': 'views/activity-stream.js', // Task 4.3
+  '/preview.js': 'preview.js', // Task 5.1
+  '/preview-poll.js': 'preview-poll.js', // Task 5.2
+  '/qr.js': 'qr.js', // Task 5.3
+  '/views/preview-pane.js': 'views/preview-pane.js', // Task 5.3
 };
 
 /** Content-Type by file extension for the served static assets. */

@@ -84,6 +84,11 @@ export function initialState() {
       restartOffered: false,
       mobile: null, // { url } -> QR + selectable text
       source: 'sse', // 'sse' | 'poll'
+      // A `ready` frame that arrives with a missing/empty url must NOT replace
+      // the shown preview; instead the prior state is retained and this flag is
+      // raised so the view shows a "ready URL unavailable" error (Req 4.2). It
+      // is cleared by any subsequent frame that resolves the preview state.
+      urlUnavailable: false,
     },
 
     theme: {
@@ -144,10 +149,15 @@ export const ACTIONS = Object.freeze({
   // Reset the Activity_Stream (e.g. on a fresh session open).
   ACTIVITY_CLEARED: 'activity/cleared',
 
-  // Apply a preview_status frame (Req 4.1–4.6). Preview reducers proper land
-  // in Task 5; Task 4 only needs the frame to update the mirrored slice so a
-  // reconnect replay shows the current preview state.
+  // Apply a preview_status frame (Req 4.1–4.6). Task 4 mirrored the frame so a
+  // reconnect replay shows the current preview state; Task 5 makes the reducer
+  // honor the full lifecycle semantics (ready-empty-url retain, loading
+  // suppression, failure cause, restart offer).
   PREVIEW_STATUS_SET: 'preview/statusSet',
+
+  // Set the mobile connection URL for the Preview_Pane (Req 4.10). Carried by a
+  // preview_mobile frame or the liveness poll's served.mobile detail.
+  PREVIEW_MOBILE_SET: 'preview/mobileSet',
 
   // Work_Mode / Session_Header frame application (Req 10.1, 10.2).
   WORK_MODE_SET: 'workMode/set',
@@ -383,26 +393,106 @@ export function reducer(state, action) {
         session: { ...state.session, activity: [], lastSeq: null },
       };
 
-    // ---- preview_status frame (Req 4.1–4.6; full reducers in Task 5) ----
+    // ---- preview_status frame (Req 4.1–4.6) -----------------------------
+    // The single reducer that applies a preview_status frame — from an SSE
+    // frame (frames.js) OR the 5s liveness poll (preview-poll.js), which tags
+    // itself source:'poll'. The lifecycle semantics the requirements demand
+    // are honored HERE so they are pure and property-testable:
+    //
+    //   - ready + non-empty url  -> becomes { status:'ready', url }, replacing
+    //     any prior loading indicator / content, urlUnavailable cleared (4.1).
+    //   - ready + missing/empty url -> RETAIN the prior preview state entirely
+    //     (status, url, snapshotId, showingPrior) and raise urlUnavailable so
+    //     the view shows a "ready URL unavailable" error (4.2). This is the one
+    //     status that does NOT overwrite the shown state.
+    //   - loading -> status:'loading'; the view suppresses previously rendered
+    //     content while loading (4.3). url is cleared to null so nothing stale
+    //     is shown behind the loading indicator.
+    //   - showing_prior / error / persistent_failure -> set the status +
+    //     showingPrior + a SAFE cause summary iff the frame carried a non-empty
+    //     one (4.4, 4.5); url is retained for showing_prior (a prior state IS
+    //     shown) and cleared for error/persistent_failure.
+    //   - restartOffered rides through verbatim so the view offers the restart
+    //     control exactly when the frame reports it (4.6).
     case ACTIONS.PREVIEW_STATUS_SET: {
       const p = action.preview ?? {};
+      const prev = state.preview;
+      const status = typeof p.status === 'string' ? p.status : prev.status;
+      const frameUrl = typeof p.url === 'string' ? p.url : '';
+      const hasUsableUrl = frameUrl !== '';
+      const source = p.source === 'poll' ? 'poll' : 'sse';
+      // Only a SAFE single-line cause summary is ever stored (Req 3.8/4.4/4.5).
+      // A whitespace-only cause counts as ABSENT so the view shows no summary.
+      const cause = typeof p.cause === 'string' && p.cause.trim() !== '' ? p.cause : null;
+      const restartOffered = p.restartOffered === true;
+
+      // Req 4.2: a ready frame WITHOUT a usable url retains the prior state and
+      // only raises the url-unavailable error indication. Nothing else changes,
+      // except restartOffered (a frame may still offer a restart) and source.
+      if (status === 'ready' && !hasUsableUrl) {
+        return {
+          ...state,
+          preview: {
+            ...prev,
+            urlUnavailable: true,
+            restartOffered,
+            source,
+          },
+        };
+      }
+
+      const next = {
+        ...prev,
+        status,
+        showingPrior: p.showingPrior === true,
+        cause,
+        restartOffered,
+        source,
+        urlUnavailable: false,
+      };
+
+      if (status === 'ready') {
+        // Req 4.1: replace any prior loading indicator/content with the ready url.
+        next.url = frameUrl;
+        if ('snapshotId' in p) {
+          next.snapshotId = typeof p.snapshotId === 'string' ? p.snapshotId : null;
+        }
+      } else if (status === 'loading') {
+        // Req 4.3: loading suppresses previously rendered content — drop the url
+        // so nothing stale shows behind the loading indicator.
+        next.url = null;
+      } else if (status === 'showing_prior') {
+        // A prior project state IS being shown, so retain the last url unless
+        // the frame supplies one; showingPrior is asserted for the indicator.
+        next.url = 'url' in p ? (hasUsableUrl ? frameUrl : null) : prev.url;
+        next.showingPrior = true;
+        if ('snapshotId' in p) {
+          next.snapshotId = typeof p.snapshotId === 'string' ? p.snapshotId : null;
+        }
+      } else {
+        // error | persistent_failure | any other terminal status: no live
+        // preview is shown, so clear the url. snapshotId follows the frame.
+        next.url = 'url' in p ? (hasUsableUrl ? frameUrl : null) : null;
+        if ('snapshotId' in p) {
+          next.snapshotId = typeof p.snapshotId === 'string' ? p.snapshotId : null;
+        }
+      }
+
+      return { ...state, preview: next };
+    }
+
+    // ---- mobile connection details (Req 4.10) ---------------------------
+    // A preview_mobile frame (or the poll surfacing served.mobile) carries the
+    // mobile connection URL. We store ONLY a non-empty url under preview.mobile
+    // so the view renders it as selectable text + a scannable QR; an absent or
+    // empty url clears it.
+    case ACTIONS.PREVIEW_MOBILE_SET: {
+      const url = typeof action.url === 'string' ? action.url.trim() : '';
       return {
         ...state,
         preview: {
           ...state.preview,
-          status: typeof p.status === 'string' ? p.status : state.preview.status,
-          url: 'url' in p ? (typeof p.url === 'string' ? p.url : null) : state.preview.url,
-          snapshotId:
-            'snapshotId' in p
-              ? typeof p.snapshotId === 'string'
-                ? p.snapshotId
-                : null
-              : state.preview.snapshotId,
-          showingPrior: p.showingPrior === true,
-          // Only a SAFE single-line cause summary is ever stored (Req 3.8/4.4).
-          cause: typeof p.cause === 'string' && p.cause !== '' ? p.cause : null,
-          restartOffered: p.restartOffered === true,
-          source: p.source === 'poll' ? 'poll' : 'sse',
+          mobile: url !== '' ? { url } : null,
         },
       };
     }
@@ -599,4 +689,14 @@ export function selectActivity(state) {
 /** The current SSE connection status of the open session (Req 3.2, 3.6). */
 export function selectConnection(state) {
   return state.session.connection;
+}
+
+/** The full preview slice (Req 4.1–4.10). */
+export function selectPreview(state) {
+  return state.preview;
+}
+
+/** The mobile connection details `{ url } | null` for the Preview_Pane (Req 4.10). */
+export function selectPreviewMobile(state) {
+  return state.preview.mobile;
 }

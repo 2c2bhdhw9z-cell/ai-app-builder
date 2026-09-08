@@ -26,11 +26,14 @@ import { createStore, ACTIONS } from './store.js';
 import { createApiClient } from './api.js';
 import { createBuilderController } from './builder.js';
 import { createSseClient } from './sse.js';
+import { createPreviewController } from './preview.js';
+import { createPreviewPoll } from './preview-poll.js';
 import { createPromptView } from './views/prompt.js';
 import {
   createActivityStreamView,
   connectActivityStream,
 } from './views/activity-stream.js';
+import { createPreviewPaneView } from './views/preview-pane.js';
 
 /** The DOM node the client mounts into (declared in index.html). */
 const ROOT_ID = 'app';
@@ -66,7 +69,14 @@ export function createClient(deps = {}) {
     createSseClient({
       getToken: deps.getToken ?? (() => null),
     });
-  return { store, api, builder, sse };
+  // The preview controller (Task 5.1) owns the restart control + the store
+  // projection of preview_status; the poller (Task 5.2) is the safety net for
+  // the known "dead preview not pushed over SSE" gap (Req 4.7–4.9). Both share
+  // the SAME store + gated api client, so the Bearer flows once the Token_Store
+  // (Task 8) fills the getToken seam.
+  const preview = deps.preview ?? createPreviewController({ store, api });
+  const previewPoll = deps.previewPoll ?? createPreviewPoll({ store, api, controller: preview });
+  return { store, api, builder, sse, preview, previewPoll };
 }
 
 /**
@@ -84,7 +94,20 @@ export function createClient(deps = {}) {
 export function openSession(client, projectId) {
   client.store.dispatch({ type: ACTIONS.SESSION_OPEN, projectId });
   client.store.dispatch({ type: ACTIONS.ACTIVITY_CLEARED });
-  return connectActivityStream({ store: client.store, sse: client.sse, projectId });
+  const wiring = connectActivityStream({ store: client.store, sse: client.sse, projectId });
+  // Start the 5s preview liveness poll for this session (Req 4.7). It is the
+  // ONLY mechanism that detects a dead preview the backend does not push.
+  if (client.previewPoll && typeof client.previewPoll.start === 'function') {
+    client.previewPoll.start(projectId);
+  }
+  return {
+    disconnect() {
+      if (client.previewPoll && typeof client.previewPoll.stop === 'function') {
+        client.previewPoll.stop();
+      }
+      wiring.disconnect();
+    },
+  };
 }
 
 /**
@@ -133,6 +156,19 @@ export function createInitialView(doc, client) {
     });
     main.append(activity.el);
     views.push(activity);
+  }
+
+  // Mount the Preview_Pane view (Task 5.3) beside the activity feed so the live
+  // preview (same-origin iframe), its lifecycle indicators, the restart control,
+  // and the mobile connection URL + QR render in the shell.
+  if (client && client.store) {
+    const preview = createPreviewPaneView({
+      doc,
+      store: client.store,
+      controller: client.preview,
+    });
+    main.append(preview.el);
+    views.push(preview);
   }
 
   return { el: main, views };

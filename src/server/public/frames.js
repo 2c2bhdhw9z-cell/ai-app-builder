@@ -353,7 +353,8 @@ export function createFrameDispatcher({ store, hooks = {} } = {}) {
           preview: {
             status: frame.status,
             // Preserve the url key semantics: present-but-empty vs absent matter
-            // to the Task-5 reducers; forward what the frame carried.
+            // to the Task-5 reducer (ready-empty-url retains prior + raises the
+            // url-unavailable error, Req 4.2); forward what the frame carried.
             ...(('url' in frame) ? { url: frame.url } : {}),
             ...(('snapshotId' in frame) ? { snapshotId: frame.snapshotId } : {}),
             showingPrior: frame.showingPrior === true,
@@ -361,6 +362,22 @@ export function createFrameDispatcher({ store, hooks = {} } = {}) {
             restartOffered: frame.restartOffered === true,
             source: 'sse',
           },
+        });
+        break;
+
+      case 'preview_mobile':
+        // A typed mobile frame carries the mobile connection URL under `url`
+        // (mirroring the served-preview mobile detail `{ url, qr, ... }`). Only
+        // the URL is read into state (Req 4.10); the client synthesizes its own
+        // scannable QR from it, never trusting a vendor-supplied QR payload.
+        store.dispatch({
+          type: ACTIONS.PREVIEW_MOBILE_SET,
+          url:
+            typeof frame.url === 'string'
+              ? frame.url
+              : typeof frame.connectionUrl === 'string'
+                ? frame.connectionUrl
+                : '',
         });
         break;
 

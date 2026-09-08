@@ -168,3 +168,85 @@ body {
   background-color: var(--color-surface);
   color: var(--color-status-warning);
 }
+
+
+/*
+ * Preview_Pane (Task 5.3, Req 4.1–4.6, 4.10, 4.11). Palette-driven via
+ * var(--color-*) only; the same-origin iframe fills the pane; the restart
+ * control is touch-sized (>=44px) for phone use; the mobile URL is selectable
+ * and the QR is an inline data: image sized responsively.
+ */
+.preview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  background-color: var(--color-surface);
+}
+
+.preview__frame {
+  width: 100%;
+  min-height: 20rem;
+  border: 1px solid var(--color-badge);
+  background-color: var(--color-background);
+}
+
+.preview__loading,
+.preview__status {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  background-color: var(--color-surface);
+  color: var(--color-status-info);
+}
+
+.preview__cause {
+  margin: 0;
+  padding: 0.25rem 0.75rem;
+  color: var(--color-status-warning);
+}
+
+.preview__url-error {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  color: var(--color-status-error);
+}
+
+.preview__restart {
+  /* Touch target: comfortably >=44px tall (Req 11.3). */
+  min-height: 2.75rem;
+  padding: 0.5rem 1rem;
+  color: var(--color-background);
+  background-color: var(--color-button);
+  border: none;
+  cursor: pointer;
+}
+
+.preview__mobile {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.preview__mobile-hint {
+  margin: 0;
+  color: var(--color-accent);
+}
+
+.preview__mobile-url {
+  /* Selectable connection URL (Req 4.10). */
+  user-select: all;
+  word-break: break-all;
+  padding: 0.25rem 0.5rem;
+  background-color: var(--color-background);
+  color: var(--color-accent);
+  border: 1px solid var(--color-badge);
+}
+
+.preview__mobile-qr {
+  width: 12rem;
+  height: 12rem;
+  max-width: 100%;
+  background-color: #ffffff;
+  image-rendering: pixelated;
+}
