@@ -530,6 +530,49 @@ export function themeFrame({ theme, palette, previewed, experience } = {}) {
  *        flow injected neither path is routed (405, exactly as any unknown path)
  *        and every existing route is byte-identical, so an unconfigured deploy
  *        advertises no login it cannot honor.
+ * @param {object} [opts.providerResolver]  OPTIONAL ProviderResolver
+ *        (src/server/provider-resolver.js). When present, GET/POST
+ *        /settings/provider are routed (per-account, authn only): GET lists the
+ *        supported providers + the active one; POST { provider } selects it and
+ *        responds { active } (400 { error, code } + prior active on an
+ *        unsupported provider — the resolver leaves the selection unchanged).
+ *        Strictly additive: with none injected neither route is added.
+ * @param {object} [opts.connectorService]  OPTIONAL ConnectorService
+ *        (src/connectors/connector-service.js). When present, GET/POST
+ *        /settings/connectors are routed (per-account): GET returns the catalog
+ *        (flat entries the client groups) + the bound state; POST { service,
+ *        secrets } configures a connector via a PER-CALL capture seam and
+ *        responds with ONLY the safe, name-only bound view — the submitted
+ *        secret VALUE is NEVER echoed (Req 13.3).
+ * @param {object} [opts.connectorBindingStore]  OPTIONAL ConnectorBindingStore
+ *        used ONLY to surface the bound-connector list on GET /settings/connectors
+ *        (name-only). Absent ⇒ the bound list is [] (the catalog is still served).
+ * @param {object} [opts.skillLibrary]  OPTIONAL SkillLibrary (src/skills/library.js).
+ *        When present, GET/POST /settings/skills are routed (per-account): GET
+ *        returns { stocked, user } (name+description only); POST { name,
+ *        description, body, import? } adds a User_Skill owned by the account.
+ * @param {object} [opts.memoryStore]  OPTIONAL MemoryStore (src/memory/store.js).
+ *        When present, GET/POST /settings/memory are routed (per-account): GET
+ *        returns { project, global, mode } (Project_Memory scoped to an optional
+ *        projectId, Global_Memory per-account); POST { op:'edit'|'prune'|'mode' }
+ *        mutates the entry/mode and returns the updated view.
+ * @param {object} [opts.projectLifecycle]  OPTIONAL build/deploy service. When
+ *        present, POST /settings/build and /settings/deploy are routed
+ *        (per-project, full auth): each delegates to projectLifecycle.build /
+ *        .deploy and surfaces ONLY the safe { outcome, summary?, url? }.
+ * @param {object} [opts.projectExporter]  OPTIONAL Project_Export
+ *        (src/portability/export.js). When present, GET /settings/export
+ *        (per-project) produces the credential-stripped package and returns it as
+ *        a downloadable JSON package (the client reads it as a blob).
+ * @param {object} [opts.lockinAudit]  OPTIONAL Lockin_Audit
+ *        (src/portability/lockin-audit.js). When present, GET /settings/lockin-audit
+ *        (per-project) returns { findings, clean }.
+ * @param {object} [opts.shareLinkService]  OPTIONAL ShareLinkService
+ *        (src/auth/share-link-service.js). When present, POST /settings/share
+ *        (per-project) mints a read-only Share_Link and returns { url } built
+ *        from the token (a service denial collapses to the non-disclosing 401).
+ * @param {string} [opts.shareLinkBaseUrl]  OPTIONAL base URL for building a
+ *        Share_Link URL from a token (else a relative /share/<token> path).
  * @param {number} [opts.confirmTimeoutMs=60000]  fail-closed confirm ceiling.
  * @param {() => number} [opts.now]       injectable clock.
  * @returns {object} frozen server handle.
@@ -549,6 +592,20 @@ export function createBuilderServer(opts = {}) {
     previewController,
     workspaceExperienceStore,
     themeStore,
+    // ---- Settings surfaces (spec Task 14/15, Req 12-15) — each STRICTLY
+    // ADDITIVE and behind its own injected backing service, exactly like
+    // themeStore / previewController above. With none injected, no /settings/*
+    // route is added and every existing route/behaviour is byte-identical.
+    providerResolver, // GET/POST /settings/provider (per-account)  Req 12
+    connectorService, // GET/POST /settings/connectors (per-account) Req 13
+    connectorBindingStore, // OPTIONAL binding store to surface bound state on GET
+    skillLibrary, // GET/POST /settings/skills (per-account)     Req 14.1/14.2
+    memoryStore, // GET/POST /settings/memory (per-account)     Req 14.3-14.5
+    projectExporter, // GET /settings/export (per-project)          Req 15.3
+    lockinAudit, // GET /settings/lockin-audit (per-project)    Req 15.4
+    shareLinkService, // POST /settings/share (per-project)          Req 15.5
+    projectLifecycle, // POST /settings/build + /settings/deploy (per-project) Req 15.1/15.2
+    shareLinkBaseUrl, // OPTIONAL base for building a Share_Link URL from a token
     provider,
     model,
     confirmTimeoutMs = DEFAULT_CONFIRM_TIMEOUT_MS,
@@ -962,6 +1019,55 @@ export function createBuilderServer(opts = {}) {
     }
     if (themeStore && req.method === 'POST' && pathname === '/theme') {
       return handleTheme(req, res);
+    }
+    // ------------------------------------------------------------ Settings
+    // The Web UI SETTINGS surfaces (spec Task 14/15, Req 12-15). Each route is
+    // STRICTLY ADDITIVE and only routed when its backing service is injected —
+    // exactly like the /theme and /preview surfaces above. With none injected,
+    // every /settings/* path falls through to the existing 405 and no existing
+    // route byte-changes.
+    //
+    // PER-ACCOUNT surfaces (authn only, like /theme): provider, connectors,
+    // skills, memory. PER-PROJECT surfaces (full auth incl. a projectId, like
+    // /message): build, deploy, export, lockin-audit, share.
+    if (providerResolver && req.method === 'GET' && pathname === '/settings/provider') {
+      return handleGetProvider(req, res);
+    }
+    if (providerResolver && req.method === 'POST' && pathname === '/settings/provider') {
+      return handleSelectProvider(req, res);
+    }
+    if (connectorService && req.method === 'GET' && pathname === '/settings/connectors') {
+      return handleGetConnectors(req, res);
+    }
+    if (connectorService && req.method === 'POST' && pathname === '/settings/connectors') {
+      return handleConfigureConnector(req, res);
+    }
+    if (skillLibrary && req.method === 'GET' && pathname === '/settings/skills') {
+      return handleGetSkills(req, res);
+    }
+    if (skillLibrary && req.method === 'POST' && pathname === '/settings/skills') {
+      return handleAddSkill(req, res);
+    }
+    if (memoryStore && req.method === 'GET' && pathname === '/settings/memory') {
+      return handleGetMemory(req, res);
+    }
+    if (memoryStore && req.method === 'POST' && pathname === '/settings/memory') {
+      return handleUpdateMemory(req, res);
+    }
+    if (projectLifecycle && req.method === 'POST' && pathname === '/settings/build') {
+      return handleBuild(req, res);
+    }
+    if (projectLifecycle && req.method === 'POST' && pathname === '/settings/deploy') {
+      return handleDeploy(req, res);
+    }
+    if (projectExporter && req.method === 'GET' && pathname === '/settings/export') {
+      return handleExport(req, res);
+    }
+    if (lockinAudit && req.method === 'GET' && pathname === '/settings/lockin-audit') {
+      return handleLockinAudit(req, res);
+    }
+    if (shareLinkService && req.method === 'POST' && pathname === '/settings/share') {
+      return handleShare(req, res);
     }
     // The per-Session Work_Mode surface (spec Task 32, Req 28). Work_Mode is a
     // CORE Session capability (every Session has one, defaulting to 'vibe'), so
@@ -1620,6 +1726,689 @@ export function createBuilderServer(opts = {}) {
       session.themePreview = null;
     });
     return sendJson(res, 200, { ...frame, at: committed.at });
+  }
+
+  // ============================================================ Settings surfaces
+  //
+  // The backend HTTP routes for the Web UI SETTINGS screens (spec Task 14/15,
+  // Req 12-15). The CLIENT controllers (src/server/public/settings/*.js) already
+  // exist and call these endpoints against a documented contract; these handlers
+  // wire that contract to the EXISTING backend service modules, following the
+  // SAME additive/injected/gated pattern as the theme + preview surfaces:
+  //   - every route reuses the EXISTING gate() choke point (authn, plus authz
+  //     for a projectId on the per-project routes) and the shared readJson /
+  //     sendJson helpers + baseline securityHeaders();
+  //   - a denied request returns the IDENTICAL non-disclosing 401 ACCESS_DENIED;
+  //   - a handled service failure returns a structured { error, code } (like the
+  //     other routes), never a raw internal error or a stack;
+  //   - the quota gate (429 naming the limit) is applied on the per-project
+  //     write routes ONLY when a quotaManager is injected — mirroring /message —
+  //     and never blocks when no quotaManager is present.
+
+  /**
+   * A per-account settings quota/rate gate, mirroring the /message + /projects
+   * shape. Returns null when allowed (or when no quotaManager is injected), or a
+   * { status:429, body } the caller sends verbatim. Never blocks without a
+   * quotaManager (backward compatible).
+   */
+  function settingsRateGate(account, operation) {
+    if (!quotaManager || typeof quotaManager.checkRate !== 'function') return null;
+    const rate = quotaManager.checkRate(account, operation);
+    if (rate && rate.ok === false) {
+      return {
+        status: 429,
+        body: { error: rate.message ?? 'rate limit exceeded', limit: rate.limit, operation: rate.operation },
+      };
+    }
+    return null;
+  }
+
+  // -------- GET/POST /settings/provider (per-account, Req 12) --------
+
+  /**
+   * Project the ProviderResolver's supported providers + the currently resolved
+   * ACTIVE provider onto the client's { providers, active } shape. `providers`
+   * is the string[] the client renders; `active` is the current selection's
+   * provider (an explicit selection, else the env-order default). PURE read —
+   * resolve() with no selection mutates nothing.
+   */
+  function providerView() {
+    const providers = Array.isArray(providerResolver.supportedProviders)
+      ? [...providerResolver.supportedProviders]
+      : [];
+    let active = null;
+    const current =
+      typeof providerResolver.current === 'function' ? providerResolver.current() : null;
+    if (current && typeof current.provider === 'string') active = current.provider;
+    if (active === null && typeof providerResolver.resolve === 'function') {
+      const resolved = providerResolver.resolve();
+      if (resolved && resolved.ok === true && typeof resolved.provider === 'string') {
+        active = resolved.provider;
+      }
+    }
+    return { providers, active };
+  }
+
+  /**
+   * GET /settings/provider — the available providers + the active one (Req 12.1).
+   * Per-account: authn only via gate(req, null); identical non-disclosing 401 on
+   * denial. Read-only.
+   */
+  async function handleGetProvider(req, res) {
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+    return sendJson(res, 200, providerView());
+  }
+
+  /**
+   * POST /settings/provider { provider } — select the builder's model provider
+   * (Req 12.2/12.3/12.4). Per-account: authn only. On success responds
+   * { active }; on an unsupported provider responds 400 { error, code } and the
+   * previously active provider is left in effect (the resolver's select() does
+   * not mutate on rejection).
+   */
+  async function handleSelectProvider(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const rate = settingsRateGate(result.account, 'settings.provider');
+    if (rate) return sendJson(res, rate.status, rate.body);
+
+    const provider = typeof body?.provider === 'string' ? body.provider : '';
+    const model = typeof body?.model === 'string' && body.model !== '' ? body.model : undefined;
+    const selected = providerResolver.select({ provider, ...(model ? { model } : {}) });
+    if (!selected || selected.ok !== true) {
+      // Unsupported provider/model: the resolver left the selection UNCHANGED.
+      // Report 400 with its structured code and the STILL-active provider so a
+      // client can confirm nothing changed (Req 12.4).
+      return sendJson(res, 400, {
+        error: selected?.message ?? 'unsupported provider',
+        code: selected?.code ?? 'unsupported_provider',
+        active: providerView().active,
+      });
+    }
+    return sendJson(res, 200, { active: selected.provider });
+  }
+
+  // -------- GET/POST /settings/connectors (per-account, Req 13) --------
+
+  /**
+   * The Connector_Catalog as flat entries the client groups by category
+   * (Req 13.1): { service, category, captureKind, envNames }. Read off the
+   * service's own catalog surface.
+   */
+  function connectorCatalogView() {
+    const catalog = connectorService.catalog;
+    const list = catalog && typeof catalog.list === 'function' ? catalog.list() : [];
+    return list.map((e) => ({
+      service: e.service,
+      category: e.category,
+      captureKind: e.captureKind,
+      envNames: Array.isArray(e.envNames) ? [...e.envNames] : [],
+    }));
+  }
+
+  /**
+   * Project a stored ConnectorBinding onto the SAFE, NAME-ONLY bound view the
+   * client renders (Req 13.3/13.4): { service, category, status, secretRefs }.
+   * NEVER carries a secret VALUE — secretRefs are env-var NAMEs only.
+   */
+  function boundView(binding) {
+    if (!binding || typeof binding !== 'object') return null;
+    const connector = binding.connector ?? {};
+    const service = typeof connector.service === 'string' ? connector.service : binding.service;
+    if (typeof service !== 'string') return null;
+    return {
+      service,
+      category: typeof connector.category === 'string' ? connector.category : null,
+      status: typeof binding.status === 'string' ? binding.status : 'active',
+      secretRefs: Array.isArray(binding.secretRefs)
+        ? binding.secretRefs.filter((n) => typeof n === 'string')
+        : [],
+    };
+  }
+
+  /**
+   * The current bound connectors for a project, as the SAFE name-only view. Uses
+   * the binding store's list when the service exposes it; falls back to []. Only
+   * ACTIVE bindings are surfaced. A connectorService that does not expose a list
+   * seam yields [] (the catalog is still returned).
+   */
+  function boundConnectorsView(projectId) {
+    const store = connectorBindingStore ?? connectorService.bindingStore;
+    if (store && typeof store.list === 'function') {
+      return store
+        .list(projectId)
+        .filter((b) => b.status === 'active')
+        .map(boundView)
+        .filter(Boolean);
+    }
+    return [];
+  }
+
+  /**
+   * GET /settings/connectors — the catalog (grouped by the client) + the bound
+   * state (Req 13.1/13.4). Connectors are managed per-account in the Web UI, so
+   * this gates on AUTHN ONLY. The bound state is per-project; the client's
+   * connectors screen is account-level, so the bound list is scoped to an
+   * OPTIONAL `projectId` query param when supplied (else []). NEVER returns a
+   * secret value.
+   */
+  async function handleGetConnectors(req, res) {
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+    const url = new URL(req.url, 'http://localhost');
+    const projectId = url.searchParams.get('projectId');
+    const bound = projectId ? boundConnectorsView(projectId) : [];
+    return sendJson(res, 200, { catalog: connectorCatalogView(), bound });
+  }
+
+  /**
+   * POST /settings/connectors { service, secrets:{NAME:value}, projectId? } —
+   * configure a connector (Req 13.2/13.3/13.4). Per-account authn. The submitted
+   * `secrets` map is passed to the ConnectorService via a PER-CALL capture seam
+   * and is NEVER included in the response body — only the safe, name-only bound
+   * view is returned (Req 13.3, Property 30). The secret local goes out of scope
+   * with the handler; it is never stored on the server object or logged.
+   *
+   * The ConnectorService persists the credential VALUE out-of-tree (SecretStore)
+   * and the binding (NAMEs only); this route surfaces ONLY { service, category,
+   * status, secretRefs }.
+   */
+  async function handleConfigureConnector(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const rate = settingsRateGate(result.account, 'settings.connector');
+    if (rate) return sendJson(res, rate.status, rate.body);
+
+    const service = typeof body?.service === 'string' ? body.service : '';
+    if (!service) return sendJson(res, 400, { error: "a 'service' field is required", code: 'invalid_service' });
+    // The bound state is per-project; the connectors screen defaults to the
+    // authenticated account id as the project scope when no projectId is given,
+    // matching the client contract (which posts only { service, secrets }).
+    const projectId = typeof body?.projectId === 'string' && body.projectId !== '' ? body.projectId : result.account.id;
+    const secrets = body?.secrets && typeof body.secrets === 'object' && !Array.isArray(body.secrets) ? body.secrets : {};
+
+    // The PER-CALL capture seam: it hands the ConnectorService the submitted
+    // credential map for the declared env NAMEs. This is the ONLY place the
+    // secret value is used; addConnector persists it via the SecretStore and it
+    // is never echoed. A missing NAME simply yields a CAPTURE_FAILED from the
+    // service (which validates the captured map against the catalog envNames).
+    const capture = ({ envNames }) => {
+      const credentials = {};
+      for (const name of Array.isArray(envNames) ? envNames : []) {
+        const v = secrets[name];
+        if (typeof v === 'string') credentials[name] = v;
+      }
+      return { ok: true, credentials };
+    };
+
+    let outcome;
+    try {
+      outcome = await connectorService.addConnector({ projectId, service, capture });
+    } catch {
+      // An unexpected throw is a generic 500 with NO internal detail/stack.
+      return sendJson(res, 500, { error: 'connector configuration failed', code: 'internal_error' });
+    }
+
+    if (!outcome || outcome.ok !== true) {
+      // A handled service failure (unknown connector, capture failed, store
+      // failed) is a structured 400 { error, code } — never the secret, never a
+      // raw internal error.
+      return sendJson(res, 400, {
+        error: outcome?.message ?? 'connector could not be configured',
+        code: outcome?.code ?? 'connector_failed',
+      });
+    }
+
+    // SUCCESS — respond with ONLY the safe, name-only bound view (Req 13.3). The
+    // binding the service returns carries secretRefs (NAMEs), never a value.
+    const bound = boundView(outcome.binding) ?? {
+      service,
+      category: outcome.connector?.category ?? null,
+      status: 'active',
+      secretRefs: Array.isArray(outcome.secretRefs) ? [...outcome.secretRefs] : [],
+    };
+    return sendJson(res, 200, { bound });
+  }
+
+  // -------- GET/POST /settings/skills (per-account, Req 14.1/14.2) --------
+
+  /** The safe { name, description } view of a Skill record. */
+  function skillView(s) {
+    if (!s || typeof s !== 'object') return null;
+    const name = typeof s.invocationName === 'string' ? s.invocationName : typeof s.name === 'string' ? s.name : null;
+    if (!name) return null;
+    return { name, description: typeof s.description === 'string' ? s.description : '' };
+  }
+
+  /**
+   * GET /settings/skills — the Stocked_Skills + the account's User_Skills
+   * (Req 14.1). Skills are per-User_Account, so this gates on AUTHN ONLY. Only
+   * the safe { name, description } listing surface crosses the wire (no body).
+   */
+  async function handleGetSkills(req, res) {
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+    const stocked = (
+      typeof skillLibrary.stockedSkills === 'function' ? skillLibrary.stockedSkills() : []
+    )
+      .map(skillView)
+      .filter(Boolean);
+    const user = (
+      typeof skillLibrary.readUserSkills === 'function' ? skillLibrary.readUserSkills(result.account.id) : []
+    )
+      .map(skillView)
+      .filter(Boolean);
+    return sendJson(res, 200, { stocked, user });
+  }
+
+  /**
+   * POST /settings/skills { name, description, body, import? } — add or import a
+   * User_Skill (Req 14.2). Per-account authn; the account id is the skill owner.
+   * On success responds { skill: { name, description } }. A naming collision /
+   * validation rejection from the library is a structured 400 { error, code }.
+   */
+  async function handleAddSkill(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const rate = settingsRateGate(result.account, 'settings.skill');
+    if (rate) return sendJson(res, rate.status, rate.body);
+
+    const ownerId = result.account.id;
+    const name = typeof body?.name === 'string' ? body.name : '';
+    const description = typeof body?.description === 'string' ? body.description : '';
+    const skillBody = typeof body?.body === 'string' ? body.body : '';
+
+    let outcome;
+    try {
+      outcome =
+        body?.import === true && typeof skillLibrary.importSkill === 'function'
+          ? skillLibrary.importSkill({ ownerId, name, description, body: skillBody })
+          : skillLibrary.createUserSkill({ ownerId, name, description, body: skillBody });
+    } catch {
+      return sendJson(res, 500, { error: 'skill could not be added', code: 'internal_error' });
+    }
+
+    if (!outcome || outcome.ok !== true) {
+      return sendJson(res, 400, {
+        error: outcome?.message ?? 'skill could not be added',
+        code: outcome?.code ?? 'skill_rejected',
+      });
+    }
+    return sendJson(res, 200, { skill: skillView(outcome.skill) ?? { name, description } });
+  }
+
+  // -------- GET/POST /settings/memory (per-account, Req 14.3-14.5) --------
+
+  /** The safe { id, kind, text } view of a Memory_Entry. */
+  function memoryEntryView(e) {
+    if (!e || typeof e !== 'object' || typeof e.id !== 'string') return null;
+    return {
+      id: e.id,
+      kind: typeof e.kind === 'string' ? e.kind : '',
+      text: typeof e.text === 'string' ? e.text : '',
+    };
+  }
+
+  /** The global memory handle for an account (out-of-tree, per-owner). */
+  function globalHandle(accountId) {
+    return memoryStore.globalStore(accountId);
+  }
+
+  /**
+   * The current memory view { project, global, mode } (Req 14.3). Global memory
+   * is per-account; Project_Memory needs a projectId (the client screen is
+   * account-level and does not send one), so `project` is populated only when a
+   * projectId is supplied and []-empty otherwise. `mode` is the global scope's
+   * Memory_Mode. Entries are the user's OWN content (not secrets), so they ARE
+   * shown.
+   */
+  function memoryView(accountId, projectId) {
+    const global = globalHandle(accountId);
+    const project = [];
+    if (projectId) {
+      const ph = memoryStore.projectStore(projectId);
+      for (const e of ph.list()) {
+        const v = memoryEntryView(e);
+        if (v) project.push(v);
+      }
+    }
+    const globalEntries = [];
+    for (const e of global.list()) {
+      const v = memoryEntryView(e);
+      if (v) globalEntries.push(v);
+    }
+    return { project, global: globalEntries, mode: global.getMode() };
+  }
+
+  /**
+   * GET /settings/memory — Project_Memory + Global_Memory + Memory_Mode
+   * (Req 14.3). Memory is managed per-account in the Web UI, so this gates on
+   * AUTHN ONLY. An OPTIONAL `projectId` query param scopes Project_Memory (else
+   * []).
+   */
+  async function handleGetMemory(req, res) {
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+    const url = new URL(req.url, 'http://localhost');
+    const projectId = url.searchParams.get('projectId') ?? undefined;
+    return sendJson(res, 200, memoryView(result.account.id, projectId || undefined));
+  }
+
+  /**
+   * POST /settings/memory { op:'edit'|'prune'|'mode', ... } — edit/prune a
+   * Memory_Entry or set the Memory_Mode (Req 14.4/14.5). Per-account authn. The
+   * `scope` selects the project (requires projectId) or global handle. Responds
+   * 200 with the updated { project, global, mode } view; an invalid mode / entry
+   * is a structured 400 { error, code }.
+   */
+  async function handleUpdateMemory(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    const result = await gate(req, null);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const rate = settingsRateGate(result.account, 'settings.memory');
+    if (rate) return sendJson(res, rate.status, rate.body);
+
+    const accountId = result.account.id;
+    const op = typeof body?.op === 'string' ? body.op : '';
+    const scope = body?.scope === 'project' ? 'project' : 'global';
+    const projectId = typeof body?.projectId === 'string' && body.projectId !== '' ? body.projectId : undefined;
+
+    // Resolve the target handle. A project-scoped op requires a projectId.
+    let handle;
+    if (scope === 'project') {
+      if (!projectId) {
+        return sendJson(res, 400, { error: "a 'projectId' is required for a project-scoped memory op", code: 'missing_project' });
+      }
+      handle = memoryStore.projectStore(projectId);
+    } else {
+      handle = globalHandle(accountId);
+    }
+
+    let outcome;
+    try {
+      if (op === 'mode') {
+        const mode = typeof body?.mode === 'string' ? body.mode : '';
+        outcome = handle.setMode(mode);
+      } else if (op === 'edit') {
+        const id = typeof body?.id === 'string' ? body.id : '';
+        outcome = handle.edit(id, { text: body?.text, kind: body?.kind });
+      } else if (op === 'prune') {
+        const id = typeof body?.id === 'string' ? body.id : '';
+        outcome = handle.delete(id);
+      } else {
+        return sendJson(res, 400, { error: "an 'op' of 'edit', 'prune', or 'mode' is required", code: 'unsupported_op' });
+      }
+    } catch {
+      return sendJson(res, 500, { error: 'memory change could not be applied', code: 'internal_error' });
+    }
+
+    if (!outcome || outcome.ok !== true) {
+      return sendJson(res, 400, {
+        error: outcome?.message ?? 'memory change could not be applied',
+        code: outcome?.code ?? 'memory_rejected',
+      });
+    }
+    // Return the updated view so the client re-renders (Req 14.3-14.5).
+    return sendJson(res, 200, memoryView(accountId, projectId));
+  }
+
+  // -------- POST /settings/build + /settings/deploy (per-project, Req 15.1/15.2)
+
+  /**
+   * POST /settings/build { projectId } — run a build and surface its outcome
+   * (Req 15.1). PER-PROJECT: full auth incl. projectId via gate(req, projectId)
+   * — identical non-disclosing 401 on denial. The build itself is owned by the
+   * injected projectLifecycle service (which routes any command through the
+   * existing CommandGuard); this route only surfaces the structured outcome. The
+   * quota gate (429 naming the limit) applies when a quotaManager is injected.
+   */
+  async function handleBuild(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    const projectId = typeof body?.projectId === 'string' ? body.projectId : '';
+    if (!projectId) return sendJson(res, 400, { error: "a 'projectId' field is required" });
+
+    const result = await gate(req, projectId);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const rate = settingsRateGate(result.account, 'settings.build');
+    if (rate) return sendJson(res, rate.status, rate.body);
+
+    if (typeof projectLifecycle.build !== 'function') {
+      return sendJson(res, 405, { error: 'build is not available', code: 'unsupported' });
+    }
+    let outcome;
+    try {
+      outcome = await projectLifecycle.build({ projectId, accountId: result.account.id });
+    } catch {
+      return sendJson(res, 500, { error: 'build failed', code: 'internal_error' });
+    }
+    return sendJson(res, 200, safeOutcome(outcome));
+  }
+
+  /**
+   * POST /settings/deploy { projectId, service? } — deploy and surface the
+   * outcome (Req 15.2). PER-PROJECT full auth. Delegates to the injected
+   * projectLifecycle.deploy; surfaces only the structured outcome. Quota-gated
+   * when a quotaManager is injected.
+   */
+  async function handleDeploy(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    const projectId = typeof body?.projectId === 'string' ? body.projectId : '';
+    if (!projectId) return sendJson(res, 400, { error: "a 'projectId' field is required" });
+
+    const result = await gate(req, projectId);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    const rate = settingsRateGate(result.account, 'settings.deploy');
+    if (rate) return sendJson(res, rate.status, rate.body);
+
+    if (typeof projectLifecycle.deploy !== 'function') {
+      return sendJson(res, 405, { error: 'deploy is not available', code: 'unsupported' });
+    }
+    const service = typeof body?.service === 'string' && body.service !== '' ? body.service : undefined;
+    let outcome;
+    try {
+      outcome = await projectLifecycle.deploy({ projectId, accountId: result.account.id, ...(service ? { service } : {}) });
+    } catch {
+      return sendJson(res, 500, { error: 'deploy failed', code: 'internal_error' });
+    }
+    return sendJson(res, 200, safeOutcome(outcome));
+  }
+
+  /**
+   * Reduce a lifecycle outcome to the SAFE subset the client renders: outcome,
+   * summary?, url?. Never forwards a raw internal object/stack. Accepts either a
+   * structured { outcome, summary, url } or a guard-style { ok, outcome }.
+   */
+  function safeOutcome(outcome) {
+    const o = outcome && typeof outcome === 'object' ? outcome : {};
+    const view = {
+      outcome:
+        typeof o.outcome === 'string'
+          ? o.outcome
+          : o.ok === true
+            ? 'succeeded'
+            : o.ok === false
+              ? 'failed'
+              : 'unknown',
+    };
+    if (typeof o.summary === 'string') view.summary = o.summary;
+    if (typeof o.url === 'string') view.url = o.url;
+    return view;
+  }
+
+  // -------- GET /settings/export (per-project, Req 15.3) --------
+
+  /**
+   * GET /settings/export?projectId=… — produce the Project_Export package and
+   * return it as a DOWNLOADABLE file (Req 15.3). PER-PROJECT full auth. The
+   * ProjectExport service yields a { files, envTemplate, ... } package (no zip
+   * buffer); we serialize it into ONE self-describing JSON package and respond
+   * with a download Content-Type + Content-Disposition, which the client reads
+   * as a blob. A Buffer file entry is base64-encoded (marked) so the JSON stays
+   * valid and lossless. Credential VALUES never enter the package (the export is
+   * credential-stripped by construction).
+   */
+  async function handleExport(req, res) {
+    const url = new URL(req.url, 'http://localhost');
+    const projectId = url.searchParams.get('projectId');
+    if (!projectId) return sendJson(res, 400, { error: "a 'projectId' query parameter is required" });
+
+    const result = await gate(req, projectId);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    let outcome;
+    try {
+      outcome = projectExporter.export(projectId);
+    } catch {
+      return sendJson(res, 500, { error: 'export failed', code: 'internal_error' });
+    }
+    if (!outcome || outcome.ok !== true) {
+      return sendJson(res, 400, {
+        error: outcome?.message ?? 'export failed',
+        code: outcome?.code ?? 'export_failed',
+      });
+    }
+
+    // Build a lossless JSON package: text files verbatim, binary files base64.
+    const files = {};
+    for (const [rel, contents] of Object.entries(outcome.files ?? {})) {
+      if (Buffer.isBuffer(contents)) {
+        files[rel] = { encoding: 'base64', data: contents.toString('base64') };
+      } else {
+        files[rel] = { encoding: 'utf8', data: String(contents) };
+      }
+    }
+    const pkg = {
+      projectId,
+      files,
+      envTemplate: typeof outcome.envTemplate === 'string' ? outcome.envTemplate : '',
+      envNames: Array.isArray(outcome.envNames) ? outcome.envNames : [],
+    };
+    const bodyText = JSON.stringify(pkg);
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'content-disposition': `attachment; filename="${projectId}-export.json"`,
+      'cache-control': 'no-store',
+    });
+    res.end(bodyText);
+  }
+
+  // -------- GET /settings/lockin-audit (per-project, Req 15.4) --------
+
+  /**
+   * GET /settings/lockin-audit?projectId=… — scan the Project for lock-in
+   * signals and report them (Req 15.4). PER-PROJECT full auth. Surfaces ONLY the
+   * client's { findings, clean } shape; a failed audit (read/timeout/file-count)
+   * is a structured 400 { error, code }.
+   */
+  async function handleLockinAudit(req, res) {
+    const url = new URL(req.url, 'http://localhost');
+    const projectId = url.searchParams.get('projectId');
+    if (!projectId) return sendJson(res, 400, { error: "a 'projectId' query parameter is required" });
+
+    const result = await gate(req, projectId);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    let outcome;
+    try {
+      outcome = lockinAudit.audit(projectId);
+    } catch {
+      return sendJson(res, 500, { error: 'lock-in audit failed', code: 'internal_error' });
+    }
+    if (!outcome || outcome.ok !== true) {
+      return sendJson(res, 400, {
+        error: outcome?.message ?? 'lock-in audit failed',
+        code: outcome?.code ?? 'audit_failed',
+      });
+    }
+    const findings = Array.isArray(outcome.findings) ? outcome.findings : [];
+    return sendJson(res, 200, { findings, clean: findings.length === 0 });
+  }
+
+  // -------- POST /settings/share (per-project, Req 15.5) --------
+
+  /**
+   * POST /settings/share { projectId } — mint a read-only Share_Link and return
+   * its copyable URL (Req 15.5). PER-PROJECT full auth. The ShareLinkService
+   * returns { link:{ token, ... } }; a link URL is built from the token (using
+   * shareLinkBaseUrl when injected, else a relative /share/<token> path) and
+   * returned as { url } — the RAW token is not surfaced beyond the URL. A
+   * service denial collapses to the non-disclosing 401 (mirroring the service's
+   * own deny-disclose-nothing posture) so a share attempt on a project the
+   * account cannot access reveals nothing.
+   */
+  async function handleShare(req, res) {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+    const projectId = typeof body?.projectId === 'string' ? body.projectId : '';
+    if (!projectId) return sendJson(res, 400, { error: "a 'projectId' field is required" });
+
+    const result = await gate(req, projectId);
+    if (result.denied) return sendJson(res, 401, ACCESS_DENIED);
+
+    let outcome;
+    try {
+      outcome = shareLinkService.share({ id: result.account.id }, projectId);
+    } catch {
+      return sendJson(res, 500, { error: 'share failed', code: 'internal_error' });
+    }
+    if (!outcome || outcome.ok !== true) {
+      // The service already denies-discloses-nothing; surface the same generic
+      // 401 so a share attempt reveals nothing about the project.
+      return sendJson(res, 401, ACCESS_DENIED);
+    }
+    const link = outcome.link ?? {};
+    const token = typeof link.token === 'string' ? link.token : '';
+    const url =
+      typeof link.url === 'string' && link.url !== ''
+        ? link.url
+        : typeof shareLinkBaseUrl === 'string' && shareLinkBaseUrl !== ''
+          ? `${shareLinkBaseUrl.replace(/\/+$/, '')}/${encodeURIComponent(token)}`
+          : `/share/${encodeURIComponent(token)}`;
+    return sendJson(res, 200, { url });
   }
 
   // -------- Work_Mode surface (spec Task 32, Req 28) — a core Session capability
