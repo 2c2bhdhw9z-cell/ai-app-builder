@@ -76,6 +76,17 @@ import { createSnapshotStore } from '../persistence/snapshot-store.js';
 import { createPersistenceStore } from '../persistence/persistence-store.js';
 import { createThemeStore } from '../presentation/theme-store.js';
 import { createWorkspaceExperienceStore } from '../presentation/workspace-experience-store.js';
+import { createProviderResolver } from './provider-resolver.js';
+import {
+  createConnectorService,
+  createConnectorBindingStore,
+  createConnectorsSteeringWriter,
+  defaultConnectorCatalog,
+} from '../connectors/index.js';
+import { createSkillLibrary } from '../skills/library.js';
+import { createMemoryStore } from '../memory/store.js';
+import { createProjectExport, createLockinAudit } from '../portability/index.js';
+import { createAuthorizer, createShareLinkStore, createShareLinkService } from '../auth/index.js';
 
 /**
  * Where the platform keeps its export trees + control plane, when AAB_DATA_DIR is
@@ -258,6 +269,24 @@ export function platformSecretSet(env = process.env) {
 export function resolveDataDir(env = process.env) {
   const raw = (env.AAB_DATA_DIR ?? '').trim();
   return raw !== '' ? path.resolve(raw) : DEFAULT_DATA_DIR;
+}
+
+/**
+ * The public base URL a minted Share_Link is rendered against (Req 15.5). When
+ * set, POST /settings/share returns an ABSOLUTE `${base}/<token>` URL a user can
+ * copy and open from outside the deploy; when unset the builder-server falls
+ * back to a relative `/share/<token>` path (its documented default), so this is
+ * genuinely optional. Read from AAB_SHARE_BASE_URL, else the platform's public
+ * base URL (PUBLIC_BASE_URL) when the operator has set one. A blank value is
+ * treated as unset (returns undefined) so nothing is threaded and the relative
+ * fallback applies.
+ *
+ * @param {Record<string,string|undefined>} [env=process.env]
+ * @returns {string|undefined}
+ */
+export function resolveShareLinkBaseUrl(env = process.env) {
+  const raw = (env.AAB_SHARE_BASE_URL ?? env.PUBLIC_BASE_URL ?? '').trim();
+  return raw !== '' ? raw.replace(/\/+$/, '') : undefined;
 }
 
 /** Parse a positive-integer env override, or undefined when unset/invalid. */
@@ -455,6 +484,10 @@ export function composeProjectRuntime({
     createSecretStore({ layout, ownerId, ...composed.secretStoreOptions() }),
   );
   const persistenceStores = perOwner((ownerId) => createPersistenceStore({ layout, ownerId }));
+  // Per-account ConnectorBindingStore instances (owner-pinned paths), backing
+  // both the ConnectorService per account and the bound-connector listing on
+  // GET /settings/connectors. See the WEB UI SETTINGS SURFACES section below.
+  const connectorBindingStores = perOwner((ownerId) => createConnectorBindingStore({ layout, ownerId }));
   // The owner's SnapshotStore is paired with THAT owner's PersistenceStore, so
   // resume() can fall back to the most recent persisted tree for a project that
   // has no snapshot yet (Req 19.6) instead of finding nothing.
@@ -882,6 +915,208 @@ export function composeProjectRuntime({
   const themeStore = createThemeStore({ layout });
   const workspaceExperienceStore = createWorkspaceExperienceStore({ layout });
 
+  // ==========================================================================
+  // WEB UI SETTINGS SURFACES (Req 12-15). The /settings/* routes already exist
+  // on createBuilderServer, each gated behind an injected backing service, but
+  // the production composition never constructed one — so in a real deploy every
+  // /settings/* route fell through to 405 (unreachable), exactly like POST
+  // /projects did before the runtime was wired. This section is that missing
+  // production wiring for the settings surfaces, and nothing more. Each service
+  // is composed through its EXISTING seams, matching how the settings tests
+  // construct them with real collaborators.
+  //
+  // TWO SHAPES, chosen per service by reading its constructor — never guessed:
+  //
+  //   - PER-ACCOUNT, STATELESS-BY-LAYOUT: SkillLibrary and MemoryStore take the
+  //     owning account as a METHOD argument (readUserSkills(ownerId),
+  //     createUserSkill({ ownerId }), globalStore(accountId), projectStore(...))
+  //     and derive every on-disk path from the layout at call time. They pin no
+  //     owner at construction, so ONE instance serves every account — composed
+  //     exactly like themeStore / workspaceExperienceStore above.
+  //
+  //   - PER-ACCOUNT, OWNER-PINNED: ConnectorService + ConnectorBindingStore pin
+  //     an ownerId AT CONSTRUCTION (their secret/binding paths are
+  //     controlConnectorBindingPath(ownerId, projectId), like the SecretStore).
+  //     A single instance pinned to a placeholder owner would collapse every
+  //     account's connector credentials + bindings into ONE owner directory —
+  //     the same per-owner isolation trap the SecretStore facade above avoids.
+  //     So these are a per-account INSTANCE CACHE behind the exact object shape
+  //     the route expects (connectorService.addConnector / .catalog;
+  //     connectorBindingStore.list), each call resolving its account.
+  //
+  //   - PER-PROJECT: ProjectExport + LockinAudit read a project's exportable
+  //     tree keyed by projectId ALONE (layout.exportableProjectTree(projectId));
+  //     no owner is in the path, so ONE instance over the layout is correct.
+  //     ShareLinkService needs a per-owner store (controlShareLinkPath keys on
+  //     ownerId), so it is dispatched per-owner like the owner-pinned group.
+  //
+  // The ACCOUNT the settings routes operate on is the authenticated account. The
+  // per-account routes pass the authenticated account id AS the projectId when
+  // the client sends none (the connectors/memory screens are account-level), and
+  // otherwise a real projectId. So a per-account facade resolves the owning
+  // account from its argument: a REGISTERED projectId -> its owner via ownerOf;
+  // anything else -> the argument IS the account id (the route's own default).
+  // This never widens access — the route has already authn/authz-gated the
+  // request; the facade only selects which per-owner instance to write through.
+
+  /**
+   * Resolve the owning ACCOUNT for a per-account settings call whose argument is
+   * "a projectId or, when the client sent none, the account id itself" (the
+   * builder-server's own contract for the per-account routes). A registered
+   * project resolves to its real owner; any other value is treated as the
+   * account id it already is. Returns null only for a blank/absent argument.
+   */
+  function accountOf(projectIdOrAccountId) {
+    if (typeof projectIdOrAccountId !== 'string' || projectIdOrAccountId === '') return null;
+    return ownerOf(projectIdOrAccountId) ?? projectIdOrAccountId;
+  }
+
+  // ---- providerResolver: PROCESS-WIDE (Req 12) -----------------------------
+  // Not per-owner: it selects the BUILDER's own model provider/model for this
+  // deployment, a single process-wide choice. Composed exactly as the settings
+  // test does — over plumby's canonical PROVIDERS / describeProviders seams
+  // through the engine boundary (provider-resolver.js already imports them), so
+  // GET /settings/provider reflects the SAME provider set + env-order default
+  // this deployment's default agent path uses (start.js resolveProvider(env)).
+  const providerResolver = createProviderResolver({ env, now });
+
+  // ---- connectors: PER-ACCOUNT, OWNER-PINNED (Req 13) ----------------------
+  // The steering writer is layout-stateless (like themeStore), shared across
+  // owners. The SecretStore + BindingStore pin an owner, so build one
+  // ConnectorService per account, cached, each over that account's own stores.
+  const connectorSteeringWriter = createConnectorsSteeringWriter({ layout });
+  const connectorServices = perOwner((ownerId) =>
+    createConnectorService({
+      secretStore: secretStores.forOwner(ownerId),
+      bindingStore: connectorBindingStores.forOwner(ownerId),
+      steeringWriter: connectorSteeringWriter,
+      catalog: defaultConnectorCatalog,
+      // The capture seam is supplied PER-CALL by the /settings/connectors route
+      // from the POST body; the service-level default is never reached, but the
+      // constructor requires a function, so provide an honest no-op that reports
+      // a structured failure if it ever were called without a per-call override.
+      capture: () => ({ ok: false, reason: 'failed' }),
+      // deployTo (Req 10.8) routes through the SAME wired CommandGuard the rest
+      // of the runtime uses, so a hosting-deploy connector is gated identically.
+      commandGuard,
+      now,
+    }),
+  );
+
+  /**
+   * The single `connectorService` object the /settings/connectors route expects
+   * (it calls addConnector({ projectId, ... }) and reads `.catalog`). Each call
+   * resolves its account from the projectId-or-accountId argument and delegates
+   * to that account's cached ConnectorService — so a connector credential lands
+   * in the requesting account's own owner directory, never a shared placeholder.
+   * The catalog is owner-independent, exposed directly.
+   */
+  const connectorService = Object.freeze({
+    catalog: defaultConnectorCatalog,
+    addConnector(params = {}) {
+      const accountId = accountOf(params?.projectId);
+      if (accountId === null) {
+        return Object.freeze({
+          ok: false,
+          code: 'invalid_project',
+          message: 'a projectId (or account scope) is required to select the owning account',
+        });
+      }
+      return connectorServices.forOwner(accountId).addConnector(params);
+    },
+    removeConnector(params = {}) {
+      const accountId = accountOf(params?.projectId);
+      if (accountId === null) {
+        return Object.freeze({ ok: false, code: 'invalid_project', message: 'a projectId is required' });
+      }
+      return connectorServices.forOwner(accountId).removeConnector(params);
+    },
+  });
+
+  /**
+   * The `connectorBindingStore` the route uses ONLY to surface the bound-connector
+   * list on GET /settings/connectors (name-only). Same per-account dispatch: it
+   * lists the requesting account's own bindings. An absent/blank argument yields
+   * an empty list (the route already treats a no-projectId GET as []).
+   */
+  const connectorBindingStore = Object.freeze({
+    list(projectIdOrAccountId) {
+      const accountId = accountOf(projectIdOrAccountId);
+      if (accountId === null) return Object.freeze([]);
+      return connectorBindingStores.forOwner(accountId).list(projectIdOrAccountId);
+    },
+  });
+
+  // ---- skills + memory: PER-ACCOUNT, STATELESS-BY-LAYOUT (Req 14) ----------
+  // Both take the owning account as a method argument and derive their paths
+  // from the layout, pinning no owner at construction — so ONE instance each,
+  // exactly like themeStore. The cap/env behaviour of the MemoryStore reads the
+  // same env this composition is given.
+  const skillLibrary = createSkillLibrary({ layout });
+  const memoryStore = createMemoryStore({ layout, env });
+
+  // ---- export + lockin-audit: PER-PROJECT over the layout (Req 15.3/15.4) --
+  // Both read a project's exportable tree keyed by projectId alone (no owner in
+  // the path), so ONE instance over the layout serves every project. The export
+  // is passed the connector catalog so its env-var template names the connector
+  // credential NAMEs too (names only, never values). The default readTree walks
+  // the on-disk exportable tree with the PersistenceStore text/binary contract —
+  // the SAME tree the runtime already persists/restores.
+  const projectExporter = createProjectExport({
+    layout,
+    now,
+    connectorCatalog: defaultConnectorCatalog,
+  });
+  const lockinAudit = createLockinAudit({ layout, now });
+
+  // ---- share links: PER-OWNER dispatch (Req 15.5) --------------------------
+  // The ShareLinkStore pins an owner (controlShareLinkPath keys on ownerId), so
+  // a link is stored under the PROJECT's owner. The ShareLinkService is composed
+  // per-owner over that owner's store, reusing the runtime's REAL authorizer and
+  // projectResolver (share() authorizes the requester against the resolved
+  // project through the same authorizer the rest of auth uses). The route calls
+  // only share(requester, projectId); the facade resolves the project's owner
+  // and delegates to that owner's service, so a link is persisted in the owning
+  // account's own directory. A projectId that resolves to no owner is handled by
+  // the service itself: it is composed for the requesting account and share()
+  // then denies-discloses-nothing when projectResolver returns null.
+  const shareAuthorizer = createAuthorizer();
+  const shareLinkServices = perOwner((ownerId) =>
+    createShareLinkService({
+      store: createShareLinkStore({ layout, ownerId }),
+      authorizer: shareAuthorizer,
+      projectResolver,
+      now,
+      auditSink: composed.auditLog,
+    }),
+  );
+  const shareLinkService = Object.freeze({
+    share(requester, projectId) {
+      // Store the link under the PROJECT's owner when it is registered; otherwise
+      // fall back to the requester's own account so the service can still run its
+      // deny-disclose-nothing path (projectResolver(null) -> generic deny) rather
+      // than throwing. Either way the service re-authorizes the requester.
+      const ownerId = ownerOf(projectId) ?? (requester && requester.id);
+      if (typeof ownerId !== 'string' || ownerId === '') {
+        return { ok: false, code: 'denied', message: 'access denied' };
+      }
+      return shareLinkServices.forOwner(ownerId).share(requester, projectId);
+    },
+  });
+  const shareLinkBaseUrl = resolveShareLinkBaseUrl(env);
+
+  // ---- build / deploy: DELIBERATELY UNWIRED (Req 15.1/15.2) ----------------
+  // There is NO real build/deploy engine in this repo — no module composes a
+  // Deployment_Artifact or performs a deploy. Wiring a fake `projectLifecycle`
+  // that pretended to build/deploy would be a dishonest success (and an exit-tax
+  // hazard the anti-lock-in policy forbids). So `projectLifecycle` is left
+  // UNINJECTED: POST /settings/build and /settings/deploy honestly stay 405 in
+  // the live boot, truthfully reflecting that the engine does not exist yet,
+  // instead of returning a fabricated { outcome:'succeeded' }. When a real
+  // ProjectLifecycle exists it composes here and the routes light up with no
+  // change to createBuilderServer. This is the same honesty the DevServer seam
+  // keeps (inert unless a real preview backend is configured).
+
   /**
    * The bundle to spread into createBuilderServer:
    *   createBuilderServer({ authService, provider, ...runtime.serverOptions() })
@@ -902,6 +1137,20 @@ export function composeProjectRuntime({
       previewController,
       themeStore,
       workspaceExperienceStore,
+      // Web UI settings surfaces (Req 12-15). Spread straight into
+      // createBuilderServer by start.js with no change required there. Each
+      // option name matches the createBuilderServer contract exactly. Note the
+      // DELIBERATE absence of `projectLifecycle` (build/deploy) — see the wiring
+      // section above for why it stays unwired (405) in an honest deploy.
+      providerResolver,
+      connectorService,
+      connectorBindingStore,
+      skillLibrary,
+      memoryStore,
+      projectExporter,
+      lockinAudit,
+      shareLinkService,
+      ...(shareLinkBaseUrl !== undefined ? { shareLinkBaseUrl } : {}),
     };
   }
 
@@ -922,6 +1171,18 @@ export function composeProjectRuntime({
     projectManager,
     themeStore,
     workspaceExperienceStore,
+    // Web UI settings surfaces (Req 12-15), exposed so a deployment / the wiring
+    // tests can observe WHAT was composed (and that build/deploy is deliberately
+    // absent) rather than inferring it from a route probe.
+    providerResolver,
+    connectorService,
+    connectorBindingStore,
+    skillLibrary,
+    memoryStore,
+    projectExporter,
+    lockinAudit,
+    shareLinkService,
+    shareLinkBaseUrl,
     serverOptions,
     egressMode: egress.mode,
     /**
