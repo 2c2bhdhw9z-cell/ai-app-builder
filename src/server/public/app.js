@@ -31,6 +31,7 @@ import { createSseClient } from './sse.js';
 import { createPreviewController } from './preview.js';
 import { createPreviewPoll } from './preview-poll.js';
 import { createConfirmController } from './confirm.js';
+import { createProjectsController } from './projects.js';
 import { createPromptView } from './views/prompt.js';
 import {
   createActivityStreamView,
@@ -38,6 +39,7 @@ import {
 } from './views/activity-stream.js';
 import { createPreviewPaneView } from './views/preview-pane.js';
 import { createConfirmView } from './views/confirm.js';
+import { createProjectsView } from './views/projects.js';
 
 /** The DOM node the client mounts into (declared in index.html). */
 const ROOT_ID = 'app';
@@ -110,7 +112,23 @@ export function createClient(deps = {}) {
       tokenStore,
       ...(deps.navigate ? { navigate: deps.navigate } : {}),
     });
-  return { store, api, builder, sse, preview, previewPoll, confirm, tokenStore, auth };
+  const client = { store, api, builder, sse, preview, previewPoll, confirm, tokenStore, auth };
+  // The project-creation controller (Task 9.1) turns a chosen Target_Category +
+  // Project_Origin (+ any origin-specific reference) into a POST /projects
+  // carrying the Bearer (Req 7.2), and on a 201 opens the core builder screen
+  // for the new Project_Session (Req 7.3). Its `openSession` seam is a closure
+  // over the SAME client + the real openSession() below, so a created project
+  // resets the activity slice, opens the SSE stream, and starts the preview poll
+  // with no rewire. It shares the SAME store + gated api client so the Bearer
+  // flows and the notice slice the form view reads is the same one.
+  client.projects =
+    deps.projects ??
+    createProjectsController({
+      store,
+      api,
+      openSession: (projectId) => openSession(client, projectId),
+    });
+  return client;
 }
 
 /**
@@ -218,6 +236,48 @@ export function createInitialView(doc, client) {
     });
     main.append(confirm.el);
     views.push(confirm);
+  }
+
+  // Mount the project-creation form view (Task 9.1). It is shown ONLY when the
+  // user is logged in (a Bearer_Token is held) AND no Project_Session is open —
+  // i.e. the workspace-shell entry point between login and the builder screen.
+  // On a 201 the controller opens the core builder screen (openSession), which
+  // sets session.projectId and thereby hides this form. The form's visibility is
+  // driven by a subscription to the auth + session slices so it appears/hides
+  // reactively without any imperative navigation here.
+  if (client && client.store && client.projects) {
+    const projects = createProjectsView({
+      doc,
+      store: client.store,
+      controller: client.projects,
+    });
+    const gate = doc.createElement('div');
+    gate.className = 'projects-gate';
+    gate.append(projects.el);
+    main.append(gate);
+
+    function applyGate() {
+      const state = client.store.getState();
+      const loggedIn = !!(state.auth && state.auth.hasToken);
+      const sessionOpen = !!(state.session && state.session.projectId);
+      // Shown iff logged in AND no session open.
+      gate.hidden = !(loggedIn && !sessionOpen);
+    }
+    // Re-evaluate on any auth or session change. Two subscriptions (one per
+    // slice) keep the gate correct whether the token or the session changes.
+    const unsubAuth = client.store.subscribe((s) => s.auth, applyGate);
+    const unsubSession = client.store.subscribe((s) => s.session, applyGate);
+    applyGate();
+
+    views.push({
+      el: gate,
+      destroy() {
+        unsubAuth();
+        unsubSession();
+        projects.destroy();
+        gate.remove();
+      },
+    });
   }
 
   return { el: main, views };

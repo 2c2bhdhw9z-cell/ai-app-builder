@@ -121,6 +121,8 @@ const STATIC_ASSETS = {
   '/views/confirm.js': 'views/confirm.js', // Task 6.1
   '/token-store.js': 'token-store.js', // Task 8.1
   '/auth.js': 'auth.js', // Task 8.2
+  '/projects.js': 'projects.js', // Task 9.1
+  '/views/projects.js': 'views/projects.js', // Task 9.1
 };
 
 /** Content-Type by file extension for the served static assets. */
