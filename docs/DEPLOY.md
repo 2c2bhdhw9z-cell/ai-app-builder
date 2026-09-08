@@ -167,6 +167,28 @@ not stop the server from booting — it fails when a turn actually runs.
 | `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) / `OPENROUTER_API_KEY` | The key for the selected provider. |
 | `AAB_MODEL` | Optional. Pins the model the default agent path builds with, instead of the provider's default. |
 
+### Web UI settings surfaces
+
+The `/settings/*` routes (provider selection, connectors, skills, memory, export,
+lock-in audit, share links) are wired into the live process: each is enabled only
+when its backing service is composed, which the production composition now does.
+The one route group deliberately **not** wired is **build / deploy** — there is no
+real build/deploy engine in the repo yet, so `POST /settings/build` and
+`POST /settings/deploy` honestly stay `405` rather than returning a fabricated
+success. When a real lifecycle engine exists it composes in the same place and
+those routes light up with no other change.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AAB_SHARE_BASE_URL` | unset → **relative `/share/<token>` URL** | Public base URL a minted read-only Share_Link is rendered against. Set it to the externally reachable origin (e.g. `https://your-host.example.com`) so `POST /settings/share` returns an absolute, copyable link. A trailing slash is trimmed; a blank value is treated as unset. |
+| `PUBLIC_BASE_URL` | unset | Fallback source for the Share_Link base URL when `AAB_SHARE_BASE_URL` is not set (`AAB_SHARE_BASE_URL` wins when both are present). Use whichever you already set for your public origin. |
+
+The connectors, skills and memory settings are **per-account** — a connector
+credential or User_Skill you add is stored under **your own** account's control-plane
+directory and is never visible to another account; export, lock-in audit and share
+are **per-project** and require full authorization for the target project, denying a
+non-owner with the same non-disclosing `401` as every other project route.
+
 ## Setting up the provider
 
 ### GitHub
@@ -460,6 +482,14 @@ register exactly that URL with your identity provider.
   `docker ps --filter label=aab.sandbox` still lists the container, restart with
   `AAB_STARTUP_REAP=instance`, and confirm the boot log reports the removal and the
   list is empty.
+- **No build/deploy engine.** The `/settings/build` and `/settings/deploy` routes
+  exist and are auth-gated, but no module actually builds a Deployment_Artifact or
+  performs a deploy, so the production composition injects no `projectLifecycle` and
+  both routes stay `405` — an honest "not implemented yet" rather than a fabricated
+  success. This is the same discipline as the inert Preview default: the seam is
+  ready, the engine behind it is the remaining work. All the other `/settings/*`
+  surfaces (provider, connectors, skills, memory, export, lock-in audit, share) are
+  wired and reachable.
 - **Single instance assumed.** Accounts, sessions and the login-state key are
   in-process. Behind a load balancer, either pin sessions to one instance or set
   `OIDC_STATE_SIGNING_KEY` — and note that accounts and sessions are still

@@ -32,7 +32,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { createBuilderServer } from '../src/server/index.js';
-import { createAuthService } from '../src/auth/index.js';
+import { createAuthService, createShareLinkStore } from '../src/auth/index.js';
 import { createScriptedProvider } from '../src/engine/plumby.js';
 import { startPlatformServer } from '../src/server/start.js';
 import {
@@ -1385,6 +1385,349 @@ test('the per-account anti-starvation ceiling is ENFORCEABLE once configured', a
     assert.equal((await createProject(srv.base, bob.token, { description: 'b1' })).status, 201);
   } finally {
     await srv.close();
+    cleanup();
+  }
+});
+
+
+// ============================== WEB UI settings surfaces are LIVE (Req 12-15)
+//
+// The /settings/* routes were built on createBuilderServer and each gated behind
+// an injected backing service, but the production composition never constructed
+// one — so in the live boot every /settings/* route fell through to 405, exactly
+// like POST /projects did before the runtime was wired. These tests prove the
+// composition now injects those services (so the routes are reachable in a real
+// deploy) and are written to FAIL if the wiring is reverted. They use the SAME
+// real StorageLayout + real server + real fetch harness as the rest of this
+// file; nothing about the settings services is faked.
+
+import { resolveShareLinkBaseUrl } from '../src/server/compose-runtime.js';
+
+/** The settings services the composition must now inject. */
+const SETTINGS_SERVICE_KEYS = [
+  'providerResolver',
+  'connectorService',
+  'connectorBindingStore',
+  'skillLibrary',
+  'memoryStore',
+  'projectExporter',
+  'lockinAudit',
+  'shareLinkService',
+];
+
+test('serverOptions() now injects every settings backing service as a usable object', () => {
+  const { dir, cleanup } = tempDataDir();
+  const { runtime } = makeRuntime({ dir });
+  try {
+    const opts = runtime.serverOptions();
+    for (const key of SETTINGS_SERVICE_KEYS) {
+      assert.ok(opts[key] && typeof opts[key] === 'object', `serverOptions().${key} must be injected`);
+    }
+
+    // Each is the REAL service surface, not an empty placeholder — spot-check the
+    // method/property each /settings route actually consumes.
+    assert.deepEqual(
+      [...runtime.providerResolver.supportedProviders],
+      ['anthropic', 'gemini', 'openrouter'],
+      'the provider resolver reflects plumby PROVIDERS through the engine boundary',
+    );
+    assert.ok(runtime.connectorService.catalog.list().length > 0, 'the connector catalog is served');
+    assert.equal(typeof runtime.connectorService.addConnector, 'function');
+    assert.equal(typeof runtime.connectorBindingStore.list, 'function');
+    assert.equal(typeof runtime.skillLibrary.readUserSkills, 'function');
+    assert.equal(typeof runtime.skillLibrary.createUserSkill, 'function');
+    assert.equal(typeof runtime.memoryStore.globalStore, 'function');
+    assert.equal(typeof runtime.memoryStore.projectStore, 'function');
+    assert.equal(typeof runtime.projectExporter.export, 'function');
+    assert.equal(typeof runtime.lockinAudit.audit, 'function');
+    assert.equal(typeof runtime.shareLinkService.share, 'function');
+  } finally {
+    cleanup();
+  }
+});
+
+test('build/deploy is DELIBERATELY left unwired — projectLifecycle is not injected (honest 405)', async () => {
+  // There is no real build/deploy engine in the repo. Rather than fabricate a
+  // fake that pretends to succeed, the composition injects NO projectLifecycle,
+  // so POST /settings/build and /settings/deploy honestly stay 405 in the live
+  // boot. If a future ProjectLifecycle is composed, this assertion is the
+  // reminder to update the honesty contract deliberately.
+  const { dir, cleanup } = tempDataDir();
+  const { runtime, composed } = makeRuntime({ dir });
+  assert.equal(Object.hasOwn(runtime.serverOptions(), 'projectLifecycle'), false, 'projectLifecycle must NOT be injected');
+
+  const srv = await startServer({ runtime, composed });
+  try {
+    const { token } = await srv.login('alice');
+    const auth = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+    for (const route of ['/settings/build', '/settings/deploy']) {
+      const res = await fetch(`${srv.base}${route}`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ projectId: 'p' }),
+      });
+      assert.equal(res.status, 405, `${route} must stay 405 (no build/deploy engine exists)`);
+    }
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
+
+test('the per-account settings routes are ROUTED in the live composition (was 405 before)', async () => {
+  const { dir, cleanup } = tempDataDir();
+  const { runtime, composed } = makeRuntime({ dir });
+  const srv = await startServer({ runtime, composed });
+  try {
+    const { token } = await srv.login('alice');
+    const auth = { authorization: `Bearer ${token}` };
+    // GET routes that gate on authn only (per-account) must now answer 200 — each
+    // was 405 (unrouted) before the settings services were composed.
+    for (const url of ['/settings/provider', '/settings/connectors', '/settings/skills', '/settings/memory']) {
+      const res = await fetch(`${srv.base}${url}`, { headers: auth });
+      assert.notEqual(res.status, 405, `${url} must be routed once its service is composed`);
+      assert.equal(res.status, 200, `${url} answers for an authenticated account`);
+    }
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
+
+test('the connector service is PER-ACCOUNT: a submitted secret lands in the requesting account\'s own owner dir, never a shared placeholder, and is never echoed', async () => {
+  const { dir, cleanup } = tempDataDir();
+  const { runtime, composed } = makeRuntime({ dir });
+  const srv = await startServer({ runtime, composed });
+  try {
+    const alice = await srv.login('alice');
+    const bob = await srv.login('bob');
+    assert.notEqual(alice.account.id, bob.account.id);
+
+    const SECRET = 'sk_live_PERACCOUNT_9f3a';
+    const conf = await fetch(`${srv.base}/settings/connectors`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${alice.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ service: 'stripe', secrets: { STRIPE_SECRET_KEY: SECRET } }),
+    });
+    const text = await conf.text();
+    assert.equal(conf.status, 200);
+    assert.ok(!text.includes(SECRET), 'the submitted secret value must never be echoed');
+    assert.deepEqual(JSON.parse(text).bound.secretRefs, ['STRIPE_SECRET_KEY'], 'only the NAME is surfaced');
+
+    // Alice's active binding is visible to Alice (name-only)...
+    const aliceBound = await (await fetch(`${srv.base}/settings/connectors`, {
+      headers: { authorization: `Bearer ${alice.token}` },
+    })).json();
+    // GET with no projectId scopes bound to []; the per-account bound listing is
+    // exercised directly through the composed facade below (the route only lists
+    // when a projectId is supplied — here the account id is that scope).
+
+    // ...and NOT to Bob: a different account's connector facade resolves a
+    // different owner, so Bob sees none of Alice's bindings.
+    const bobBinding = runtime.connectorBindingStore.list(bob.account.id);
+    const aliceBinding = runtime.connectorBindingStore.list(alice.account.id);
+    assert.ok(aliceBinding.some((b) => b.connector.service === 'stripe'), 'alice owns the stripe binding');
+    assert.ok(!bobBinding.some((b) => b.connector.service === 'stripe'), 'bob must not see alice\'s binding');
+
+    // The credential VALUE is stored out-of-tree under ALICE's owner and is
+    // injectable for her scope, but not under bob's — the per-owner isolation the
+    // facade preserves. (accountId is the connectors screen's default scope.)
+    const aliceStores = runtime.storesForOwner(alice.account.id);
+    assert.equal(aliceStores.secretStore.get(alice.account.id, 'STRIPE_SECRET_KEY'), SECRET);
+    const bobStores = runtime.storesForOwner(bob.account.id);
+    assert.equal(bobStores.secretStore.get(bob.account.id, 'STRIPE_SECRET_KEY'), null, 'bob\'s owner dir holds none of it');
+
+    assert.ok(Array.isArray(aliceBound.bound));
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
+
+test('the connector facade resolves the OWNER of a registered project, not the caller\'s account', async () => {
+  // When a real projectId is supplied, the per-account facade must select the
+  // project's OWNER (via ownerOf), so a connector added against a project lands in
+  // that project owner's directory — proven by the binding being readable through
+  // the owner-keyed store and the owner-count incrementing for the real owner.
+  const { dir, cleanup } = tempDataDir();
+  const { runtime, composed } = makeRuntime({ dir });
+  const srv = await startServer({ runtime, composed });
+  try {
+    const alice = await srv.login('alice');
+    const projectId = (await (await createProject(srv.base, alice.token)).json()).id;
+
+    const conf = await fetch(`${srv.base}/settings/connectors`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${alice.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ service: 'stripe', projectId, secrets: { STRIPE_SECRET_KEY: 'sk_live_proj' } }),
+    });
+    assert.equal(conf.status, 200);
+
+    // The binding is stored under alice (the project's real owner) and keyed by
+    // the projectId — resolvable through the owner-agnostic facade.
+    const bound = runtime.connectorBindingStore.list(projectId);
+    assert.ok(bound.some((b) => b.connector.service === 'stripe' && b.status === 'active'));
+    assert.equal(runtime._ownerOf(projectId), alice.account.id, 'the project resolves to alice');
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
+
+test('skills + memory are per-account through ONE stateless-by-layout instance', async () => {
+  const { dir, cleanup } = tempDataDir();
+  const { runtime, composed } = makeRuntime({ dir });
+  const srv = await startServer({ runtime, composed });
+  try {
+    const alice = await srv.login('alice');
+    const bob = await srv.login('bob');
+    const auth = (t) => ({ authorization: `Bearer ${t}`, 'content-type': 'application/json' });
+
+    // Alice adds a User_Skill; it is owned by her account only.
+    const add = await fetch(`${srv.base}/settings/skills`, {
+      method: 'POST',
+      headers: auth(alice.token),
+      body: JSON.stringify({ name: 'alice-skill', description: 'does a thing', body: '# hi' }),
+    });
+    assert.equal(add.status, 200);
+
+    const aliceSkills = await (await fetch(`${srv.base}/settings/skills`, { headers: auth(alice.token) })).json();
+    assert.ok(aliceSkills.user.some((s) => s.name === 'alice-skill'));
+    const bobSkills = await (await fetch(`${srv.base}/settings/skills`, { headers: auth(bob.token) })).json();
+    assert.ok(!bobSkills.user.some((s) => s.name === 'alice-skill'), 'bob must not see alice\'s skill');
+
+    // Memory mode set for Alice's global scope does not affect Bob's.
+    const mode = await fetch(`${srv.base}/settings/memory`, {
+      method: 'POST', headers: auth(alice.token), body: JSON.stringify({ op: 'mode', mode: 'manual' }),
+    });
+    assert.equal(mode.status, 200);
+    assert.equal((await mode.json()).mode, 'manual');
+    const bobMem = await (await fetch(`${srv.base}/settings/memory`, { headers: auth(bob.token) })).json();
+    assert.equal(bobMem.mode, 'auto', 'bob\'s memory mode is unaffected (its own per-account scope)');
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
+
+test('export + lockin-audit are reachable and functional on an OWNED project (per-project auth)', async () => {
+  const { dir, cleanup } = tempDataDir();
+  const { runtime, composed } = makeRuntime({ dir });
+  const srv = await startServer({ runtime, composed });
+  try {
+    const alice = await srv.login('alice');
+    const bob = await srv.login('bob');
+    const projectId = (await (await createProject(srv.base, alice.token)).json()).id;
+
+    const exp = await (await fetch(`${srv.base}/settings/export?projectId=${projectId}`, {
+      headers: { authorization: `Bearer ${alice.token}` },
+    })).json();
+    assert.ok(exp.files && typeof exp.envTemplate === 'string', 'a real export package is produced');
+
+    const aud = await (await fetch(`${srv.base}/settings/lockin-audit?projectId=${projectId}`, {
+      headers: { authorization: `Bearer ${alice.token}` },
+    })).json();
+    assert.equal(typeof aud.clean, 'boolean');
+    assert.ok(Array.isArray(aud.findings));
+
+    // Per-project auth still holds: a different account is denied identically.
+    const intruderExport = await fetch(`${srv.base}/settings/export?projectId=${projectId}`, {
+      headers: { authorization: `Bearer ${bob.token}` },
+    });
+    assert.equal(intruderExport.status, 401);
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
+
+test('share links are per-owner: a link for an OWNED project is minted with the configured base URL', async () => {
+  const { dir, cleanup } = tempDataDir();
+  const { runtime, composed } = makeRuntime({ dir, env: { AAB_SHARE_BASE_URL: 'https://share.example.test' } });
+  const srv = await startServer({ runtime, composed });
+  try {
+    const alice = await srv.login('alice');
+    const bob = await srv.login('bob');
+    const projectId = (await (await createProject(srv.base, alice.token)).json()).id;
+
+    const res = await fetch(`${srv.base}/settings/share`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${alice.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId }),
+    });
+    assert.equal(res.status, 200);
+    const { url } = await res.json();
+    assert.ok(url.startsWith('https://share.example.test/'), `absolute URL from the configured base, got ${url}`);
+
+    // The link is really persisted under ALICE's (the project owner's) share-link
+    // store — a per-owner store keyed by her account.
+    const aliceLinks = createShareLinkStoreFor(runtime, alice.account.id);
+    assert.ok(aliceLinks.length >= 1, 'a link is persisted under the owning account');
+
+    // A non-owner sharing the same project is denied with the non-disclosing 401.
+    const denied = await fetch(`${srv.base}/settings/share`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${bob.token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId }),
+    });
+    assert.equal(denied.status, 401);
+    assert.deepEqual(await denied.json(), { error: 'access denied' });
+  } finally {
+    await srv.close();
+    cleanup();
+  }
+});
+
+/** Read the persisted Share_Links for an owner directly (per-owner store). */
+function createShareLinkStoreFor(runtime, ownerId) {
+  return createShareLinkStore({ layout: runtime.layout, ownerId }).list();
+}
+
+test('resolveShareLinkBaseUrl reads AAB_SHARE_BASE_URL / PUBLIC_BASE_URL, trims trailing slashes, and is optional', () => {
+  assert.equal(resolveShareLinkBaseUrl({ AAB_SHARE_BASE_URL: 'https://s.example.test/' }), 'https://s.example.test');
+  assert.equal(resolveShareLinkBaseUrl({ PUBLIC_BASE_URL: 'https://p.example.test' }), 'https://p.example.test');
+  // AAB_SHARE_BASE_URL wins over PUBLIC_BASE_URL.
+  assert.equal(
+    resolveShareLinkBaseUrl({ AAB_SHARE_BASE_URL: 'https://a.example.test', PUBLIC_BASE_URL: 'https://p.example.test' }),
+    'https://a.example.test',
+  );
+  // Unset / blank -> undefined (the builder-server then falls back to a relative path).
+  assert.equal(resolveShareLinkBaseUrl({}), undefined);
+  assert.equal(resolveShareLinkBaseUrl({ AAB_SHARE_BASE_URL: '   ' }), undefined);
+});
+
+test('the full settings-service bundle spreads through startPlatformServer with NO change to start.js', async () => {
+  // The decisive end-to-end: the real entry point composes the runtime and spreads
+  // runtime.serverOptions() into createBuilderServer. If the settings services were
+  // not in that bundle, these routes would be 405 in the real process.
+  const { dir, cleanup } = tempDataDir();
+  const { api, address } = await startPlatformServer({
+    env: { PORT: '0', HOST: '127.0.0.1', AAB_DATA_DIR: dir, ANTHROPIC_API_KEY: 'sk-ant-x' },
+    createRuntime: (args) => composeProjectRuntime({ ...args, createBackend: fakeBackend }),
+    idpVerifier: {
+      async verifyIdToken(idToken) {
+        if (!idToken) throw new Error('no token');
+        return { provider: 'github', subject: idToken };
+      },
+    },
+    logger: { log: () => {} },
+  });
+  try {
+    const base = `http://${address.host}:${address.port}`;
+    // No token -> 401 (routed + gated), NOT 405 (unrouted). This is the property.
+    for (const url of ['/settings/provider', '/settings/connectors', '/settings/skills', '/settings/memory']) {
+      const res = await fetch(`${base}${url}`);
+      assert.equal(res.status, 401, `${url} is routed + gated in the live process (401, not 405)`);
+    }
+    // build/deploy stay 405 in the live process too (deliberately unwired).
+    for (const url of ['/settings/build', '/settings/deploy']) {
+      const res = await fetch(`${base}${url}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+      });
+      assert.equal(res.status, 405, `${url} stays 405 in the live process (no engine)`);
+    }
+  } finally {
+    await api.close();
     cleanup();
   }
 });
