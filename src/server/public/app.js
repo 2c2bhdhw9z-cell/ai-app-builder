@@ -44,6 +44,7 @@ import { createPreviewPaneView } from './views/preview-pane.js';
 import { createConfirmView } from './views/confirm.js';
 import { createProjectsView } from './views/projects.js';
 import { createLayoutView } from './views/layout.js';
+import { createFilePanelView } from './views/file-panel.js';
 import { createSessionHeaderView } from './views/session-header.js';
 import { createWorkspaceControlsView } from './views/workspace-controls.js';
 import { createRouter } from './router.js';
@@ -318,6 +319,16 @@ export function createInitialView(doc, client) {
     });
     views.push(confirm);
 
+    // The file/tool panel surface (Req 27.2) — the fifth surface the layout
+    // descriptors position. It derives its file list from the session's REAL
+    // Activity_Stream diff/tool frames (no invented backend route) and shows an
+    // explicit empty state until the agent reports touching a file.
+    const filePanel = createFilePanelView({
+      doc,
+      store: client.store,
+    });
+    views.push(filePanel);
+
     // The experience + theme selectors (embedded in the header's context).
     const controls = createWorkspaceControlsView({
       doc,
@@ -342,8 +353,11 @@ export function createInitialView(doc, client) {
     composeWrap.className = 'shell__compose';
     composeWrap.append(confirm.el, prompt.el);
 
-    // The chat-first layout arranges the surfaces per the active experience and
-    // re-arranges (layout only) on a workspace_experience frame (Req 8.3, 11.1).
+    // The layout view arranges ALL FIVE surfaces into the regions the ACTIVE
+    // Workspace_Experience's descriptor names, and re-arranges (layout only) on a
+    // workspace_experience frame (Req 8.3, 11.1, 27.2). Every surface named in
+    // the descriptors is supplied here, so each of the five experiences renders
+    // its own real geometry rather than a flattened one.
     const layout = createLayoutView({
       doc,
       store: client.store,
@@ -352,6 +366,7 @@ export function createInitialView(doc, client) {
         activityStream: activity,
         compose: { el: composeWrap },
         preview,
+        filePanel,
       },
     });
     views.push(layout);

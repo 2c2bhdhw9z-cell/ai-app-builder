@@ -89,6 +89,7 @@ const ASSET_PATHS = Object.freeze([
   '/views/confirm.js',
   '/views/projects.js',
   '/views/layout.js',
+  '/views/file-panel.js',
   '/views/session-header.js',
   '/views/workspace-controls.js',
   '/views/settings/settings-panel.js',

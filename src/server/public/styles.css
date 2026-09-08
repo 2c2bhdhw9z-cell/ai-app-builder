@@ -89,9 +89,29 @@ body {
 
 
 /* ===================================================================== *
- * The chat-first shell (Tasks 10.1 / 12.1, Req 8.3, 11.1)               *
- * A calm single main column + a persistent slim top header + a          *
- * secondary preview panel that slides in on wide viewports.             *
+ * The workspace shell — the FIVE real Workspace_Experience geometries    *
+ * (Tasks 10.1 / 12.1, Req 8.3, 11.1; platform Req 27.2, 27.4, 27.8)      *
+ *                                                                        *
+ * views/layout.js renders one container per region named in the ACTIVE    *
+ * layout descriptor and marks the shell with data-experience,             *
+ * data-orientation, data-regions and, per container, data-region /        *
+ * data-role / data-size. THIS file turns those attributes into the actual *
+ * geometry, so each experience is a genuinely different arrangement:      *
+ *                                                                        *
+ *   kiro-style / custom  : two columns — left (activity + compose +       *
+ *                          files) and right (preview).                    *
+ *   vibe-first           : one conversation-forward column with the       *
+ *                          compose surface foregrounded (emphasis) and    *
+ *                          the preview a collapsed aside beneath it.      *
+ *   technical-workbench  : an IDE cockpit — pinned header, left sidebar   *
+ *                          (file/tool panel), large central editor area   *
+ *                          (preview), and a bottom dock spanning under    *
+ *                          both holding compose + the Activity_Stream.    *
+ *   mobile-command-center: one stacked, touch-operable column.            *
+ *                                                                        *
+ * Every geometry is palette-driven (only --color-* custom properties) and *
+ * every one collapses to a single column at <=720px and cannot overflow   *
+ * horizontally at 360px (border-box + min-width:0 + max-width:100%).      *
  * ===================================================================== */
 
 .shell {
@@ -99,25 +119,28 @@ body {
   flex-direction: column;
   min-height: 100vh;
   width: 100%;
+  max-width: 100%;
+  /* No experience may scroll the page sideways on a phone (Req 11.2). */
+  overflow-x: hidden;
 }
 
-/* The persistent slim top bar — always visible, full-width, at 360px too. */
+/* The pinned top-bar region — always visible, full-width, at 360px too. */
 .shell__header {
   position: sticky;
   top: 0;
   z-index: 10;
   width: 100%;
+  max-width: 100%;
   background-color: var(--color-surface);
   border-bottom: 1px solid var(--color-badge);
 }
 
-/* The body: a calm main column with a secondary preview panel beside it on
-   wide viewports. The main column is centered and width-capped for a relaxed,
-   readable conversation; the panel takes the remaining space. */
+/* The body is the REGION GRID. The default (two-column) template is the
+   kiro-style/custom arrangement; each experience overrides it below. */
 .shell__body {
   flex: 1 1 auto;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 22rem);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 24rem);
   gap: var(--space);
   width: 100%;
   max-width: 80rem;
@@ -125,18 +148,42 @@ body {
   padding: var(--space);
 }
 
+/* A region container: one per descriptor region, whatever it is named. */
+.shell__region {
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space);
+}
+
+.shell__region[hidden] {
+  display: none;
+}
+
+/* Honor the descriptor's DECLARED region order even for an arbitrary persisted
+   `custom` arrangement (Req 27.4): the layout view mirrors each body region's
+   declared index onto data-index. */
+.shell__region[data-index="0"] { order: 0; }
+.shell__region[data-index="1"] { order: 1; }
+.shell__region[data-index="2"] { order: 2; }
+.shell__region[data-index="3"] { order: 3; }
+.shell__region[data-index="4"] { order: 4; }
+.shell__region[data-index="5"] { order: 5; }
+
+/* The primary body-region slot. */
 .shell__main {
   min-width: 0; /* allow the column to shrink below content width (no overflow) */
   display: flex;
   flex-direction: column;
   gap: var(--space);
   width: 100%;
-  max-width: var(--maxw);
-  margin: 0 auto;
 }
 
+/* The secondary body-region slot — a side panel on wide viewports. */
 .shell__panel {
   min-width: 0;
+  width: 100%;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
@@ -148,6 +195,67 @@ body {
 }
 
 .shell__panel[hidden] {
+  display: none;
+}
+
+/* A surface wrapper inside a region. `data-size` is the descriptor's sizing,
+   `data-emphasis` its foregrounding, `data-collapsed` its collapse state. */
+.shell__surface {
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+/* A surface the descriptor marks visible:false stays mounted but unrendered. */
+.shell__surface[hidden] {
+  display: none;
+}
+
+.shell__surface[data-size="flex"] {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.shell__surface[data-size="auto"] {
+  flex: 0 0 auto;
+}
+
+/* A collapsed surface shows ONLY its toggle, so it is always still reachable. */
+.shell__surface[data-collapsed="true"] {
+  flex: 0 0 auto;
+}
+
+.shell__surface > [hidden] {
+  display: none;
+}
+
+/* emphasis:'primary' (vibe-first's compose) — foregrounded, not just first. */
+.shell__surface[data-emphasis="primary"] {
+  order: -1;
+  padding: var(--space);
+  border: 2px solid var(--color-accent);
+  border-radius: var(--radius);
+  background-color: var(--color-surface);
+}
+
+/* The collapse toggle: touch-sized (Req 11.3) and palette-driven. */
+.shell__collapse-toggle {
+  align-self: flex-start;
+  min-height: var(--touch);
+  min-width: var(--touch);
+  padding: 0.35rem 0.9rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-accent);
+  background-color: var(--color-badge);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.shell__collapse-toggle[hidden] {
   display: none;
 }
 
@@ -171,15 +279,155 @@ body {
   display: none;
 }
 
+
+/* --------------------------------------------------------------------- *
+ * kiro-style + custom: two columns — conversation left, preview right.   *
+ * --------------------------------------------------------------------- */
+
+.shell[data-experience="kiro-style"] .shell__body,
+.shell[data-experience="custom"] .shell__body {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 26rem);
+  align-items: start;
+}
+
+.shell[data-experience="kiro-style"] .shell__region[data-region="left"],
+.shell[data-experience="custom"] .shell__region[data-region="left"] {
+  grid-column: 1;
+}
+
+.shell[data-experience="kiro-style"] .shell__region[data-region="right"],
+.shell[data-experience="custom"] .shell__region[data-region="right"] {
+  grid-column: 2;
+}
+
+
+/* --------------------------------------------------------------------- *
+ * vibe-first: ONE conversation-forward column, compose foregrounded, the *
+ * preview a collapsed aside beneath it.                                  *
+ * --------------------------------------------------------------------- */
+
+.shell[data-experience="vibe-first"] .shell__body {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "main"
+    "aside";
+  max-width: 58rem;
+}
+
+.shell[data-experience="vibe-first"] .shell__region[data-region="main"] {
+  grid-area: main;
+}
+
+.shell[data-experience="vibe-first"] .shell__region[data-region="aside"] {
+  grid-area: aside;
+  position: static;
+  max-height: none;
+  overflow: visible;
+}
+
+.shell[data-experience="vibe-first"] .shell__surface[data-emphasis="primary"] {
+  /* The compose box is the loudest thing on the surface here. */
+  padding: calc(var(--space) * 1.25);
+  border-width: 2px;
+  border-radius: var(--radius);
+  background-color: var(--color-surface);
+}
+
+
+/* --------------------------------------------------------------------- *
+ * technical-workbench: the IDE cockpit (Req 27.8) — a real developer     *
+ * geometry, not the chat shell. Pinned header (above), left sidebar for  *
+ * the file/tool panel, a large central editor area for the preview, and  *
+ * a bottom dock spanning under BOTH holding compose + Activity_Stream.   *
+ * Original, clean-room layout; theme-able like every other experience    *
+ * (colors are palette variables only, Req 29).                          *
+ * --------------------------------------------------------------------- */
+
+.shell[data-experience="technical-workbench"] .shell__body {
+  grid-template-columns: minmax(0, 18rem) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) minmax(11rem, 0.55fr);
+  grid-template-areas:
+    "sidebar editor"
+    "dock dock";
+  max-width: none;
+  height: calc(100vh - var(--header-h));
+  gap: 1px;
+  padding: 0;
+  /* The 1px gaps read as pane seams in the active palette. */
+  background-color: var(--color-badge);
+}
+
+.shell[data-experience="technical-workbench"] .shell__region {
+  padding: 0.5rem;
+  gap: 0.5rem;
+  overflow: auto;
+  background-color: var(--color-background);
+}
+
+.shell[data-experience="technical-workbench"] .shell__region[data-region="sidebar"] {
+  grid-area: sidebar;
+  position: static;
+  max-height: none;
+  background-color: var(--color-surface);
+}
+
+.shell[data-experience="technical-workbench"] .shell__region[data-region="editor"] {
+  grid-area: editor;
+  position: static;
+  max-height: none;
+}
+
+.shell[data-experience="technical-workbench"] .shell__region[data-region="dock"] {
+  grid-area: dock;
+  background-color: var(--color-surface);
+  border-top: 1px solid var(--color-badge);
+}
+
+
+/* --------------------------------------------------------------------- *
+ * mobile-command-center: one stacked, touch-operable column.             *
+ * --------------------------------------------------------------------- */
+
+.shell[data-experience="mobile-command-center"] .shell__body,
+.shell[data-orientation="vertical"] .shell__body {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: none;
+  max-width: 44rem;
+  height: auto;
+  padding: 0.75rem;
+  gap: 0.75rem;
+}
+
+.shell[data-experience="mobile-command-center"] .shell__region[data-region="stack"] {
+  grid-column: 1;
+  position: static;
+  max-height: none;
+  overflow: visible;
+}
+
+.shell[data-experience="mobile-command-center"] .shell__collapse-toggle {
+  align-self: stretch;
+  text-align: left;
+}
+
+/* A top-bar region a descriptor leaves empty takes no space (a layout that
+   positions no Session_Header at all must not show a stray 1px bar). */
+.shell__header:empty {
+  display: none;
+  border-bottom: 0;
+}
+
 /*
  * Single-column collapse: the mobile-command-center experience AND any
  * phone-width viewport render the SAME shell as one calm touch column, with the
  * preview folded into the flow (Req 11.1, 11.2). The layout view sets
- * data-single-column="true"; the media query catches narrow viewports for the
- * other experiences too, so the same layout collapses gracefully on a phone.
+ * data-single-column="true"; the media query below catches narrow viewports for
+ * the other experiences too, so every layout collapses gracefully on a phone.
  */
 .shell[data-single-column="true"] .shell__body {
   grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: none;
+  height: auto;
 }
 
 .shell[data-single-column="true"] .shell__panel {
@@ -187,6 +435,8 @@ body {
   max-height: none;
 }
 
+/* Every experience — including the workbench grid — becomes ONE column on a
+   phone-width viewport (Req 11.1, 11.2). Same shell, no separate stylesheet. */
 @media (max-width: 720px) {
   .shell__body {
     grid-template-columns: minmax(0, 1fr);
@@ -195,6 +445,22 @@ body {
   .shell__panel {
     position: static;
     max-height: none;
+  }
+  .shell[data-experience] .shell__body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: none;
+    grid-template-rows: auto;
+    height: auto;
+    max-width: 100%;
+    padding: 0.75rem;
+    gap: 0.75rem;
+  }
+  .shell[data-experience] .shell__region[data-region] {
+    grid-area: auto;
+    grid-column: 1;
+    position: static;
+    max-height: none;
+    overflow: visible;
   }
 }
 
@@ -675,6 +941,154 @@ body {
 .confirm__deny {
   color: var(--color-background);
   background-color: var(--color-statusError);
+}
+
+
+/* ===================================================================== *
+ * File/tool panel surface (Req 27.2, 27.8)                              *
+ * The fifth builder surface: the files the agent touched this session   *
+ * (derived from the Activity_Stream's real diff frames) plus the tool    *
+ * activity, and the selected file's latest change. Palette-driven.      *
+ * ===================================================================== */
+
+.file-panel {
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius);
+}
+
+.file-panel__heading {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+}
+
+.file-panel__empty {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--color-statusInfo);
+}
+
+.file-panel__empty[hidden] {
+  display: none;
+}
+
+.file-panel__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.file-panel__list[hidden] {
+  display: none;
+}
+
+.file-panel__file {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.file-panel__file-button {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--touch);
+  padding: 0.35rem 0.6rem;
+  font: inherit;
+  text-align: left;
+  overflow-wrap: anywhere;
+  color: var(--color-accent);
+  background-color: var(--color-background);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.file-panel__file-button[aria-pressed="true"] {
+  border-color: var(--color-accent);
+  background-color: var(--color-badge);
+}
+
+.file-panel__file-meta {
+  flex: 0 0 auto;
+  font-size: 0.75rem;
+  color: var(--color-statusInfo);
+}
+
+.file-panel__detail {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.file-panel__detail-path {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+  color: var(--color-accent);
+}
+
+.file-panel__detail-notice,
+.file-panel__detail-hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--color-statusWarning);
+}
+
+.file-panel__diff {
+  margin: 0;
+  padding: 0.5rem;
+  max-width: 100%;
+  max-height: 18rem;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  background-color: var(--color-background);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius-sm);
+}
+
+.file-panel__diff-line {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.file-panel__diff-line[data-marker="+"] {
+  color: var(--color-statusSuccess);
+}
+
+.file-panel__diff-line[data-marker="-"] {
+  color: var(--color-statusError);
+}
+
+.file-panel__diff-marker {
+  display: inline-block;
+  width: 1ch;
+  font-weight: 700;
+}
+
+.file-panel__tool {
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+  color: var(--color-accent);
 }
 
 
