@@ -1,0 +1,11 @@
+{
+  "name": "AI App Builder",
+  "short_name": "App Builder",
+  "description": "Browser client for the AI App Builder platform.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#ffffff",
+  "theme_color": "#2f6feb"
+}
