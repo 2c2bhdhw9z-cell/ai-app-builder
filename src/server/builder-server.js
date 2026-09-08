@@ -129,6 +129,16 @@ const STATIC_ASSETS = {
   '/work-mode.js': 'work-mode.js', // Task 12.1
   '/views/session-header.js': 'views/session-header.js', // Task 12.1
   '/views/workspace-controls.js': 'views/workspace-controls.js', // Tasks 10.1/11.1
+  // Settings surfaces + final wiring (Tasks 14 / 15). Each is a 1:1 allow-list
+  // entry — no path joining of the request path, so no traversal surface.
+  '/router.js': 'router.js', // Task 15.1
+  '/settings/settings-state.js': 'settings/settings-state.js', // Task 14 (shared)
+  '/settings/provider.js': 'settings/provider.js', // Task 14.1
+  '/settings/connectors.js': 'settings/connectors.js', // Task 14.2
+  '/settings/skills.js': 'settings/skills.js', // Task 14.3
+  '/settings/memory.js': 'settings/memory.js', // Task 14.3
+  '/settings/lifecycle.js': 'settings/lifecycle.js', // Task 14.4
+  '/views/settings/settings-panel.js': 'views/settings/settings-panel.js', // Tasks 14/15.1
 };
 
 /** Content-Type by file extension for the served static assets. */

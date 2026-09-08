@@ -46,6 +46,13 @@ import { createProjectsView } from './views/projects.js';
 import { createLayoutView } from './views/layout.js';
 import { createSessionHeaderView } from './views/session-header.js';
 import { createWorkspaceControlsView } from './views/workspace-controls.js';
+import { createRouter } from './router.js';
+import { createProviderController } from './settings/provider.js';
+import { createConnectorsController } from './settings/connectors.js';
+import { createSkillsController } from './settings/skills.js';
+import { createMemoryController } from './settings/memory.js';
+import { createLifecycleController } from './settings/lifecycle.js';
+import { createSettingsPanel } from './views/settings/settings-panel.js';
 
 /** The DOM node the client mounts into (declared in index.html). */
 const ROOT_ID = 'app';
@@ -144,6 +151,34 @@ export function createClient(deps = {}) {
   client.workspace = deps.workspace ?? createWorkspaceController({ store, api });
   client.theme = deps.theme ?? createThemeController({ store, api });
   client.workMode = deps.workMode ?? createWorkModeController({ store, api });
+
+  // The settings-surface controllers (Task 14). Each is the LAST-stage feature
+  // logic behind a settings screen, all sharing the SAME store + gated api
+  // client so the Bearer flows and their non-disclosing notices (re-auth/error)
+  // land in the one observable session.notice the settings panel reads. They
+  // consume assumed-contract /settings/* endpoints (the exact shapes are not
+  // pinned in the requirements glossary) using the IDENTICAL api.js tagged-result
+  // contract and non-disclosing error posture as every other surface:
+  //   - provider:   list + select the builder's model provider (Req 12).
+  //   - connectors: list the catalog grouped by category + configure; a secret is
+  //                 sent only over the authorized request and never rendered back
+  //                 (Req 13).
+  //   - skills:     list stocked + user skills, add/import (Req 14.1/14.2).
+  //   - memory:     list project/global entries + active Memory_Mode, edit/prune,
+  //                 change mode among auto/manual/off (Req 14.3–14.5).
+  //   - lifecycle:  build/deploy/export(download)/lock-in-audit/share (Req 15).
+  client.provider = deps.provider ?? createProviderController({ store, api });
+  client.connectors = deps.connectors ?? createConnectorsController({ store, api });
+  client.skills = deps.skills ?? createSkillsController({ store, api });
+  client.memory = deps.memory ?? createMemoryController({ store, api });
+  client.lifecycle = deps.lifecycle ?? createLifecycleController({ store, api });
+
+  // The in-client view router (Task 15.1): toggles the SETTINGS panel on top of
+  // the logged-in builder/workspace shell. login-vs-builder is derived from the
+  // store's auth slice (the login gate wired in Task 8), so a 401 that clears the
+  // token via api.js onAccessDenied returns the user to login from the settings
+  // surface too (Req 6.7, 16.1). A test may inject its own router.
+  client.router = deps.router ?? createRouter({ initial: 'builder' });
 
   // Per-account presentation bootstrap (Req 8.5, 9.8): the default
   // Workspace_Experience and committed Theme are read ONCE, when a Bearer_Token
@@ -320,7 +355,74 @@ export function createInitialView(doc, client) {
       },
     });
     views.push(layout);
-    main.append(layout.el);
+
+    // The settings toggle — a slim, touch-sized control in the header that flips
+    // the router between the builder shell and the settings panel (Task 15.1).
+    const settingsToggle = doc.createElement('button');
+    settingsToggle.id = 'shell-settings-toggle';
+    settingsToggle.className = 'shell__settings-toggle';
+    settingsToggle.setAttribute('type', 'button');
+    settingsToggle.setAttribute('aria-label', 'Settings');
+    settingsToggle.textContent = 'Settings';
+    if (client.router && typeof client.router.toggleSettings === 'function') {
+      settingsToggle.addEventListener('click', () => client.router.toggleSettings());
+    }
+    // Embed the toggle in the header bar so it is always reachable (incl. 360px).
+    sessionHeader.el.append(settingsToggle);
+
+    // The settings panel (Task 14 surfaces). Mounted alongside the builder shell
+    // and shown/hidden by the router so switching to settings never tears down
+    // the builder state (the SSE stream, the in-flight turn, etc. stay live).
+    const settingsPanel = createSettingsPanel({
+      doc,
+      store: client.store,
+      controllers: {
+        provider: client.provider,
+        connectors: client.connectors,
+        skills: client.skills,
+        memory: client.memory,
+        lifecycle: client.lifecycle,
+      },
+    });
+    views.push(settingsPanel);
+
+    // Route-driven visibility: the builder shell OR the settings panel is shown,
+    // never both. When the settings route becomes active the first time, the
+    // controllers refresh their lists (list()); the panel re-renders reactively.
+    let listsLoaded = false;
+    function applyRoute() {
+      const route =
+        client.router && typeof client.router.getRoute === 'function'
+          ? client.router.getRoute()
+          : 'builder';
+      const showSettings = route === 'settings';
+      layout.el.hidden = showSettings;
+      settingsPanel.el.hidden = !showSettings;
+      settingsToggle.setAttribute('aria-pressed', showSettings ? 'true' : 'false');
+      settingsToggle.textContent = showSettings ? 'Close settings' : 'Settings';
+      if (showSettings && !listsLoaded) {
+        listsLoaded = true;
+        // Load each surface's data once on first open (fire-and-forget; the
+        // panel re-renders when each controller's surface state updates). A
+        // denied read surfaces a non-disclosing re-auth notice via the store.
+        for (const ctrl of [client.provider, client.connectors, client.skills, client.memory]) {
+          if (ctrl && typeof ctrl.list === 'function') void ctrl.list();
+        }
+      }
+    }
+    const unsubRoute =
+      client.router && typeof client.router.subscribe === 'function'
+        ? client.router.subscribe(applyRoute)
+        : () => {};
+    applyRoute();
+
+    main.append(layout.el, settingsPanel.el);
+    views.push({
+      el: settingsToggle,
+      destroy() {
+        unsubRoute();
+      },
+    });
   }
 
   // Mount the project-creation form view (Task 9.1). It is shown ONLY when the
