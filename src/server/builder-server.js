@@ -103,6 +103,13 @@ const STATIC_ASSETS = {
   '/app.js': 'app.js',
   '/styles.css': 'styles.css',
   '/manifest.webmanifest': 'manifest.webmanifest',
+  // Web UI client ES modules loaded (statically) by app.js. Each is a 1:1
+  // allow-list entry — no path joining of the request path, so no traversal
+  // surface — added as the modules are introduced by their spec tasks.
+  '/store.js': 'store.js', // Task 2.1
+  '/api.js': 'api.js', // Task 2.2
+  '/builder.js': 'builder.js', // Task 3.1
+  '/views/prompt.js': 'views/prompt.js', // Task 3.2
 };
 
 /** Content-Type by file extension for the served static assets. */
