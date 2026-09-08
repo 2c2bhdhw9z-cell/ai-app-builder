@@ -1,29 +1,54 @@
 /*
- * styles.css — Web UI base stylesheet (spec Task 1.2, Req 1.4 / 9.1).
+ * styles.css — Web UI stylesheet (spec Tasks 1.2 / 10.1 / 11.1 / 12.1,
+ *  Req 1.4 / 8 / 9.1 / 10 / 11).
  *
- * Palette-driven by design: every color below is read from a `--color-*` CSS
- * custom property, NEVER a hard-coded hex. A Theme is applied later by setting
- * those nine custom properties on `document.documentElement` via the CSSOM
- * (which is NOT an inline <style> element, so it stays CSP-legal under
- * style-src 'self'). The nine names mirror the backend THEME_CATALOG Palette
- * keys (background, surface, accent, button, badge, statusInfo, statusSuccess,
- * statusWarning, statusError) so a `theme` frame's palette maps 1:1.
+ * Palette-driven by design: EVERY color below is read from a `--color-*` CSS
+ * custom property, NEVER a hard-coded hex (the only exception is pure white/
+ * black scaffolding on the QR image, which must be true monochrome to scan).
+ * A Theme is applied at runtime by setting those NINE custom properties on
+ * `document.documentElement` via the CSSOM (theme.js `applyPalette`), which is
+ * NOT an inline <style> element, so it stays CSP-legal under style-src 'self'.
+ * The nine names are EXACTLY the ones design Property 26 asserts — one per
+ * THEME_CATALOG palette key: --color-background, --color-surface,
+ * --color-accent, --color-button, --color-badge, --color-statusInfo,
+ * --color-statusSuccess, --color-statusWarning, --color-statusError — so a
+ * `theme` frame's palette maps 1:1 onto them.
  *
- * The :root fallbacks here are a neutral light default only — they are the
- * bootstrap colors shown before the committed Theme's palette is applied, and
- * are overwritten wholesale once a palette is set on documentElement.
+ * The :root fallbacks are a neutral light default only — the bootstrap colors
+ * shown before the committed Theme's palette is applied; a palette set on
+ * documentElement overrides them wholesale.
+ *
+ * Visual direction: a clean, modern, CHAT-FIRST builder — a calm single main
+ * column with a persistent slim top header, generous spacing, rounded surfaces,
+ * the conversation/activity front-and-centre, and the preview as a secondary
+ * panel that slides in beside the column on wide viewports and folds into the
+ * single column on a phone. The SAME layout collapses gracefully to one column
+ * at 360px (Req 11.1/11.2) — driven by media queries + the shell's
+ * data-single-column attribute, no separate mobile stylesheet.
  */
 
 :root {
+  /* The nine palette custom properties (design Property 26 names). Neutral
+     light bootstrap defaults; overwritten by a committed Theme's palette. */
   --color-background: #ffffff;
-  --color-surface: #f4f5f7;
-  --color-accent: #2f6feb;
-  --color-button: #2f6feb;
-  --color-badge: #6b7280;
-  --color-status-info: #2f6feb;
-  --color-status-success: #1a7f37;
-  --color-status-warning: #9a6700;
-  --color-status-error: #cf222e;
+  --color-surface: #f5f6f8;
+  --color-accent: #2563eb;
+  --color-button: #2563eb;
+  --color-badge: #e2e8f0;
+  --color-statusInfo: #2563eb;
+  --color-statusSuccess: #16a34a;
+  --color-statusWarning: #d97706;
+  --color-statusError: #dc2626;
+
+  /* Neutral text/foreground derived tokens. These are structural (not part of
+     the themeable palette) but still reference palette vars so a dark palette
+     reads correctly: text uses accent-neutral surfaces. */
+  --space: 1rem;
+  --radius: 0.75rem;
+  --radius-sm: 0.5rem;
+  --touch: 2.75rem; /* >=44px touch target (Req 11.3) */
+  --header-h: 3.5rem;
+  --maxw: 52rem;
 }
 
 *,
@@ -49,7 +74,7 @@ body {
     env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
-/* The app root fills the viewport so mounted views can lay themselves out. */
+/* The app root fills the viewport so the shell can lay itself out. */
 #app,
 [data-app-root] {
   display: block;
@@ -57,75 +82,348 @@ body {
 }
 
 .app-shell {
+  display: block;
+  width: 100%;
+  min-height: 100vh;
+}
+
+
+/* ===================================================================== *
+ * The chat-first shell (Tasks 10.1 / 12.1, Req 8.3, 11.1)               *
+ * A calm single main column + a persistent slim top header + a          *
+ * secondary preview panel that slides in on wide viewports.             *
+ * ===================================================================== */
+
+.shell {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
-  align-items: center;
-  justify-content: center;
   min-height: 100vh;
-  padding: 1.5rem;
-  text-align: center;
+  width: 100%;
 }
 
-.app-shell__title {
-  margin: 0;
-  font-size: 1.5rem;
-  font-weight: 700;
-  color: var(--color-accent);
-}
-
-.app-shell__status {
-  margin: 0;
-  padding: 0.4rem 0.9rem;
-  border-radius: 999px;
+/* The persistent slim top bar — always visible, full-width, at 360px too. */
+.shell__header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  width: 100%;
   background-color: var(--color-surface);
-  color: var(--color-status-info);
-  font-size: 0.95rem;
+  border-bottom: 1px solid var(--color-badge);
+}
+
+/* The body: a calm main column with a secondary preview panel beside it on
+   wide viewports. The main column is centered and width-capped for a relaxed,
+   readable conversation; the panel takes the remaining space. */
+.shell__body {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 22rem);
+  gap: var(--space);
+  width: 100%;
+  max-width: 80rem;
+  margin: 0 auto;
+  padding: var(--space);
+}
+
+.shell__main {
+  min-width: 0; /* allow the column to shrink below content width (no overflow) */
+  display: flex;
+  flex-direction: column;
+  gap: var(--space);
+  width: 100%;
+  max-width: var(--maxw);
+  margin: 0 auto;
+}
+
+.shell__panel {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  position: sticky;
+  top: calc(var(--header-h) + var(--space));
+  align-self: start;
+  max-height: calc(100vh - var(--header-h) - 2 * var(--space));
+  overflow: auto;
+}
+
+.shell__panel[hidden] {
+  display: none;
+}
+
+/* The compose surface: confirms sit above the prompt so an approval is
+   front-and-centre while the compose box stays anchored at the bottom flow. */
+.shell__compose {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.shell__attribution {
+  margin: 0;
+  padding: 0.5rem var(--space);
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--color-badge);
+}
+
+.shell__attribution[hidden] {
+  display: none;
 }
 
 /*
- * Mobile Command Center baseline (Req 11.2): the primary column must not
- * horizontally scroll at a 360px viewport. A single-column, full-width shell
- * with border-box sizing satisfies that at the shell level; later views inherit
- * the same constraint.
+ * Single-column collapse: the mobile-command-center experience AND any
+ * phone-width viewport render the SAME shell as one calm touch column, with the
+ * preview folded into the flow (Req 11.1, 11.2). The layout view sets
+ * data-single-column="true"; the media query catches narrow viewports for the
+ * other experiences too, so the same layout collapses gracefully on a phone.
  */
-@media (max-width: 480px) {
-  .app-shell {
-    padding: 1rem;
+.shell[data-single-column="true"] .shell__body {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.shell[data-single-column="true"] .shell__panel {
+  position: static;
+  max-height: none;
+}
+
+@media (max-width: 720px) {
+  .shell__body {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 0.75rem;
+  }
+  .shell__panel {
+    position: static;
+    max-height: none;
   }
 }
 
 
-/*
- * Prompt view (spec Task 3.2, Req 2.1 / 2.5 / 11.3). Palette-driven colors only
- * (var(--color-*)); touch-sized controls (>=44px hit target) so the submit
- * control is operable by touch on a phone. Full-width, border-box, single
- * column — no horizontal overflow of the primary column at a 360px viewport.
- */
+/* ===================================================================== *
+ * Session_Header — the slim top bar (Task 12.1, Req 10, 11.3, 11.4)     *
+ * ===================================================================== */
+
+.session-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  min-height: var(--header-h);
+  padding: 0.4rem var(--space);
+  width: 100%;
+}
+
+.session-header__brand {
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--color-accent);
+  white-space: nowrap;
+}
+
+/* The Work_Mode switch group — a segmented control of touch-sized buttons.
+   ALWAYS visible, including at 360px (Req 11.4). */
+.session-header__modes {
+  display: inline-flex;
+  gap: 0.25rem;
+  padding: 0.2rem;
+  background-color: var(--color-background);
+  border: 1px solid var(--color-badge);
+  border-radius: 999px;
+}
+
+.session-header__mode {
+  min-height: 2.25rem; /* comfortable touch target within the slim bar */
+  min-width: 2.75rem;
+  padding: 0.35rem 0.9rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-accent);
+  background-color: transparent;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.session-header__mode[data-active="true"] {
+  color: var(--color-background);
+  background-color: var(--color-button);
+}
+
+.session-header__context {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.session-header__experience,
+.session-header__theme {
+  padding: 0.2rem 0.6rem;
+  font-size: 0.8rem;
+  color: var(--color-statusInfo);
+  background-color: var(--color-badge);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.session-header__experience[hidden],
+.session-header__theme[hidden] {
+  display: none;
+}
+
+
+/* ===================================================================== *
+ * Workspace controls — experience + theme selectors (Tasks 10.1/11.1)  *
+ * ===================================================================== */
+
+.workspace-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.workspace-controls__experience,
+.workspace-controls__theme {
+  min-height: 2.25rem;
+  padding: 0.3rem 0.5rem;
+  font: inherit;
+  color: var(--color-accent);
+  background-color: var(--color-background);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius-sm);
+}
+
+.workspace-controls__apply,
+.workspace-controls__cancel {
+  min-height: 2.25rem;
+  padding: 0.3rem 0.8rem;
+  font: inherit;
+  font-weight: 600;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.workspace-controls__apply {
+  color: var(--color-background);
+  background-color: var(--color-button);
+}
+
+.workspace-controls__cancel {
+  color: var(--color-accent);
+  background-color: var(--color-badge);
+}
+
+.workspace-controls__apply[hidden],
+.workspace-controls__cancel[hidden] {
+  display: none;
+}
+
+
+/* ===================================================================== *
+ * Projects gate — the create-project entry point between login/builder  *
+ * ===================================================================== */
+
+.projects-gate {
+  width: 100%;
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: var(--space);
+}
+
+.projects-gate[hidden] {
+  display: none;
+}
+
+.projects {
+  display: block;
+  width: 100%;
+}
+
+.projects__form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  width: 100%;
+  padding: var(--space);
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius);
+}
+
+.projects__category,
+.projects__origin,
+.projects__description,
+.projects__template,
+.projects__repo,
+.projects__source {
+  width: 100%;
+  min-height: var(--touch);
+  padding: 0.6rem 0.75rem;
+  font: inherit;
+  color: var(--color-accent);
+  background-color: var(--color-background);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius-sm);
+}
+
+.projects__submit {
+  min-height: var(--touch);
+  min-width: var(--touch);
+  padding: 0.6rem 1.25rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-background);
+  background-color: var(--color-button);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.projects__notice {
+  margin: 0.5rem 0 0;
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius-sm);
+  background-color: var(--color-surface);
+  color: var(--color-statusWarning);
+}
+
+.projects__notice[hidden] {
+  display: none;
+}
+
+
+/* ===================================================================== *
+ * Prompt / compose (Task 3.2, Req 2.1 / 2.5 / 11.3)                     *
+ * ===================================================================== */
+
 .prompt {
   display: block;
   width: 100%;
-  max-width: 48rem;
-  margin: 0 auto;
-  padding: 0.75rem;
 }
 
 .prompt__form {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 0.6rem;
   width: 100%;
+  padding: 0.75rem;
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius);
 }
 
 .prompt__input {
   width: 100%;
-  min-height: 6rem;
+  min-height: 5.5rem;
   padding: 0.75rem;
   font: inherit;
   color: var(--color-accent);
-  background-color: var(--color-surface);
+  background-color: var(--color-background);
   border: 1px solid var(--color-badge);
-  border-radius: 0.5rem;
+  border-radius: var(--radius-sm);
   resize: vertical;
 }
 
@@ -134,16 +432,16 @@ body {
 }
 
 .prompt__submit {
-  /* Touch target: comfortably >=44px tall/wide (Req 11.3). */
-  min-height: 2.75rem;
-  min-width: 2.75rem;
-  padding: 0.6rem 1.25rem;
+  align-self: flex-end;
+  min-height: var(--touch);
+  min-width: var(--touch);
+  padding: 0.6rem 1.5rem;
   font: inherit;
   font-weight: 600;
   color: var(--color-background);
   background-color: var(--color-button);
   border: none;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-sm);
   cursor: pointer;
 }
 
@@ -156,38 +454,91 @@ body {
   align-self: flex-start;
   padding: 0.3rem 0.75rem;
   border-radius: 999px;
-  background-color: var(--color-surface);
-  color: var(--color-status-info);
+  background-color: var(--color-badge);
+  color: var(--color-statusInfo);
   font-size: 0.9rem;
 }
 
 .prompt__notice {
-  margin: 0.75rem 0 0;
+  margin: 0.5rem 0 0;
   padding: 0.6rem 0.9rem;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-sm);
   background-color: var(--color-surface);
-  color: var(--color-status-warning);
+  color: var(--color-statusWarning);
 }
 
 
-/*
- * Preview_Pane (Task 5.3, Req 4.1–4.6, 4.10, 4.11). Palette-driven via
- * var(--color-*) only; the same-origin iframe fills the pane; the restart
- * control is touch-sized (>=44px) for phone use; the mobile URL is selectable
- * and the QR is an inline data: image sized responsively.
- */
+/* ===================================================================== *
+ * Activity_Stream (Task 4.3)                                            *
+ * ===================================================================== */
+
+.activity {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 12rem;
+  padding: 0.75rem;
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius);
+  overflow-wrap: anywhere;
+}
+
+.activity__item {
+  margin: 0;
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--radius-sm);
+  background-color: var(--color-background);
+  color: var(--color-accent);
+}
+
+.activity__status {
+  padding: 0.3rem 0.6rem;
+  color: var(--color-statusInfo);
+}
+
+.activity__reconnect {
+  min-height: var(--touch);
+  padding: 0.5rem 1rem;
+  font: inherit;
+  color: var(--color-background);
+  background-color: var(--color-button);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+/* Diff markers: the +/- prefix is textual DATA (Req 3.4); color is additive. */
+.activity__diff-line--added {
+  color: var(--color-statusSuccess);
+}
+
+.activity__diff-line--removed {
+  color: var(--color-statusError);
+}
+
+
+/* ===================================================================== *
+ * Preview_Pane (Task 5.3, Req 4.1–4.6, 4.10, 4.11)                      *
+ * ===================================================================== */
+
 .preview {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  width: 100%;
   padding: 0.75rem;
   background-color: var(--color-surface);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius);
 }
 
 .preview__frame {
   width: 100%;
   min-height: 20rem;
   border: 1px solid var(--color-badge);
+  border-radius: var(--radius-sm);
   background-color: var(--color-background);
 }
 
@@ -195,29 +546,28 @@ body {
 .preview__status {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  background-color: var(--color-surface);
-  color: var(--color-status-info);
+  color: var(--color-statusInfo);
 }
 
 .preview__cause {
   margin: 0;
   padding: 0.25rem 0.75rem;
-  color: var(--color-status-warning);
+  color: var(--color-statusWarning);
 }
 
 .preview__url-error {
   margin: 0;
   padding: 0.5rem 0.75rem;
-  color: var(--color-status-error);
+  color: var(--color-statusError);
 }
 
 .preview__restart {
-  /* Touch target: comfortably >=44px tall (Req 11.3). */
-  min-height: 2.75rem;
+  min-height: var(--touch);
   padding: 0.5rem 1rem;
   color: var(--color-background);
   background-color: var(--color-button);
   border: none;
+  border-radius: var(--radius-sm);
   cursor: pointer;
 }
 
@@ -234,37 +584,33 @@ body {
 }
 
 .preview__mobile-url {
-  /* Selectable connection URL (Req 4.10). */
   user-select: all;
   word-break: break-all;
   padding: 0.25rem 0.5rem;
   background-color: var(--color-background);
   color: var(--color-accent);
   border: 1px solid var(--color-badge);
+  border-radius: var(--radius-sm);
 }
 
 .preview__mobile-qr {
   width: 12rem;
   height: 12rem;
   max-width: 100%;
+  /* The QR must be true monochrome on white to scan reliably; this is not a
+     themeable surface color. */
   background-color: #ffffff;
   image-rendering: pixelated;
 }
 
 
-/*
- * Confirm view (spec Task 6.1, Req 5.1 / 5.3 / 11.3). One card per pending
- * Confirm_Prompt; palette-driven colors only (var(--color-*)); approve/deny
- * controls are touch-sized (>=44px hit target) so they are operable by touch on
- * a phone. Full-width, border-box, single column — no horizontal overflow of
- * the primary column at a 360px viewport.
- */
+/* ===================================================================== *
+ * Confirm approvals (Task 6.1, Req 5.1 / 5.3 / 11.3)                    *
+ * ===================================================================== */
+
 .confirm {
   display: block;
   width: 100%;
-  max-width: 48rem;
-  margin: 0 auto;
-  padding: 0.75rem;
 }
 
 .confirm[hidden] {
@@ -277,7 +623,7 @@ body {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 0.5rem;
 }
 
 .confirm__card {
@@ -286,8 +632,8 @@ body {
   gap: 0.5rem;
   padding: 0.75rem;
   background-color: var(--color-surface);
-  border: 1px solid var(--color-status-warning);
-  border-radius: 0.5rem;
+  border: 1px solid var(--color-statusWarning);
+  border-radius: var(--radius);
 }
 
 .confirm__command {
@@ -299,7 +645,7 @@ body {
 
 .confirm__reason {
   margin: 0;
-  color: var(--color-status-info);
+  color: var(--color-statusInfo);
   word-break: break-word;
 }
 
@@ -311,14 +657,13 @@ body {
 
 .confirm__approve,
 .confirm__deny {
-  /* Touch target: comfortably >=44px tall/wide (Req 11.3). */
-  min-height: 2.75rem;
-  min-width: 2.75rem;
+  min-height: var(--touch);
+  min-width: var(--touch);
   padding: 0.6rem 1.25rem;
   font: inherit;
   font-weight: 600;
   border: none;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-sm);
   cursor: pointer;
 }
 
@@ -329,5 +674,251 @@ body {
 
 .confirm__deny {
   color: var(--color-background);
-  background-color: var(--color-status-error);
+  background-color: var(--color-statusError);
+}
+
+
+/* Narrow-phone tuning (Req 11.2): at 360px the primary column must not scroll
+   horizontally. Everything above is border-box + width:100% + min-width:0, so
+   nothing overflows; here we just tighten spacing and let the mode switch wrap. */
+@media (max-width: 400px) {
+  .shell__body {
+    padding: 0.6rem;
+    gap: 0.6rem;
+  }
+  .session-header {
+    padding: 0.4rem 0.6rem;
+    gap: 0.5rem;
+  }
+  .session-header__context {
+    margin-left: 0;
+    width: 100%;
+  }
+}
+
+
+
+/* ===================================================================== *
+ * Settings surfaces (Tasks 14 / 15.1, Req 12–15, 11.3)                  *
+ *                                                                       *
+ * Palette-driven like the rest of the shell — every color reads a       *
+ * --color-* custom property, never a literal. Controls a user taps are  *
+ * touch-sized (min-height: var(--touch)) so the settings surfaces are   *
+ * operable on a phone (Req 11.3). Shown/hidden by the router (app.js).  *
+ * ===================================================================== */
+
+.shell__settings-toggle {
+  min-height: var(--touch);
+  min-width: var(--touch);
+  padding: 0.35rem 0.9rem;
+  margin-left: auto;
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-accent);
+  background-color: var(--color-badge);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.settings {
+  width: 100%;
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: var(--space);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space);
+}
+
+.settings[hidden] {
+  display: none;
+}
+
+.settings__section {
+  padding: var(--space);
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.settings__heading {
+  margin: 0;
+  font-size: 1.1rem;
+  color: var(--color-accent);
+}
+
+.settings__subheading {
+  margin: 0.4rem 0 0.2rem;
+  font-size: 0.95rem;
+  color: var(--color-accent);
+}
+
+.settings__label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--color-accent);
+  margin-bottom: 0.25rem;
+}
+
+.settings__field {
+  display: block;
+  width: 100%;
+}
+
+.settings__active,
+.settings__outcome,
+.settings__notice {
+  margin: 0;
+  color: var(--color-accent);
+}
+
+.settings__notice {
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius-sm);
+  background-color: var(--color-surface);
+  color: var(--color-statusWarning);
+}
+
+.settings__notice[hidden] {
+  display: none;
+}
+
+.settings__select,
+.settings__input,
+.settings__textarea,
+.settings__connector-secret {
+  width: 100%;
+  min-height: var(--touch);
+  padding: 0.6rem 0.75rem;
+  font: inherit;
+  color: var(--color-accent);
+  background-color: var(--color-background);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius-sm);
+}
+
+.settings__textarea {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.settings__button {
+  min-height: var(--touch);
+  min-width: var(--touch);
+  padding: 0.6rem 1.1rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--color-background);
+  background-color: var(--color-button);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.settings__button--small {
+  min-width: auto;
+  padding: 0.4rem 0.75rem;
+  color: var(--color-accent);
+  background-color: var(--color-badge);
+}
+
+.settings__button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.settings__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.settings__list-item {
+  padding: 0.4rem 0.6rem;
+  background-color: var(--color-background);
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius-sm);
+  color: var(--color-accent);
+  word-break: break-word;
+}
+
+.settings__connectors {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.settings__connector {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  border: 1px solid var(--color-badge);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-background);
+}
+
+.settings__connector-name {
+  font-weight: 600;
+  color: var(--color-accent);
+  min-width: 6rem;
+}
+
+.settings__connector-secret {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+
+.settings__connector-bound {
+  font-size: 0.85rem;
+  color: var(--color-statusWarning);
+}
+
+.settings__connector-bound[data-bound="true"] {
+  color: var(--color-statusSuccess);
+}
+
+.settings__memory-entry {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.settings__memory-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.settings__share-url {
+  cursor: text;
+}
+
+.settings__share-url[hidden] {
+  display: none;
+}
+
+/* Narrow-phone tuning (Req 11.2): the settings column must not scroll
+   horizontally at 360px. All controls are width:100% / min-width:0, so nothing
+   overflows; connector rows stack their controls. */
+@media (max-width: 400px) {
+  .settings {
+    padding: 0.6rem;
+    gap: 0.6rem;
+  }
+  .settings__connector {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .settings__connector-name {
+    min-width: 0;
+  }
 }
