@@ -32,6 +32,9 @@ import { createPreviewController } from './preview.js';
 import { createPreviewPoll } from './preview-poll.js';
 import { createConfirmController } from './confirm.js';
 import { createProjectsController } from './projects.js';
+import { createWorkspaceController } from './workspace.js';
+import { createThemeController } from './theme.js';
+import { createWorkModeController } from './work-mode.js';
 import { createPromptView } from './views/prompt.js';
 import {
   createActivityStreamView,
@@ -40,12 +43,12 @@ import {
 import { createPreviewPaneView } from './views/preview-pane.js';
 import { createConfirmView } from './views/confirm.js';
 import { createProjectsView } from './views/projects.js';
+import { createLayoutView } from './views/layout.js';
+import { createSessionHeaderView } from './views/session-header.js';
+import { createWorkspaceControlsView } from './views/workspace-controls.js';
 
 /** The DOM node the client mounts into (declared in index.html). */
 const ROOT_ID = 'app';
-
-/** The human-facing product title shown in the initial shell. */
-const APP_TITLE = 'AI App Builder';
 
 /**
  * Wire the client's real collaborators. Pure of the DOM so it is unit-testable:
@@ -128,6 +131,52 @@ export function createClient(deps = {}) {
       api,
       openSession: (projectId) => openSession(client, projectId),
     });
+  // The workspace-shell controllers (Tasks 10.1 / 11.1 / 12.1). All three share
+  // the SAME store + gated api client so the Bearer flows and every applied
+  // frame lands in the one observable state the views read:
+  //   - workspace: Workspace_Experience select → POST /workspace-experience,
+  //     applied as LAYOUT ONLY (Req 8) — the store reducer enforces non-mutation.
+  //   - theme:     the 8-theme catalog + preview/commit/cancel → POST/GET /theme,
+  //     applying the palette to document.documentElement's CSSOM (Req 9). In a
+  //     browser the styleTarget defaults to the real documentElement.style; a
+  //     test injects a recorder.
+  //   - workMode:  the Session_Header mode switch → POST /work-mode (Req 10).
+  client.workspace = deps.workspace ?? createWorkspaceController({ store, api });
+  client.theme = deps.theme ?? createThemeController({ store, api });
+  client.workMode = deps.workMode ?? createWorkModeController({ store, api });
+
+  // Per-account presentation bootstrap (Req 8.5, 9.8): the default
+  // Workspace_Experience and committed Theme are read ONCE, when a Bearer_Token
+  // first becomes held (both endpoints are gated, so they need a token). The
+  // experience read must precede the theme read because a Theme is committed per
+  // (account, experience) pair, so the theme controller resolves the current
+  // experience from the store the workspace read just populated. Guarded so it
+  // fires exactly once per login. A test that injects its own controllers can
+  // still drive bootstrap() directly.
+  if (deps.bootstrapPresentation !== false) {
+    let bootstrapped = false;
+    const runPresentationBootstrap = async () => {
+      if (bootstrapped) return;
+      bootstrapped = true;
+      try {
+        await client.workspace.bootstrap();
+        await client.theme.bootstrap();
+      } catch {
+        // A failed bootstrap leaves the stylesheet :root fallback / default
+        // layout in effect; a later frame corrects it. Never throws.
+      }
+    };
+    if (store.getState().auth.hasToken) {
+      void runPresentationBootstrap();
+    } else if (typeof store.subscribe === 'function') {
+      const unsub = store.subscribe((s) => s.auth, (auth) => {
+        if (auth && auth.hasToken) {
+          unsub();
+          void runPresentationBootstrap();
+        }
+      });
+    }
+  }
   return client;
 }
 
@@ -151,6 +200,12 @@ export function openSession(client, projectId) {
   // ONLY mechanism that detects a dead preview the backend does not push.
   if (client.previewPoll && typeof client.previewPoll.start === 'function') {
     client.previewPoll.start(projectId);
+  }
+  // Read the Session's active Work_Mode + offered choices (Req 10.1/10.2). Until
+  // it resolves the store's `vibe` default stands (Req 10.5). Fire-and-forget:
+  // the header re-renders reactively when the frame lands.
+  if (client.workMode && typeof client.workMode.bootstrap === 'function') {
+    void client.workMode.bootstrap();
   }
   return {
     disconnect() {
@@ -177,65 +232,95 @@ export function createInitialView(doc, client) {
   const main = doc.createElement('main');
   main.className = 'app-shell';
 
-  const title = doc.createElement('h1');
-  title.className = 'app-shell__title';
-  title.textContent = APP_TITLE;
-
-  main.append(title);
-
   const views = [];
-  // Mount the prompt view (Task 3.2) so the prompt box renders and submits.
-  // Guarded: if collaborators are absent (e.g. a minimal test), the shell still
-  // renders its title rather than throwing.
-  if (client && client.store && client.builder) {
+
+  // ---- The chat-first workspace shell (Tasks 10.1 / 11.1 / 12.1) ----------
+  //
+  // The shell is a calm single main column with a persistent slim top header:
+  //   - the Session_Header (Task 12.1) is the slim top bar — the active
+  //     Work_Mode + a touch-sized switch, plus the experience + theme selectors
+  //     (views/workspace-controls.js) and the current experience/theme context.
+  //     It is ALWAYS visible, including at 360px (Req 11.4).
+  //   - the layout view (Task 10.1) arranges the conversation surfaces
+  //     (activityStream, compose=prompt, confirm) in the main column and the
+  //     Preview as a secondary panel, per the active Workspace_Experience — and
+  //     collapses to ONE column for mobile-command-center / phone widths
+  //     (Req 8.3, 11.1). Selecting an experience re-arranges LAYOUT ONLY.
+  //
+  // Guarded so a minimal test (no collaborators) still renders a shell rather
+  // than throwing.
+  if (client && client.store) {
+    // The conversation compose box (the prompt view) — the chat-first primary.
     const prompt = createPromptView({
       doc,
       store: client.store,
       controller: client.builder,
     });
-    main.append(prompt.el);
     views.push(prompt);
-  }
 
-  // Mount the Activity_Stream view (Task 4.3) alongside the prompt so the live
-  // reasoning/tool/diff feed and the connection state render in the shell. The
-  // SSE stream itself is opened by openSession() when a Project_Session opens.
-  if (client && client.store) {
+    // The live Activity_Stream feed.
     const activity = createActivityStreamView({
       doc,
       store: client.store,
       sse: client.sse,
     });
-    main.append(activity.el);
     views.push(activity);
-  }
 
-  // Mount the Preview_Pane view (Task 5.3) beside the activity feed so the live
-  // preview (same-origin iframe), its lifecycle indicators, the restart control,
-  // and the mobile connection URL + QR render in the shell.
-  if (client && client.store) {
+    // The secondary Preview panel (same-origin iframe + lifecycle + mobile QR).
     const preview = createPreviewPaneView({
       doc,
       store: client.store,
       controller: client.preview,
     });
-    main.append(preview.el);
     views.push(preview);
-  }
 
-  // Mount the Confirm view (Task 6.1) so a `confirm_request` frame renders its
-  // approve/deny controls, stays visible while unanswered (Req 5.3), and is
-  // re-displayed idempotently on reconnect replay keyed by requestId (Req 5.4).
-  // The controller posts the decision to /confirm; the view reads the
-  // store.pendingConfirms slice frames.js populates.
-  if (client && client.store && client.confirm) {
+    // The confirm approvals surface — rendered in the main column so a
+    // confirm_request is front-and-centre while unanswered (Req 5.3).
     const confirm = createConfirmView({
       doc,
       store: client.store,
       controller: client.confirm,
     });
-    main.append(confirm.el);
     views.push(confirm);
+
+    // The experience + theme selectors (embedded in the header's context).
+    const controls = createWorkspaceControlsView({
+      doc,
+      store: client.store,
+      workspace: client.workspace,
+      theme: client.theme,
+    });
+    views.push(controls);
+
+    // The slim top bar: the Work_Mode switch + the embedded controls.
+    const sessionHeader = createSessionHeaderView({
+      doc,
+      store: client.store,
+      controller: client.workMode,
+      controls,
+    });
+    views.push(sessionHeader);
+
+    // A wrapper so the compose box + confirm flow in the main column together as
+    // one "compose" surface beneath the activity feed.
+    const composeWrap = doc.createElement('div');
+    composeWrap.className = 'shell__compose';
+    composeWrap.append(confirm.el, prompt.el);
+
+    // The chat-first layout arranges the surfaces per the active experience and
+    // re-arranges (layout only) on a workspace_experience frame (Req 8.3, 11.1).
+    const layout = createLayoutView({
+      doc,
+      store: client.store,
+      surfaces: {
+        sessionHeader,
+        activityStream: activity,
+        compose: { el: composeWrap },
+        preview,
+      },
+    });
+    views.push(layout);
+    main.append(layout.el);
   }
 
   // Mount the project-creation form view (Task 9.1). It is shown ONLY when the

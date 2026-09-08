@@ -123,6 +123,12 @@ const STATIC_ASSETS = {
   '/auth.js': 'auth.js', // Task 8.2
   '/projects.js': 'projects.js', // Task 9.1
   '/views/projects.js': 'views/projects.js', // Task 9.1
+  '/workspace.js': 'workspace.js', // Task 10.1
+  '/views/layout.js': 'views/layout.js', // Task 10.1
+  '/theme.js': 'theme.js', // Task 11.1
+  '/work-mode.js': 'work-mode.js', // Task 12.1
+  '/views/session-header.js': 'views/session-header.js', // Task 12.1
+  '/views/workspace-controls.js': 'views/workspace-controls.js', // Tasks 10.1/11.1
 };
 
 /** Content-Type by file extension for the served static assets. */
