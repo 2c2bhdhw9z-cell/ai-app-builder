@@ -1446,28 +1446,53 @@ test('serverOptions() now injects every settings backing service as a usable obj
   }
 });
 
-test('build/deploy is DELIBERATELY left unwired — projectLifecycle is not injected (honest 405)', async () => {
-  // There is no real build/deploy engine in the repo. Rather than fabricate a
-  // fake that pretends to succeed, the composition injects NO projectLifecycle,
-  // so POST /settings/build and /settings/deploy honestly stay 405 in the live
-  // boot. If a future ProjectLifecycle is composed, this assertion is the
-  // reminder to update the honesty contract deliberately.
+test('build/deploy is now WIRED to a real engine — projectLifecycle is injected and the routes answer', async () => {
+  // THE HONESTY CONTRACT, DELIBERATELY UPDATED. This test previously asserted the
+  // OPPOSITE: build/deploy was left unwired (405) because `build-service.js`'s two
+  // work boundaries were inert seams, and injecting a projectLifecycle over them
+  // would have returned a fabricated success. Both boundaries are now REAL —
+  // src/project/container-build.js runs the project's own build script inside its
+  // Isolation_Boundary, and src/project/self-hosted-deploy.js publishes the artifact
+  // to a location this platform serves — so the honest state is the reverse: the
+  // engine is composed and the routes are reachable. What must NOT come back is a
+  // success reported for work that did not happen, which is asserted here (a project
+  // with no build script gets a NON-success outcome) and in detail in
+  // test/build-deploy-engine.test.js.
   const { dir, cleanup } = tempDataDir();
   const { runtime, composed } = makeRuntime({ dir });
-  assert.equal(Object.hasOwn(runtime.serverOptions(), 'projectLifecycle'), false, 'projectLifecycle must NOT be injected');
+  assert.equal(Object.hasOwn(runtime.serverOptions(), 'projectLifecycle'), true, 'the real build/deploy engine must be injected');
+  assert.equal(Object.hasOwn(runtime.serverOptions(), 'publishedSites'), true, 'the published-site read side must be injected');
 
   const srv = await startServer({ runtime, composed });
   try {
     const { token } = await srv.login('alice');
     const auth = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+    const created = await createProject(srv.base, token);
+    const projectId = (await created.json()).id;
+
     for (const route of ['/settings/build', '/settings/deploy']) {
       const res = await fetch(`${srv.base}${route}`, {
         method: 'POST',
         headers: auth,
-        body: JSON.stringify({ projectId: 'p' }),
+        body: JSON.stringify({ projectId }),
       });
-      assert.equal(res.status, 405, `${route} must stay 405 (no build/deploy engine exists)`);
+      assert.notEqual(res.status, 405, `${route} must be routed now that the engine is real`);
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      // A blank Project has no build script, so the ONLY honest answer is a
+      // non-success outcome with a reason — never { outcome: 'succeeded' }.
+      assert.notEqual(body.outcome, 'succeeded', `${route} must not fabricate a success`);
+      assert.equal(typeof body.summary, 'string');
     }
+
+    // An unresolvable project is still denied at the gate, disclosing nothing.
+    const unknown = await fetch(`${srv.base}/settings/build`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ projectId: 'no-such-project' }),
+    });
+    assert.equal(unknown.status, 401);
+    assert.deepEqual(await unknown.json(), { error: 'access denied' });
   } finally {
     await srv.close();
     cleanup();
@@ -1719,12 +1744,17 @@ test('the full settings-service bundle spreads through startPlatformServer with 
       const res = await fetch(`${base}${url}`);
       assert.equal(res.status, 401, `${url} is routed + gated in the live process (401, not 405)`);
     }
-    // build/deploy stay 405 in the live process too (deliberately unwired).
+    // build/deploy are ROUTED in the live process now that the engine behind the
+    // build/deploy boundaries is real (they were 405 while it was an inert seam).
+    // No token -> the same non-disclosing 401 as every other project route.
     for (const url of ['/settings/build', '/settings/deploy']) {
       const res = await fetch(`${base}${url}`, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ projectId: 'p' }),
       });
-      assert.equal(res.status, 405, `${url} stays 405 in the live process (no engine)`);
+      assert.equal(res.status, 401, `${url} is routed + gated in the live process (401, not 405)`);
+      assert.deepEqual(await res.json(), { error: 'access denied' });
     }
   } finally {
     await api.close();

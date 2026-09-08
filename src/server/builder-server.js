@@ -183,6 +183,46 @@ export function securityHeaders() {
   };
 }
 
+/**
+ * URL prefix a self-hosted PUBLISHED build output is served under (see
+ * handlePublishedSite and src/project/self-hosted-deploy.js). Kept as a module
+ * constant so the served namespace is auditable at a glance.
+ */
+export const PUBLISHED_PREFIX = '/live';
+
+/**
+ * The response headers a PUBLISHED document is served with, on top of the baseline
+ * security headers.
+ *
+ * WHY THIS IS NOT JUST THE BASELINE. A published site is generated, untrusted code,
+ * and the platform serves it from its OWN origin. Under the baseline CSP alone
+ * (`script-src 'self'`) that code would execute as same-origin script and could read
+ * the Web UI's own session storage — i.e. steal the caller's Bearer_Token. So the
+ * baseline policy is kept verbatim and the CSP `sandbox` directive is APPENDED,
+ * which (a) blocks script execution in the document outright and (b) gives it an
+ * opaque origin, so even if a script ran it could not reach the platform origin's
+ * storage. This is strictly STRICTER than the baseline — nothing is relaxed.
+ *
+ * The honest consequence, documented in docs/DEPLOY.md: a self-hosted publish serves
+ * the built output as INERT documents. A deployed app whose JavaScript must actually
+ * run needs a separate origin, which is a follow-up rather than a silent CSP hole.
+ *
+ * PURE, so the exact policy is unit-testable and cannot drift.
+ *
+ * @param {string} baselineCsp  the baseline content-security-policy value
+ * @returns {Record<string,string>}
+ */
+export function publishedSiteHeaders(baselineCsp) {
+  return {
+    // Append, never replace: every baseline directive still applies.
+    'content-security-policy': `${baselineCsp}; sandbox`,
+    // A published release is swapped atomically; never let a proxy pin one.
+    'cache-control': 'no-store',
+    // A capability URL must not end up in a search index.
+    'x-robots-tag': 'noindex, nofollow',
+  };
+}
+
 /** A single, non-disclosing access-denied body. Never varies by cause. */
 const ACCESS_DENIED = { error: 'access denied' };
 
@@ -573,6 +613,14 @@ export function themeFrame({ theme, palette, previewed, experience } = {}) {
  *        from the token (a service denial collapses to the non-disclosing 401).
  * @param {string} [opts.shareLinkBaseUrl]  OPTIONAL base URL for building a
  *        Share_Link URL from a token (else a relative /share/<token> path).
+ * @param {{lookup:Function}} [opts.publishedSites]  OPTIONAL read side of a
+ *        self-hosted deploy (src/project/self-hosted-deploy.js). When present,
+ *        GET /live/<projectId>/<target>/<signature>/<path> serves a PUBLISHED
+ *        build output. See handlePublishedSite for the safety contract — the
+ *        request path is only ever a manifest KEY, the URL signature is an
+ *        unguessable capability, and published documents are served under an
+ *        ADDITIONALLY SANDBOXED CSP so generated script cannot run on the
+ *        platform's origin.
  * @param {number} [opts.confirmTimeoutMs=60000]  fail-closed confirm ceiling.
  * @param {() => number} [opts.now]       injectable clock.
  * @returns {object} frozen server handle.
@@ -605,6 +653,7 @@ export function createBuilderServer(opts = {}) {
     lockinAudit, // GET /settings/lockin-audit (per-project)    Req 15.4
     shareLinkService, // POST /settings/share (per-project)          Req 15.5
     projectLifecycle, // POST /settings/build + /settings/deploy (per-project) Req 15.1/15.2
+    publishedSites, // GET /live/... (self-hosted deploy read side, capability URL)
     shareLinkBaseUrl, // OPTIONAL base for building a Share_Link URL from a token
     provider,
     model,
@@ -982,6 +1031,23 @@ export function createBuilderServer(opts = {}) {
       return handleStaticAsset(res, pathname);
     }
 
+    // A PUBLISHED build output from a self-hosted deploy (Req 15.2). STRICTLY
+    // ADDITIVE: only routed when a publishedSites read side is injected, so with
+    // none composed this namespace 405s exactly as any unknown route always has.
+    //
+    // Placed with the other unauthenticated GET paths BY DESIGN: a deployed site
+    // has to be openable in a browser, which could never send a Bearer_Token. It is
+    // not open access — the URL carries an unguessable capability signature, exactly
+    // like a read-only Share_Link — and nothing that previously required
+    // authorization becomes reachable through it. See handlePublishedSite.
+    if (
+      publishedSites &&
+      req.method === 'GET' &&
+      (pathname === PUBLISHED_PREFIX || pathname.startsWith(`${PUBLISHED_PREFIX}/`))
+    ) {
+      return handlePublishedSite(res, pathname);
+    }
+
     if (req.method === 'GET' && pathname === '/events') return handleEvents(req, res);
     if (req.method === 'POST' && pathname === '/message') return handleMessage(req, res);
     if (req.method === 'POST' && pathname === '/confirm') return handleConfirm(req, res);
@@ -1124,6 +1190,77 @@ export function createBuilderServer(opts = {}) {
       'cache-control': 'no-cache',
     });
     res.end(body);
+  }
+
+  // -------- GET /live/... — a PUBLISHED build output (self-hosted deploy)
+
+  /**
+   * Serve one file from a project's PUBLISHED build output.
+   *
+   * THE URL: `/live/<projectId>/<target>/<signature>/<path...>`. The `signature` is
+   * an unguessable, key-derived capability over (owner, project, target) — knowing a
+   * projectId is not enough — so this is the same capability model as a read-only
+   * Share_Link rather than open access.
+   *
+   * THE SAFETY CONTRACT, mirroring the fixed STATIC_ASSETS allow-list above:
+   *   - this handler performs NO filesystem access at all. It splits the URL and
+   *     hands the raw request path to `publishedSites.lookup`, which uses it ONLY as
+   *     a KEY into the manifest written at publish time and returns the response
+   *     bytes. The request path is never joined onto a path here or there, so there
+   *     is no traversal surface;
+   *   - a directory is served only if the publish recorded an `index.html` for it;
+   *     there is NO directory listing, ever;
+   *   - every miss — malformed URL, unknown project, wrong signature, no release,
+   *     an unlisted path — is the SAME generic 404 with a fixed body, so nothing
+   *     about what exists is disclosed;
+   *   - the response carries the baseline security headers PLUS a sandboxed CSP
+   *     (publishedSiteHeaders), so generated script cannot execute on the platform's
+   *     origin and read the Web UI's session storage.
+   */
+  async function handlePublishedSite(res, pathname) {
+    const notFound = () => {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('not found');
+    };
+
+    if (!pathname.startsWith(`${PUBLISHED_PREFIX}/`)) return notFound();
+    const segments = pathname.slice(PUBLISHED_PREFIX.length + 1).split('/');
+    if (segments.length < 3) return notFound();
+    const [rawProjectId, rawTarget, signature] = segments;
+
+    // The path WITHIN the published site. `/live/p/web/sig` and `/live/p/web/sig/`
+    // both address the site root, which the manifest records as '/'.
+    let requestPath;
+    try {
+      requestPath = `/${segments.slice(3).map((part) => decodeURIComponent(part)).join('/')}`;
+    } catch {
+      // An undecodable escape is a malformed request, not a 500.
+      return notFound();
+    }
+    let projectId;
+    let target;
+    try {
+      projectId = decodeURIComponent(rawProjectId);
+      target = decodeURIComponent(rawTarget);
+    } catch {
+      return notFound();
+    }
+
+    let found;
+    try {
+      found = await publishedSites.lookup({ projectId, target, signature, requestPath });
+    } catch {
+      // The read side is documented never to throw; if it ever does, that must be a
+      // generic 404 rather than a 500 disclosing a control-plane path.
+      return notFound();
+    }
+    if (!found || found.ok !== true || !found.body) return notFound();
+
+    res.writeHead(200, {
+      'content-type': typeof found.contentType === 'string' ? found.contentType : 'application/octet-stream',
+      ...publishedSiteHeaders(baselineHeaders['content-security-policy']),
+    });
+    res.end(found.body);
   }
 
   // -------- delegated login — only routed when a LoginFlow is injected

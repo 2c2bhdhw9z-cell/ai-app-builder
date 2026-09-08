@@ -47,6 +47,8 @@ const SNAPSHOTS_DIR = 'snapshots'; // Snapshot registry/metadata (out-of-tree on
 const USER_SKILLS_DIR = 'user-skills'; // per-owner User_Skill library (out-of-tree)
 const GLOBAL_MEMORY_DIR = 'global-memory'; // per-owner Global_Memory store (out-of-tree)
 const PRESENTATION_DIR = 'presentation'; // per-owner UserPresentationSettings (out-of-tree)
+const BUILD_ARTIFACTS_DIR = 'build-artifacts'; // Deployment_Artifact bytes (out-of-tree)
+const PUBLISHED_DIR = 'published'; // self-hosted published build output (out-of-tree)
 
 /**
  * Create a storage layout rooted at `baseDir`. `exportRoot` and `controlRoot`
@@ -229,6 +231,47 @@ class StorageLayout {
     return this.assertOutsideExportTrees(
       path.join(this.controlRoot, PRESENTATION_DIR, ownerId, 'presentation.json'),
       'controlPresentationSettingsPath',
+    );
+  }
+
+  /**
+   * Where a Target's Deployment_Artifact BYTES are written (control-plane, out of
+   * every tree). A build product is not source: it must never enter an exported
+   * tree, and it must not collapse across accounts, so it is keyed by ownerId
+   * FIRST and then by projectId + Target. Keying on projectId alone would put two
+   * accounts' artifacts in one directory tree, breaking the per-owner storage-path
+   * isolation axis (Req 7.6) that every other control path here preserves.
+   */
+  controlBuildArtifactPath(ownerId, projectId, target) {
+    requireId('ownerId', ownerId);
+    requireId('projectId', projectId);
+    requireId('target', target);
+    return this.assertOutsideExportTrees(
+      path.join(this.controlRoot, BUILD_ARTIFACTS_DIR, ownerId, projectId, `${target}.artifact`),
+      'controlBuildArtifactPath',
+    );
+  }
+
+  /**
+   * Where a Target's PUBLISHED build output lives for a self-hosted deploy
+   * (control-plane, out of every tree). This is the directory the platform itself
+   * serves a deployed site from, so it is deliberately NOT inside the project's
+   * exportable tree: an export must produce the project's SOURCE, not a copy of a
+   * published release, and a published release must not be reachable through any
+   * in-tree path. Keyed by ownerId first for the same per-owner isolation reason
+   * as controlBuildArtifactPath.
+   *
+   * The publisher keeps `releases/<releaseId>/` directories beneath this path plus
+   * a `current` symlink, so a new release is swapped in atomically and a failed
+   * publish leaves the previous release byte-for-byte unchanged.
+   */
+  controlPublishedSitePath(ownerId, projectId, target) {
+    requireId('ownerId', ownerId);
+    requireId('projectId', projectId);
+    requireId('target', target);
+    return this.assertOutsideExportTrees(
+      path.join(this.controlRoot, PUBLISHED_DIR, ownerId, projectId, target),
+      'controlPublishedSitePath',
     );
   }
 
