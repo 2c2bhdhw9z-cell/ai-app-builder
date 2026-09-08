@@ -266,17 +266,20 @@ export const THEME_CATALOG = Object.freeze({
 /**
  * The default Theme applied when a user first enters a Workspace_Experience for
  * which they have committed no Theme (Req 29.3). Keyed by ALL FIVE
- * Workspace_Experience values; each maps to a valid Theme id. Entering an
- * experience with no committed Theme applies THAT experience's default; the
- * user may then commit a different Theme for that experience. Exported so the
- * ThemeStore and any caller share one source of truth (cross-ref Req
- * 29.1-29.3/29.5).
+ * Workspace_Experience values; each maps to a valid Theme id. Every experience
+ * defaults to a NEUTRAL base theme — `light` or `dark` — never a colored theme;
+ * the distinctive colored themes (e.g. "Summer Sunset", "Morning Dew") remain
+ * in the catalog and fully selectable, but they are OPT-IN only and are never a
+ * default. Entering an experience with no committed Theme applies THAT
+ * experience's neutral default; the user may then commit a different Theme
+ * (including a colored one) for that experience. Exported so the ThemeStore and
+ * any caller share one source of truth (cross-ref Req 29.1-29.3/29.5).
  */
 export const DEFAULT_THEME_BY_EXPERIENCE = Object.freeze({
   'kiro-style': 'light',
-  'vibe-first': 'summer-sunset',
+  'vibe-first': 'light',
   'technical-workbench': 'dark',
-  'mobile-command-center': 'morning-dew',
+  'mobile-command-center': 'light',
   custom: 'light',
 });
 
