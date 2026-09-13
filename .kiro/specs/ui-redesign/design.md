@@ -1,3 +1,18 @@
+> ## ⚠ SUPERSEDED IN PART — read `PLAN.md` first
+>
+> This document was written when the rewrite was scoped as **presentation only**
+> (a restyle of one shared screen). That scope was wrong. The agreed direction is
+> **Vibe mode and IDE mode as distinct interfaces over one shared project, with
+> Preview as its own full-bleed screen** — see `PLAN.md`, which is authoritative.
+>
+> **Still valid here:** the derived colour system (nine themeable inputs, everything
+> else derived), the WCAG AA contrast fix, and the type / space / radius / elevation
+> / motion scales. Those are built and tested.
+>
+> **No longer valid here:** anything describing the region grid, the five
+> per-experience geometries, the canvas + sheet Stage, or the preview as a panel
+> beside the agent.
+
 # Design Document: UI Redesign
 
 ## Overview
