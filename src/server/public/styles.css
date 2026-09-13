@@ -236,230 +236,243 @@ button {
 }
 
 /* ===================================================================== *
- * THE SHELL                                                              *
- * views/layout.js renders one container per region in the ACTIVE layout   *
- * descriptor and marks the shell with data-experience / data-orientation /*
- * data-regions, and each container with data-region / data-role /         *
- * data-size / data-emphasis. This file turns those attributes into        *
- * geometry. Those attributes are UNCHANGED by the redesign.               *
+ * THE STAGE — the shell. Replaces the region-grid layout.                *
+ *                                                                        *
+ * Structure, not skin. The old shell was a grid of named regions: a       *
+ * header strip, a conversation column, a preview panel, a dock. Every     *
+ * "experience" was a rearrangement of those same four boxes, which is     *
+ * the layout every AI builder ships.                                     *
+ *                                                                        *
+ * The Stage instead gives the whole screen to the app being built and     *
+ * puts the agent in a bottom sheet with three detents:                    *
+ *                                                                        *
+ *   peek  grip + status + chips + compose        (agent out of the way)   *
+ *   half  the above plus recent activity          (following along)       *
+ *   full  the whole stream, diffs, confirmations  (working in detail)     *
+ *                                                                        *
+ * On a wide viewport the same DOM becomes a docked side rail — one        *
+ * breakpoint, no second layout, no separate mobile stylesheet.            *
  * ===================================================================== */
 
-.shell {
+.stage {
+  position: relative;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  height: 100vh;
+  /* Never scrolls sideways: the 360px no-overflow guarantee. */
+  overflow-x: hidden;
+  background-color: var(--color-surfaceSunken);
+}
+
+/* ---- the canvas: the running app, full bleed. THE HERO. ---- */
+.stage__canvas {
+  position: absolute;
+  inset: 0;
+  min-width: 0;
+  max-width: 100%;
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
-  /* The shell never scrolls sideways — the 360px no-overflow guarantee. */
-  overflow-x: hidden;
+  overflow: hidden;
+}
+
+/* Inside the canvas the preview is not a card — it IS the surface. */
+.stage__canvas .preview {
+  flex: 1 1 auto;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
   background-color: var(--color-background);
 }
 
-.shell__main {
-  /* min-width:0 + width:100% are what actually prevent horizontal overflow. */
-  min-width: 0;
-  width: 100%;
+.stage__canvas .preview__frame {
   flex: 1 1 auto;
-  display: flex;
-  flex-direction: column;
-}
-
-.shell__body {
-  display: grid;
-  gap: var(--gap-region);
-  padding: var(--gap-region);
-  min-width: 0;
-  width: 100%;
-  align-items: start;
-  flex: 1 1 auto;
-}
-
-.shell__region {
-  min-width: 0;
-  max-width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: var(--gap-stack);
-}
-
-.shell__region[hidden] {
-  display: none;
-}
-
-.shell__surface {
-  min-width: 0;
-  max-width: 100%;
-  display: flex;
-  flex-direction: column;
   min-height: 0;
 }
 
-.shell__surface[hidden] {
-  display: none;
+/* ---- the hud: small floating chips over the canvas ---- */
+.stage__hud {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 3;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  /* The hud is a pass-through layer; only its children take pointer events, so
+     the canvas underneath stays fully interactive. */
+  pointer-events: none;
 }
 
-.shell__surface > [hidden] {
-  display: none;
+.stage__hud > * {
+  pointer-events: auto;
 }
 
-.shell__surface[data-size="flex"] {
-  flex: 1 1 auto;
-}
-
-.shell__surface[data-size="auto"] {
-  flex: 0 0 auto;
-}
-
-/* The descriptor's emphasis:primary — the ONE accent job on a screen. */
-.shell__surface[data-emphasis="primary"] {
-  border: 1px solid var(--color-accent);
-  border-radius: var(--radius-md);
-  padding: var(--pad-surface);
+/* ---- the sheet ---- */
+.sheet {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 4;
+  min-width: 0;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--gap-region) var(--space-4);
   background-color: var(--color-background);
-  box-shadow: var(--elev-1);
+  border-top: 1px solid var(--color-borderStrong);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  box-shadow: var(--elev-3);
+  transition: height var(--dur-base) var(--ease);
 }
 
-.shell__collapse-toggle {
+/* The grip: a real button, so the sheet works by tap and keyboard, not only by
+   drag. Sized to the touch floor. */
+.sheet__grip {
+  align-self: center;
   min-height: var(--touch);
   min-width: var(--touch);
-  display: inline-flex;
+  width: 4rem;
+  padding: 0;
+  background-color: transparent;
+  border: 0;
+  cursor: grab;
+  touch-action: none;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+
+.sheet__grip::before {
+  content: "";
+  width: 2.25rem;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background-color: var(--color-borderStrong);
+  transition: background-color var(--dur-fast) var(--ease);
+}
+
+.sheet__grip:hover::before {
+  background-color: var(--color-textSubtle);
+}
+
+/* The one line that is ALWAYS visible, at every detent. */
+.sheet__peek {
+  margin: 0;
+  flex: none;
+  display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: var(--space-2);
-  width: 100%;
-  padding: 0 var(--pad-control);
   font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
+  color: var(--color-textMuted);
+}
+
+.sheet__peek::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-radius: var(--radius-full);
+  background-color: var(--color-statusSuccess);
+}
+
+.stage[data-running="true"] .sheet__peek::before {
+  background-color: var(--color-statusInfo);
+}
+
+/* Everything conversational. Scrolls inside the sheet, never the page. */
+.sheet__scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-stack);
+  padding-right: var(--space-1);
+}
+
+/* ---- input: chips first, because typing on a phone is the fallback ---- */
+.sheet__chips {
+  flex: none;
+  display: flex;
+  gap: var(--space-2);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  padding-bottom: var(--space-1);
+}
+
+.sheet__chips::-webkit-scrollbar {
+  display: none;
+}
+
+.sheet__chip {
+  flex: none;
+  min-height: var(--touch);
+  padding: 0 var(--space-4);
+  font-size: var(--text-sm);
+  white-space: nowrap;
   color: var(--color-text);
-  background-color: var(--color-surfaceSunken);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  background-color: var(--color-background);
+  border: 1px solid var(--color-borderStrong);
+  border-radius: var(--radius-full);
   cursor: pointer;
   transition:
     background-color var(--dur-fast) var(--ease),
     border-color var(--dur-fast) var(--ease);
 }
 
-.shell__collapse-toggle:hover {
+.sheet__chip:hover {
   background-color: var(--color-hover);
-  border-color: var(--color-borderStrong);
 }
 
-.shell__settings-toggle {
-  min-height: var(--touch);
-  padding: 0 var(--pad-control);
-  font-size: var(--text-sm);
-  color: var(--color-textMuted);
-  background-color: transparent;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  transition:
-    color var(--dur-fast) var(--ease),
-    background-color var(--dur-fast) var(--ease);
-}
-
-.shell__settings-toggle:hover {
+/* Voice leads the row: it is the primary input on a phone. */
+.sheet__chip--voice {
   color: var(--color-text);
-  background-color: var(--color-hover);
-}
-
-.shell__attribution {
-  padding: var(--space-2) var(--gap-region);
-  font-size: var(--text-xs);
-  color: var(--color-textSubtle);
-}
-
-.shell__compose {
-  min-width: 0;
-  max-width: 100%;
-}
-
-/* --------------------------------------------------------------------- *
- * LAYER 6: the five Workspace_Experience geometries.                     *
- * Each is a genuinely different arrangement, and each pair differs.       *
- * --------------------------------------------------------------------- */
-
-/* kiro-style — two columns: work on the left, live preview on the right. */
-.shell[data-experience="kiro-style"] .shell__body {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 22rem);
-  grid-template-rows: minmax(0, 1fr);
-}
-
-/* vibe-first — one conversation-forward column, preview folded beneath. */
-.shell[data-experience="vibe-first"] .shell__body {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto auto;
-  grid-template-areas: "main" "aside";
-  max-width: var(--maxw);
-  margin: 0 auto;
-}
-
-.shell[data-experience="vibe-first"] .shell__region[data-region="aside"] {
-  grid-area: aside;
-}
-
-.shell[data-experience="vibe-first"] .shell__surface[data-emphasis="primary"] {
+  background-color: var(--color-accentTint);
   border-color: var(--color-accent);
-  box-shadow: var(--elev-2);
-  padding: var(--space-5);
+  font-weight: var(--weight-medium);
 }
 
-/* technical-workbench — an IDE cockpit: sidebar beside a large editor, with a
-   dock spanning the full width beneath both. */
-.shell[data-experience="technical-workbench"] .shell__body {
-  grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr) minmax(0, 18rem);
-  grid-template-areas:
-    "sidebar editor"
-    "dock dock";
-  height: calc(100vh - var(--header-h));
-  gap: 1px;
-  padding: 0;
-  /* The 1px gap over this background IS the pane seam. --color-badge is the
-     asserted token for it (web-ui-layout-geometry.test.js). */
-  background-color: var(--color-badge);
+.sheet__compose {
+  flex: none;
+  min-width: 0;
 }
 
-.shell[data-experience="technical-workbench"] .shell__region {
-  overflow: auto;
-  background-color: var(--color-background);
-  padding: var(--space-3);
+/* ---- detents ---- */
+
+/* peek: the agent is out of the way. The scroll region is gone entirely. */
+.sheet[data-detent="peek"] {
+  height: auto;
 }
 
-.shell[data-experience="technical-workbench"] .shell__region[data-region="sidebar"] {
-  grid-area: sidebar;
-  background-color: var(--color-surfaceSunken);
+.sheet[data-detent="peek"] .sheet__scroll {
+  display: none;
 }
 
-.shell[data-experience="technical-workbench"] .shell__region[data-region="editor"] {
-  grid-area: editor;
+.sheet[data-detent="half"] {
+  height: 54vh;
 }
 
-.shell[data-experience="technical-workbench"] .shell__region[data-region="dock"] {
-  grid-area: dock;
+.sheet[data-detent="full"] {
+  height: 92vh;
 }
 
-/* mobile-command-center — one stacked, touch-operable column. */
-.shell[data-experience="mobile-command-center"] .shell__body {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto;
-  gap: var(--space-3);
-  padding: var(--space-3);
+/* When the sheet is large it owns the surface, so square off the top corners and
+   drop the float — it is no longer an overlay, it is the screen. */
+.sheet[data-detent="full"] {
+  border-radius: 0;
+  box-shadow: none;
 }
 
-/* custom — starts as the kiro-style split until the user rearranges it. */
-.shell[data-experience="custom"] .shell__body {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 20rem);
-  grid-template-rows: auto;
-}
-
-/* --------------------------------------------------------------------- *
- * LAYER 4: density profiles, selected from data-experience.              *
- * Gaps and interior padding only. The SCALES never change, and --touch   *
- * is a floor in both profiles.                                          *
- * --------------------------------------------------------------------- */
-
-/* compact — the workbench cockpit */
-.shell[data-experience="technical-workbench"] {
+/* ---- density, tuned by experience. The experience TUNES, it never rearranges ---- */
+.stage[data-experience="technical-workbench"] {
   --gap-region: var(--space-2);
   --gap-stack: var(--space-2);
   --pad-surface: var(--space-3);
@@ -468,15 +481,64 @@ button {
   --stream-leading: var(--leading-snug);
 }
 
-/* comfortable — conversation-forward and phone */
-.shell[data-experience="vibe-first"],
-.shell[data-experience="mobile-command-center"] {
+.stage[data-experience="vibe-first"],
+.stage[data-experience="mobile-command-center"] {
   --gap-region: var(--space-4);
   --gap-stack: var(--space-3);
   --pad-surface: var(--space-5);
   --pad-control: var(--space-3);
   --row-h: 2.25rem;
   --stream-leading: var(--leading-normal);
+}
+
+/* ===================================================================== *
+ * WIDE VIEWPORT — the SAME DOM becomes a docked rail.                    *
+ * Not a second layout: the sheet stops being a bottom overlay and becomes *
+ * a right-hand column, and the canvas gives up that width.               *
+ * ===================================================================== */
+@media (min-width: 60rem) {
+  .stage {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 26rem);
+  }
+
+  .stage__canvas {
+    position: relative;
+    inset: auto;
+    grid-column: 1;
+  }
+
+  .stage__hud {
+    grid-column: 1;
+  }
+
+  .sheet {
+    position: relative;
+    grid-column: 2;
+    height: 100vh;
+    border-top: 0;
+    border-left: 1px solid var(--color-border);
+    border-radius: 0;
+    box-shadow: none;
+    padding-top: var(--space-3);
+  }
+
+  /* On a rail there is no drag affordance to make sense of, and every detent is
+     the same full-height column. */
+  .sheet__grip {
+    display: none;
+  }
+
+  .sheet[data-detent="peek"] .sheet__scroll,
+  .sheet[data-detent="half"],
+  .sheet[data-detent="full"] {
+    display: flex;
+    height: 100vh;
+  }
+
+  .sheet[data-detent="peek"] .sheet__scroll {
+    display: flex;
+  }
 }
 
 /* ===================================================================== *
@@ -1201,69 +1263,20 @@ button {
 }
 
 /* ===================================================================== *
- * RESPONSIVE — every experience folds to one column at phone width.      *
+ * NARROW PHONE TUNING                                                    *
+ * The Stage needs no column-collapse rule: it is single-column by         *
+ * construction and only GAINS a rail above 60rem. Tighten gutters at      *
+ * 360px, never the touch targets.                                        *
  * ===================================================================== */
 
-/* The explicit single-column hook views/layout.js sets on the shell. */
-.shell[data-single-column="true"] .shell__body {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: none;
-}
-
-@media (max-width: 720px) {
-  /* Attribute-presence selector, so this collapses EVERY experience — including
-     the workbench cockpit — rather than listing them. */
-  .shell[data-experience] .shell__body {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: none;
-    grid-template-rows: auto;
-    height: auto;
-    gap: var(--space-3);
-    padding: var(--space-3);
-    background-color: var(--color-background);
-  }
-
-  .shell[data-experience] .shell__region[data-region] {
-    grid-area: auto;
-    position: static;
-    overflow: visible;
-    padding: 0;
-  }
-
-  .session-header {
-    gap: var(--space-2);
-    padding: 0 var(--space-3);
-  }
-
-  .session-header__meta {
-    display: none;
-  }
-
-  /* Thumb reach: the compose surface stays pinned to the bottom of the viewport
-     on a phone, which is the whole point of the mobile command centre. */
-  .shell[data-experience="mobile-command-center"] .shell__compose {
-    position: sticky;
-    bottom: 0;
-    z-index: 4;
-    padding-top: var(--space-2);
-    background-color: var(--color-background);
-  }
-
-  .confirm__approve,
-  .confirm__deny {
-    flex: 1 1 100%;
-  }
-}
-
 @media (max-width: 400px) {
-  /* 360px tuning: tighten the gutters, never the touch targets. */
-  .shell[data-experience] .shell__body {
-    gap: var(--space-2);
-    padding: var(--space-2);
+  .stage {
+    --gap-region: var(--space-3);
   }
 
-  .session-header {
-    padding: 0 var(--space-2);
+  .sheet {
+    padding-left: var(--space-3);
+    padding-right: var(--space-3);
   }
 
   .activity__diff-line,
@@ -1271,8 +1284,9 @@ button {
     font-size: var(--text-xs);
   }
 
-  .prompt__submit {
-    padding: 0 var(--space-3);
+  .confirm__approve,
+  .confirm__deny {
+    flex: 1 1 100%;
   }
 }
 

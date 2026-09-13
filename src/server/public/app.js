@@ -43,7 +43,7 @@ import {
 import { createPreviewPaneView } from './views/preview-pane.js';
 import { createConfirmView } from './views/confirm.js';
 import { createProjectsView } from './views/projects.js';
-import { createLayoutView } from './views/layout.js';
+import { createStageView } from './views/stage.js';
 import { createFilePanelView } from './views/file-panel.js';
 import { createSessionHeaderView } from './views/session-header.js';
 import { createWorkspaceControlsView } from './views/workspace-controls.js';
@@ -347,29 +347,41 @@ export function createInitialView(doc, client) {
     });
     views.push(sessionHeader);
 
-    // A wrapper so the compose box + confirm flow in the main column together as
-    // one "compose" surface beneath the activity feed.
+    // The compose surface is JUST the prompt now. Confirmations are no longer
+    // stacked above it: they belong in the sheet's scroll region with the rest of
+    // the stream, so the compose row can stay pinned in thumb reach at every
+    // detent. The Stage places them (SLOT_OF_SURFACE.confirm === 'scroll').
     const composeWrap = doc.createElement('div');
-    composeWrap.className = 'shell__compose';
-    composeWrap.append(confirm.el, prompt.el);
+    composeWrap.className = 'sheet__compose-inner';
+    composeWrap.append(prompt.el);
 
-    // The layout view arranges ALL FIVE surfaces into the regions the ACTIVE
-    // Workspace_Experience's descriptor names, and re-arranges (layout only) on a
-    // workspace_experience frame (Req 8.3, 11.1, 27.2). Every surface named in
-    // the descriptors is supplied here, so each of the five experiences renders
-    // its own real geometry rather than a flattened one.
-    const layout = createLayoutView({
+    // ---- THE STAGE ------------------------------------------------------
+    // The shell. Gives the whole screen to the app being built and puts the
+    // agent in a bottom sheet with three detents (peek / half / full), which
+    // becomes a docked rail on a wide viewport. Surfaces are placed by IDENTITY
+    // into fixed slots (preview -> canvas, header -> hud, everything
+    // conversational -> sheet), so the backend descriptor no longer decides
+    // geometry. It still decides visibility, and the experience id still tunes
+    // the opening detent and the density. No backend contract changes.
+    const stage = createStageView({
       doc,
       store: client.store,
       surfaces: {
         sessionHeader,
         activityStream: activity,
+        confirm,
         compose: { el: composeWrap },
         preview,
         filePanel,
       },
+      onChip: (text) => {
+        // A chip is just a prompt the user did not have to type.
+        if (client.builder && typeof client.builder.submit === 'function') {
+          client.builder.submit(text);
+        }
+      },
     });
-    views.push(layout);
+    views.push(stage);
 
     // The settings toggle — a slim, touch-sized control in the header that flips
     // the router between the builder shell and the settings panel (Task 15.1).
@@ -411,7 +423,7 @@ export function createInitialView(doc, client) {
           ? client.router.getRoute()
           : 'builder';
       const showSettings = route === 'settings';
-      layout.el.hidden = showSettings;
+      stage.el.hidden = showSettings;
       settingsPanel.el.hidden = !showSettings;
       settingsToggle.setAttribute('aria-pressed', showSettings ? 'true' : 'false');
       settingsToggle.textContent = showSettings ? 'Close settings' : 'Settings';
@@ -431,7 +443,7 @@ export function createInitialView(doc, client) {
         : () => {};
     applyRoute();
 
-    main.append(layout.el, settingsPanel.el);
+    main.append(stage.el, settingsPanel.el);
     views.push({
       el: settingsToggle,
       destroy() {

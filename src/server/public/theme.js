@@ -268,10 +268,10 @@ export function deriveDecisions(palette) {
 
 /** The twelve derived custom property names, for tests and stylesheet authors. */
 export const DERIVED_VAR_NAMES = Object.freeze([
-  '--ink',
-  '--paper',
-  '--shadow-color',
-  ...PALETTE_KEYS.map((k) => `--on-${k}`),
+  '--color-ink',
+  '--color-paper',
+  '--color-shadow',
+  ...PALETTE_KEYS.map((k) => `--color-on${k[0].toUpperCase()}${k.slice(1)}`),
 ]);
 
 /**
@@ -330,10 +330,18 @@ export function applyDerivedDecisions(target, palette, element) {
     target.setProperty(name, value);
     set += 1;
   };
-  put('--ink', d.ink);
-  put('--paper', d.paper);
-  put('--shadow-color', d.shadowColor);
-  for (const key of PALETTE_KEYS) put(`--on-${key}`, d.on[key]);
+  // NOTE the naming: every derived colour also lives in the `--color-*`
+  // namespace, in camelCase. That is not cosmetic — `web-ui-layout-geometry.test.js`
+  // asserts that EVERY colour declaration below `.shell {` matches
+  // /var\(--color-[A-Za-z]+\)/, so a `--text` or `--on-background` reference in a
+  // component rule would fail the shipped suite. One namespace keeps the
+  // stylesheet compliant and the system coherent.
+  put('--color-ink', d.ink);
+  put('--color-paper', d.paper);
+  put('--color-shadow', d.shadowColor);
+  for (const key of PALETTE_KEYS) {
+    put(`--color-on${key[0].toUpperCase()}${key.slice(1)}`, d.on[key]);
+  }
   // `color-scheme` is a real CSS property so it rides the same CSSOM write and
   // stays CSP-legal. `--is-dark` lets the sheet branch numerically in calc() and
   // color-mix() without needing an attribute selector.

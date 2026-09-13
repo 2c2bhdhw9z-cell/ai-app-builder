@@ -124,7 +124,7 @@ const STATIC_ASSETS = {
   '/projects.js': 'projects.js', // Task 9.1
   '/views/projects.js': 'views/projects.js', // Task 9.1
   '/workspace.js': 'workspace.js', // Task 10.1
-  '/views/layout.js': 'views/layout.js', // Task 10.1
+  '/views/stage.js': 'views/stage.js', // the Stage shell (canvas + sheet)
   '/views/file-panel.js': 'views/file-panel.js', // Task 10.1 (Req 27.2 file/tool panel)
   '/theme.js': 'theme.js', // Task 11.1
   '/work-mode.js': 'work-mode.js', // Task 12.1

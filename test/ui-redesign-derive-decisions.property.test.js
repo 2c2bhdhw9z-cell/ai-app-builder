@@ -229,10 +229,13 @@ test(tag(38, 'applyPalette still sets EXACTLY the nine themeable inputs (Propert
       for (const key of PALETTE_KEYS) {
         assert.equal(all.get(`--color-${key}`), palette[key], `--color-${key} survived the derived pass`);
       }
-      assert.equal(all.get('--ink'), d.ink);
-      assert.equal(all.get('--paper'), d.paper);
-      assert.equal(all.get('--shadow-color'), d.shadowColor);
-      for (const key of PALETTE_KEYS) assert.equal(all.get(`--on-${key}`), d.on[key]);
+      assert.equal(all.get('--color-ink'), d.ink);
+      assert.equal(all.get('--color-paper'), d.paper);
+      assert.equal(all.get('--color-shadow'), d.shadowColor);
+      for (const key of PALETTE_KEYS) {
+        const cap = `--color-on${key[0].toUpperCase()}${key.slice(1)}`;
+        assert.equal(all.get(cap), d.on[key], `${cap} emitted`);
+      }
       assert.equal(all.get('color-scheme'), d.colorScheme);
       assert.equal(attrs.get('data-polarity'), d.polarity);
     }),

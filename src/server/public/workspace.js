@@ -35,7 +35,7 @@
  * INJECTED so the whole controller runs under `node --test` with the REAL store
  * reducer and the REAL api client (driven by an injected fetch), never a
  * stand-in double. It imports only the store action names + the api result
- * kinds. The layout arrangement itself is the view's job (views/layout.js); this
+ * kinds. The arrangement itself is the view's job (views/stage.js); this
  * controller only mutates the store's workspace slice.
  */
 
