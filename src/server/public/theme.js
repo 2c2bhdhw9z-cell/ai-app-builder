@@ -111,6 +111,169 @@ export function cssVarName(key) {
   return `--color-${key}`;
 }
 
+/* ===================================================================== *
+ * DERIVED DECISION LAYER (ui-redesign Req 1, 2)                          *
+ *                                                                        *
+ * The nine palette keys stay the ONLY themeable input. Everything else a  *
+ * real design system needs — a readable foreground, neutral anchors,      *
+ * elevation color — is DERIVED from those nine here.                      *
+ *                                                                        *
+ * Why this exists: styles.css shipped `body { color: var(--color-accent) }`,*
+ * so body text was painted with the theme's ACCENT hue. That makes body    *
+ * contrast equal to accent-on-background, and it FAILS WCAG AA on four of  *
+ * the eight shipped themes (pastel-pasture 2.15:1, morning-dew 2.36:1,     *
+ * summer-sunset 2.63:1, peach-popsicle 2.14:1). A real foreground token    *
+ * fixes it for every palette, including palettes that do not exist yet.    *
+ *                                                                        *
+ * Everything below is PURE: same nine inputs -> same outputs, no DOM, no  *
+ * prior state. That is what lets a Theme preview revert by simply         *
+ * re-applying the committed palette (web-ui Property 27 extends for free).*
+ * ===================================================================== */
+
+/** Near-black / near-white anchor bases. Nudged per-palette, never used raw. */
+const INK_BASE = Object.freeze([10, 12, 15]);
+const PAPER_BASE = Object.freeze([255, 255, 255]);
+/** Max share of the palette's own background mixed into an anchor. */
+const NUDGE_MAX = 0.09;
+/** Guaranteed-legible fallbacks. Better-of-these is always >= 4.58:1. */
+const PURE_INK_RGB = Object.freeze([0, 0, 0]);
+const PURE_PAPER_RGB = Object.freeze([255, 255, 255]);
+const PURE_INK_HEX = '#000000';
+const PURE_PAPER_HEX = '#ffffff';
+/** WCAG AA floor for body text. */
+const AA_FLOOR = 4.5;
+
+/** Parse `#rgb`/`#rrggbb` to [r,g,b]. Returns null when unparseable. */
+function parseHex(value) {
+  if (typeof value !== 'string') return null;
+  let h = value.trim().replace(/^#/, '');
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  if (h.length !== 6 || /[^0-9a-fA-F]/.test(h)) return null;
+  return [
+    parseInt(h.slice(0, 2), 16),
+    parseInt(h.slice(2, 4), 16),
+    parseInt(h.slice(4, 6), 16),
+  ];
+}
+
+/** [r,g,b] -> `#rrggbb`. */
+function toHex(rgb) {
+  return `#${rgb.map((c) => Math.max(0, Math.min(255, Math.round(c))).toString(16).padStart(2, '0')).join('')}`;
+}
+
+/** WCAG 2.x relative luminance of an [r,g,b] triple. */
+function luminance(rgb) {
+  const [r, g, b] = rgb.map((c) => {
+    const s = c / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/** WCAG contrast ratio between two [r,g,b] triples. Always >= 1. */
+function contrast(a, b) {
+  const la = luminance(a);
+  const lb = luminance(b);
+  const hi = Math.max(la, lb);
+  const lo = Math.min(la, lb);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+/** Linear per-channel mix: `amount` of b into a. */
+function mix(a, b, amount) {
+  return [0, 1, 2].map((i) => a[i] + (b[i] - a[i]) * amount);
+}
+
+/**
+ * Nudge an anchor toward the palette's background hue so a neutral does not
+ * read dirty against a warm or cool surface — but BOUNDED and CONTRAST-FLOORED:
+ * the nudge is stepped back until it clears AA against `bg`, so warmth can
+ * never be bought with legibility.
+ */
+function nudgeAnchor(base, bg) {
+  for (let amount = NUDGE_MAX; amount > 0; amount -= 0.03) {
+    const candidate = mix(base, bg, amount);
+    // Judge the rounded value, since that is what is emitted and measured.
+    if (contrast(parseHex(toHex(candidate)), bg) >= AA_FLOOR) return candidate;
+  }
+  return base;
+}
+
+/**
+ * Derive every non-themeable colour DECISION from the nine palette inputs.
+ *
+ * PURE and DOM-FREE by construction: takes only a palette, returns only data,
+ * reads no module state. Malformed input degrades to a safe neutral rather
+ * than throwing, so a partial or junk palette can never blank the UI.
+ *
+ * @param {Record<string,string> | null | undefined} palette
+ * @returns {{
+ *   polarity: 'light'|'dark', colorScheme: 'light'|'dark',
+ *   ink: string, paper: string, shadowColor: string,
+ *   on: Record<string,string>,
+ * }}
+ */
+export function deriveDecisions(palette) {
+  const pal = palette && typeof palette === 'object' ? palette : {};
+  // A junk/absent background degrades to white so the result stays usable.
+  const bg = parseHex(pal.background) ?? [255, 255, 255];
+
+  const ink = nudgeAnchor(INK_BASE, bg);
+  const paper = nudgeAnchor(PAPER_BASE, bg);
+  const inkHex = toHex(ink);
+  const paperHex = toHex(paper);
+
+  const isDark = luminance(bg) < 0.5;
+
+  // Elevation tint comes from ink, never pure black, so shadows sit INSIDE the
+  // theme instead of laying a grey film over it.
+  const shadowColor = toHex(mix(ink, bg, 0.18));
+
+  /**
+   * Readable foreground for one fill.
+   *
+   * The hue-nudged anchors are a PREFERENCE, not a guarantee: against a
+   * mid-luminance fill the headroom above AA is only ~0.08, so any nudge can
+   * push it under the floor. So we take the better nudged anchor when it clears
+   * AA, and otherwise fall back to the pure neutral. Picking the better of pure
+   * black/white is provably >= 4.58:1 for ANY fill (the worst case is a fill at
+   * relative luminance 0.179, where both anchors tie at 4.58), so this can
+   * never return an unreadable pairing.
+   */
+  const onFill = (raw) => {
+    const fill = parseHex(raw) ?? bg;
+    const nudged = contrast(ink, fill) >= contrast(paper, fill) ? ink : paper;
+    const nudgedHex = toHex(nudged);
+    // Measure the ROUNDED value we actually emit, not the float we computed from.
+    // `toHex` rounds, the AA floor is a hard boundary, and a ratio of 4.501 can
+    // round down through it — so the decision has to be made on the emitted value.
+    if (contrast(parseHex(nudgedHex), fill) >= AA_FLOOR) return nudgedHex;
+    return contrast(PURE_INK_RGB, fill) >= contrast(PURE_PAPER_RGB, fill)
+      ? PURE_INK_HEX
+      : PURE_PAPER_HEX;
+  };
+
+  const on = {};
+  for (const key of PALETTE_KEYS) on[key] = onFill(pal[key]);
+
+  return Object.freeze({
+    polarity: isDark ? 'dark' : 'light',
+    colorScheme: isDark ? 'dark' : 'light',
+    ink: inkHex,
+    paper: paperHex,
+    shadowColor,
+    on: Object.freeze(on),
+  });
+}
+
+/** The twelve derived custom property names, for tests and stylesheet authors. */
+export const DERIVED_VAR_NAMES = Object.freeze([
+  '--ink',
+  '--paper',
+  '--shadow-color',
+  ...PALETTE_KEYS.map((k) => `--on-${k}`),
+]);
+
 /**
  * PURE palette applier (Req 9.1, Property 26). Set the nine `--color-*` CSS
  * custom properties on a style TARGET from a palette map. The target is anything
@@ -134,6 +297,50 @@ export function applyPalette(target, palette) {
       target.setProperty(cssVarName(key), value);
       set += 1;
     }
+  }
+  return set;
+}
+
+/**
+ * Apply the DERIVED decision layer (ui-redesign Req 1.3).
+ *
+ * Deliberately a SEPARATE function from `applyPalette` rather than an extension
+ * of it. `web-ui` Property 26 asserts that applying a palette puts EXACTLY nine
+ * custom properties on the surface (`target.size() === PALETTE_KEYS.length`), so
+ * it is an exclusivity assertion, not merely a completeness one. Folding the
+ * derived writes into `applyPalette` would break that shipped contract. Keeping
+ * them apart means Property 26 holds verbatim and untouched, while the stylesheet
+ * still gets everything it needs.
+ *
+ * In the browser both functions receive the same `documentElement.style`, so the
+ * cascade sees one merged set; only the *contract of applyPalette* stays narrow.
+ *
+ * @param {{ setProperty: (name: string, value: string) => void } | null | undefined} target
+ * @param {Record<string,string> | null | undefined} palette
+ * @param {{ setAttribute: (name: string, value: string) => void }} [element]
+ *   optional element for the `data-polarity` attribute (the document element).
+ * @returns {number} how many properties were set
+ */
+export function applyDerivedDecisions(target, palette, element) {
+  if (!target || typeof target.setProperty !== 'function') return 0;
+  if (!palette || typeof palette !== 'object') return 0;
+  const d = deriveDecisions(palette);
+  let set = 0;
+  const put = (name, value) => {
+    target.setProperty(name, value);
+    set += 1;
+  };
+  put('--ink', d.ink);
+  put('--paper', d.paper);
+  put('--shadow-color', d.shadowColor);
+  for (const key of PALETTE_KEYS) put(`--on-${key}`, d.on[key]);
+  // `color-scheme` is a real CSS property so it rides the same CSSOM write and
+  // stays CSP-legal. `--is-dark` lets the sheet branch numerically in calc() and
+  // color-mix() without needing an attribute selector.
+  put('color-scheme', d.colorScheme);
+  put('--is-dark', d.polarity === 'dark' ? '1' : '0');
+  if (element && typeof element.setAttribute === 'function') {
+    element.setAttribute('data-polarity', d.polarity);
   }
   return set;
 }
@@ -181,6 +388,11 @@ export function createThemeController({ store, api, styleTarget, getExperience }
         ? document.documentElement.style
         : null;
 
+  // The element the `data-polarity` attribute goes on. Same defensive shape as
+  // `target`: absent outside a browser, in which case the attribute is skipped
+  // and the derived custom properties still apply.
+  const docElement =
+    typeof document !== 'undefined' && document.documentElement ? document.documentElement : null;
   const experienceOf =
     typeof getExperience === 'function'
       ? getExperience
@@ -193,12 +405,16 @@ export function createThemeController({ store, api, styleTarget, getExperience }
    *  palette if previewing, else the committed baseline. */
   function applyActive() {
     const t = store.getState().theme;
-    applyPalette(target, t.previewedPalette ?? t.committedPalette);
+    const palette = t.previewedPalette ?? t.committedPalette;
+    applyPalette(target, palette);
+    applyDerivedDecisions(target, palette, docElement);
   }
 
   /** Apply the last COMMITTED palette to the surface (the revert baseline). */
   function applyCommitted() {
-    applyPalette(target, store.getState().theme.committedPalette);
+    const palette = store.getState().theme.committedPalette;
+    applyPalette(target, palette);
+    applyDerivedDecisions(target, palette, docElement);
   }
 
   /**

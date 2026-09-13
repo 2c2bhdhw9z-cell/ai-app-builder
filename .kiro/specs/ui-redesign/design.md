@@ -97,9 +97,24 @@ This is the hard constraint in the whole design and it is addressed head-on rath
 
 A real design system needs more tokens than nine. So does the contract break?
 
-### It does not — and the reason matters
+### It does not — but not for the reason first claimed
 
-**Property 26 is a completeness assertion, not an exclusivity assertion.** It requires that all nine are set from the frame palette. It does not say that nothing else may be set. So the resolution is not to widen the themeable contract, it is to keep it exactly as it is and **derive everything else from it**:
+**Correction, found by running the shipped test.** This document originally argued
+that Property 26 was a completeness assertion rather than an exclusivity one, and
+that the derived tokens could therefore ride inside `applyPalette`. That was wrong.
+`test/web-ui-theme-palette.property.test.js` line 90 asserts
+`target.size() === PALETTE_KEYS.length` — **exactly nine** custom properties on the
+surface. Folding the derived writes into `applyPalette` breaks it, and did.
+
+The resolution is a **separate function**: `applyPalette` keeps its narrow
+nine-property contract untouched, and `applyDerivedDecisions(target, palette,
+element)` emits the derived layer alongside it. The controller calls both. In the
+browser both receive the same `documentElement.style`, so the cascade sees one
+merged set; only the *contract of `applyPalette`* stays narrow. Property 26 holds
+verbatim, with no edit to any shipped test.
+
+With that correction, the themeable contract still is not widened — everything else
+is **derived from the nine**:
 
 > **The nine palette keys remain the single source of truth and the only themeable input. Every other token in the system is a pure function of those nine. No new themeable input is introduced, no frame field is added, no backend data changes, and Property 26 continues to hold verbatim.**
 
