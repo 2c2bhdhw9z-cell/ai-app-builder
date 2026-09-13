@@ -133,8 +133,8 @@ On branch `ui-redesign-spec`. Suite: **1043 tests, 1035 pass, 0 fail, 8 skipped.
 | `test/ui-redesign-derive-decisions.property.test.js` | **Done.** 9 property tests, 200 runs each |
 | `styles.css` token system: type/space/radius/elevation/motion scales | **Done and reusable** |
 | `views/layout.js` (region grid) | **Deleted** |
-| `views/stage.js` (canvas + sheet) | **Built but SUPERSEDED.** Wrong model — one screen with the preview pinned beside the agent |
-| `styles.css` stage/sheet layout rules | **Superseded** alongside it |
+| `views/stage.js` (canvas + sheet) | **Deleted.** Wrong model — one screen with the preview pinned beside the agent |
+| `styles.css` stage/sheet layout rules | **Deleted** alongside it |
 | Vibe mode, IDE mode, Preview screen | **Not built.** Approved as designs only |
 | Compose bar, model picker, context gauge, attachments | **Not built** |
 | Autonomy control | **Not built** |
@@ -144,8 +144,13 @@ Deleted tests, replaced deliberately rather than skipped, because they asserted 
 removed region architecture: `web-ui-layout-geometry.test.js`,
 `web-ui-workspace-regions.test.js`,
 `web-ui-mobile-command-center.integration.test.js`. Their surviving invariants
-(no 360px overflow, touch sizing, palette-driven colour, CSP) are re-asserted in
-`test/ui-redesign-stage.test.js` and must carry into whatever replaces the Stage.
+(no 360px overflow, touch sizing, palette-driven colour, CSP, textual diff markers)
+are re-asserted in `test/ui-redesign-shell.test.js` and **must carry into the real
+surfaces** rather than retiring with the interim shell.
+
+`views/shell.js` is an interim vertical stack, labelled temporary in its own header,
+that exists only to keep the client mountable until task 1.1 lands. It is not a
+layout system and should be replaced, not extended.
 
 ## 7. Build order
 

@@ -19,9 +19,16 @@ lands before the denser IDE.
   pure and DOM-free), `applyDerivedDecisions()` kept separate so the shipped
   Property 26 exactness assertion still holds, the WCAG AA body-text fix, and the
   token scales in `styles.css`.
-- **Built and superseded:** `views/stage.js` and its stylesheet rules. Wrong model —
-  one screen with the preview pinned beside the agent.
-- **Deleted:** `views/layout.js` (region grid) and three tests that asserted it.
+- **Deleted, not evolved:** `views/layout.js` (region grid) and `views/stage.js`
+  (canvas + sheet). Both encoded the wrong model. Four tests that asserted them are
+  deleted too.
+- **Interim:** `views/shell.js` — a deliberately minimal vertical stack that keeps the
+  client mountable. It is labelled temporary in its own header. Replace it in task 1.1;
+  do not grow it.
+- **Invariant carrier:** `test/ui-redesign-shell.test.js` holds the invariants
+  inherited from the deleted tests (no 360px overflow, touch sizing, palette-driven
+  colour, CSP, textual diff markers). **Move them to the real surfaces; do not delete
+  them with the interim shell.**
 - **Untouched and reused:** `store.js`, `api.js`, `sse.js`, `router.js`, `auth.js`,
   `token-store.js`, `builder.js`, `confirm.js`, `preview.js`, `preview-poll.js`,
   `qr.js`, `work-mode.js`, `workspace.js`, the settings controllers.
@@ -41,7 +48,7 @@ a needed change.
 - [ ] 1. Mode router over shared project state
   - [ ] 1.1 Add Vibe / IDE / Preview as real routes
     - Extend `router.js` with the three surfaces; mount each lazily; keep one store
-    - Retire `views/stage.js` and its stylesheet rules
+    - Retire `views/shell.js` and its stylesheet rules; move its invariant assertions onto the new surfaces
     - _PLAN §1, §3_
   - [ ] 1.2 Prove switching modes resets nothing
     - Files, conversation history, live preview, in-flight turn and SSE stream all survive a mode switch

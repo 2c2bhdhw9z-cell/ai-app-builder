@@ -1,4 +1,25 @@
-# Requirements Document
+# Requirements Document — Web UI **backend contract**
+
+> ## Scope of this document, read before using it
+>
+> This spec is retained for **one reason**: it documents the backend surface the UI
+> consumes, and ~40 shipped test files reference its numbered properties
+> (`Feature: web-ui, Property N`). Do not delete it and do not renumber it.
+>
+> **The interface is NOT specified here.** `../ui-redesign/PLAN.md` owns the interface
+> and is authoritative. The UI described below — a chat column with a preview panel,
+> five Workspace Experience geometries, a Work Mode toggle in a header — has been
+> replaced.
+>
+> | Requirements | Status for the client |
+> |---|---|
+> | 1–7, 12–16 | **Still binding.** Static-asset delivery, prompt submission, SSE Activity Stream, preview pipeline, confirm approvals, OIDC login, project creation, provider, connectors, skills/memory, build/deploy/export/share, non-disclosing errors |
+> | 9 | **Still binding.** Theme palette application and preview-then-commit. `ui-redesign` builds directly on it |
+> | 8, 10, 11 | **Superseded.** Workspace Experience switching, Work Mode as a header control, and Mobile Command Center as one experience among five. Replaced by the three-surface model in `PLAN.md` §3. The backend endpoints still exist; the client no longer renders five geometries |
+>
+> Its `tasks.md` was **deleted** — the checkboxes were long out of sync with the code
+> and were actively misleading. `../ui-redesign/tasks.md` is the live plan.
+> Its `screenshots/` were **deleted** — they pictured the replaced UI.
 
 ## Introduction
 

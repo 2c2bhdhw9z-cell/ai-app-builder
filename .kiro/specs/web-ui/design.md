@@ -1,4 +1,11 @@
-# Design Document
+# Design Document — Web UI **backend contract**
+
+> Retained only for the backend surface and the numbered properties that ~40 shipped
+> tests reference. **The interface is not specified here** — see
+> `../ui-redesign/design.md` and `../ui-redesign/PLAN.md`, which are authoritative.
+> Any content below describing the region grid, the five Workspace Experience
+> geometries, or the preview as a side panel is **replaced**.
+
 
 ## Overview
 
@@ -208,7 +215,7 @@ Holds the client-side models in Data Models below. Notable invariants enforced h
 - **`views/preview-pane.js`** — same-origin `<iframe>` for the preview URL; loading/showing_prior/error/persistent_failure indicators; QR (`data:` image) + selectable URL for mobile targets (Req 4).
 - **`views/confirm.js`** — approve/deny controls, touch-sized (Req 5, 11.3).
 - **`views/session-header.js`** — active Work_Mode + switch control, current experience + theme; always visible at 360px (Req 10, 11.4).
-- **`views/layout.js`** — arranges surfaces per the `workspace_experience` layout descriptor; single-column touch layout for `mobile-command-center`; renders `attribution` when present (Req 8, 11).
+- **`views/layout.js` **(DELETED — superseded, see ../ui-redesign/PLAN.md)**** — arranges surfaces per the `workspace_experience` layout descriptor; single-column touch layout for `mobile-command-center`; renders `attribution` when present (Req 8, 11).
 - **`views/settings/*`** — the remaining surfaces.
 
 ---
@@ -301,7 +308,7 @@ Workspace {
 }
 ```
 
-`layout.surfaces` entries (`{ region, visible, order, size, collapsible?, collapsed? }`) drive `views/layout.js`. Selecting an experience changes **layout only** — the client never mutates theme/work-mode/project data on a `workspace_experience` frame (Req 8.3).
+`layout.surfaces` entries (`{ region, visible, order, size, collapsible?, collapsed? }`) drive `views/layout.js` **(DELETED — superseded, see ../ui-redesign/PLAN.md)**. Selecting an experience changes **layout only** — the client never mutates theme/work-mode/project data on a `workspace_experience` frame (Req 8.3).
 
 ### Work_Mode state
 
@@ -635,10 +642,10 @@ The one additive backend change (the static-serving route in `builder-server.js`
 - **Req 5 (confirm approvals):** `confirm.js`/`views/confirm.js`; Properties 16, 17; 401 example (5.5).
 - **Req 6 (browser OIDC login):** `auth.js` + Token_Store; Properties 18–22; login-control example (6.1).
 - **Req 7 (project creation):** `projects.js`; Properties 4, 23; origin-form examples (7.6–7.8).
-- **Req 8 (workspace switching):** `workspace.js`/`views/layout.js`; Properties 24, 25; default example (8.5).
+- **Req 8 (workspace switching):** `workspace.js`/`views/layout.js` **(DELETED — superseded, see ../ui-redesign/PLAN.md)**; Properties 24, 25; default example (8.5).
 - **Req 9 (theme render + preview/commit):** `theme.js`; Properties 26–28; default example (9.8).
 - **Req 10 (work mode):** `work-mode.js`/`views/session-header.js`; Properties 25, 29; default example (10.5).
-- **Req 11 (mobile):** `views/layout.js`; examples/integration (11.1–11.4).
+- **Req 11 (mobile):** `views/layout.js` **(DELETED — superseded, see ../ui-redesign/PLAN.md)**; examples/integration (11.1–11.4).
 - **Req 12–15 (settings surfaces):** `settings/*`; Property 30 (secret non-disclosure); examples otherwise; last delivery stage.
 - **Req 16 (non-disclosing errors):** `api.js` central classification; Properties 9, 31; storage-sink example (16.3).
 

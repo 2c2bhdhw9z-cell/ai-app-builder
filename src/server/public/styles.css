@@ -236,309 +236,84 @@ button {
 }
 
 /* ===================================================================== *
- * THE STAGE — the shell. Replaces the region-grid layout.                *
+ * THE INTERIM SHELL                                                      *
  *                                                                        *
- * Structure, not skin. The old shell was a grid of named regions: a       *
- * header strip, a conversation column, a preview panel, a dock. Every     *
- * "experience" was a rearrangement of those same four boxes, which is     *
- * the layout every AI builder ships.                                     *
+ * Minimal and temporary, matching views/shell.js. The real interface is   *
+ * three surfaces (Vibe / IDE / Preview) behind a mode router — see        *
+ * .kiro/specs/ui-redesign/PLAN.md. Do not grow this into a layout system. *
  *                                                                        *
- * The Stage instead gives the whole screen to the app being built and     *
- * puts the agent in a bottom sheet with three detents:                    *
- *                                                                        *
- *   peek  grip + status + chips + compose        (agent out of the way)   *
- *   half  the above plus recent activity          (following along)       *
- *   full  the whole stream, diffs, confirmations  (working in detail)     *
- *                                                                        *
- * On a wide viewport the same DOM becomes a docked side rail — one        *
- * breakpoint, no second layout, no separate mobile stylesheet.            *
+ * What it MUST keep carrying, inherited from three deleted tests:         *
+ *   - no horizontal overflow at 360px                                    *
+ *   - touch targets at or above --touch                                  *
+ *   - every colour read through var(--color-*)                           *
+ * Those invariants move to the real surfaces; they do not retire with     *
+ * this block.                                                            *
  * ===================================================================== */
 
-.stage {
-  position: relative;
-  display: block;
+.shell {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 100vh;
+  overflow-x: hidden;
+  background-color: var(--color-background);
+}
+
+.shell__main {
+  flex: 1 1 auto;
+  min-width: 0;
   width: 100%;
-  min-width: 0;
-  height: 100vh;
-  /* Never scrolls sideways: the 360px no-overflow guarantee. */
-  overflow-x: hidden;
-  background-color: var(--color-surfaceSunken);
+  display: flex;
+  flex-direction: column;
 }
 
-/* ---- the canvas: the running app, full bleed. THE HERO. ---- */
-.stage__canvas {
-  position: absolute;
-  inset: 0;
+.shell__stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-region);
+  padding: var(--gap-region);
+  min-width: 0;
+  max-width: var(--maxw);
+  width: 100%;
+  margin: 0 auto;
+}
+
+.shell__slot {
   min-width: 0;
   max-width: 100%;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
 }
 
-/* Inside the canvas the preview is not a card — it IS the surface. */
-.stage__canvas .preview {
-  flex: 1 1 auto;
-  min-height: 0;
-  border: 0;
-  border-radius: 0;
-  box-shadow: none;
-  background-color: var(--color-background);
+.shell__slot[hidden] {
+  display: none;
 }
 
-.stage__canvas .preview__frame {
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-/* ---- the hud: small floating chips over the canvas ---- */
-.stage__hud {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 3;
-  display: flex;
-  align-items: flex-start;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  /* The hud is a pass-through layer; only its children take pointer events, so
-     the canvas underneath stays fully interactive. */
-  pointer-events: none;
-}
-
-.stage__hud > * {
-  pointer-events: auto;
-}
-
-/* ---- the sheet ---- */
-.sheet {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  z-index: 4;
+.shell__compose {
   min-width: 0;
   max-width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--gap-region) var(--space-4);
-  background-color: var(--color-background);
-  border-top: 1px solid var(--color-borderStrong);
-  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
-  box-shadow: var(--elev-3);
-  transition: height var(--dur-base) var(--ease);
-}
-
-/* The grip: a real button, so the sheet works by tap and keyboard, not only by
-   drag. Sized to the touch floor. */
-.sheet__grip {
-  align-self: center;
-  min-height: var(--touch);
-  min-width: var(--touch);
-  width: 4rem;
-  padding: 0;
-  background-color: transparent;
-  border: 0;
-  cursor: grab;
-  touch-action: none;
-  display: grid;
-  place-items: center;
-  flex: none;
-}
-
-.sheet__grip::before {
-  content: "";
-  width: 2.25rem;
-  height: 4px;
-  border-radius: var(--radius-full);
-  background-color: var(--color-borderStrong);
-  transition: background-color var(--dur-fast) var(--ease);
-}
-
-.sheet__grip:hover::before {
-  background-color: var(--color-textSubtle);
-}
-
-/* The one line that is ALWAYS visible, at every detent. */
-.sheet__peek {
-  margin: 0;
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-size: var(--text-sm);
-  color: var(--color-textMuted);
-}
-
-.sheet__peek::before {
-  content: "";
-  width: 5px;
-  height: 5px;
-  flex: none;
-  border-radius: var(--radius-full);
-  background-color: var(--color-statusSuccess);
-}
-
-.stage[data-running="true"] .sheet__peek::before {
-  background-color: var(--color-statusInfo);
-}
-
-/* Everything conversational. Scrolls inside the sheet, never the page. */
-.sheet__scroll {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  overflow-x: hidden;
   display: flex;
   flex-direction: column;
   gap: var(--gap-stack);
-  padding-right: var(--space-1);
 }
 
-/* ---- input: chips first, because typing on a phone is the fallback ---- */
-.sheet__chips {
-  flex: none;
-  display: flex;
-  gap: var(--space-2);
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: none;
-  padding-bottom: var(--space-1);
-}
-
-.sheet__chips::-webkit-scrollbar {
-  display: none;
-}
-
-.sheet__chip {
-  flex: none;
+.shell__settings-toggle {
   min-height: var(--touch);
-  padding: 0 var(--space-4);
+  padding: 0 var(--pad-control);
   font-size: var(--text-sm);
-  white-space: nowrap;
-  color: var(--color-text);
-  background-color: var(--color-background);
-  border: 1px solid var(--color-borderStrong);
-  border-radius: var(--radius-full);
+  color: var(--color-textMuted);
+  background-color: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition:
-    background-color var(--dur-fast) var(--ease),
-    border-color var(--dur-fast) var(--ease);
+    color var(--dur-fast) var(--ease),
+    background-color var(--dur-fast) var(--ease);
 }
 
-.sheet__chip:hover {
-  background-color: var(--color-hover);
-}
-
-/* Voice leads the row: it is the primary input on a phone. */
-.sheet__chip--voice {
+.shell__settings-toggle:hover {
   color: var(--color-text);
-  background-color: var(--color-accentTint);
-  border-color: var(--color-accent);
-  font-weight: var(--weight-medium);
-}
-
-.sheet__compose {
-  flex: none;
-  min-width: 0;
-}
-
-/* ---- detents ---- */
-
-/* peek: the agent is out of the way. The scroll region is gone entirely. */
-.sheet[data-detent="peek"] {
-  height: auto;
-}
-
-.sheet[data-detent="peek"] .sheet__scroll {
-  display: none;
-}
-
-.sheet[data-detent="half"] {
-  height: 54vh;
-}
-
-.sheet[data-detent="full"] {
-  height: 92vh;
-}
-
-/* When the sheet is large it owns the surface, so square off the top corners and
-   drop the float — it is no longer an overlay, it is the screen. */
-.sheet[data-detent="full"] {
-  border-radius: 0;
-  box-shadow: none;
-}
-
-/* ---- density, tuned by experience. The experience TUNES, it never rearranges ---- */
-.stage[data-experience="technical-workbench"] {
-  --gap-region: var(--space-2);
-  --gap-stack: var(--space-2);
-  --pad-surface: var(--space-3);
-  --pad-control: var(--space-2);
-  --row-h: 1.75rem;
-  --stream-leading: var(--leading-snug);
-}
-
-.stage[data-experience="vibe-first"],
-.stage[data-experience="mobile-command-center"] {
-  --gap-region: var(--space-4);
-  --gap-stack: var(--space-3);
-  --pad-surface: var(--space-5);
-  --pad-control: var(--space-3);
-  --row-h: 2.25rem;
-  --stream-leading: var(--leading-normal);
-}
-
-/* ===================================================================== *
- * WIDE VIEWPORT — the SAME DOM becomes a docked rail.                    *
- * Not a second layout: the sheet stops being a bottom overlay and becomes *
- * a right-hand column, and the canvas gives up that width.               *
- * ===================================================================== */
-@media (min-width: 60rem) {
-  .stage {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 26rem);
-  }
-
-  .stage__canvas {
-    position: relative;
-    inset: auto;
-    grid-column: 1;
-  }
-
-  .stage__hud {
-    grid-column: 1;
-  }
-
-  .sheet {
-    position: relative;
-    grid-column: 2;
-    height: 100vh;
-    border-top: 0;
-    border-left: 1px solid var(--color-border);
-    border-radius: 0;
-    box-shadow: none;
-    padding-top: var(--space-3);
-  }
-
-  /* On a rail there is no drag affordance to make sense of, and every detent is
-     the same full-height column. */
-  .sheet__grip {
-    display: none;
-  }
-
-  .sheet[data-detent="peek"] .sheet__scroll,
-  .sheet[data-detent="half"],
-  .sheet[data-detent="full"] {
-    display: flex;
-    height: 100vh;
-  }
-
-  .sheet[data-detent="peek"] .sheet__scroll {
-    display: flex;
-  }
+  background-color: var(--color-hover);
 }
 
 /* ===================================================================== *
@@ -1270,13 +1045,12 @@ button {
  * ===================================================================== */
 
 @media (max-width: 400px) {
-  .stage {
+  .shell {
     --gap-region: var(--space-3);
   }
 
-  .sheet {
-    padding-left: var(--space-3);
-    padding-right: var(--space-3);
+  .shell__stack {
+    padding: var(--space-3);
   }
 
   .activity__diff-line,

@@ -43,7 +43,7 @@ import {
 import { createPreviewPaneView } from './views/preview-pane.js';
 import { createConfirmView } from './views/confirm.js';
 import { createProjectsView } from './views/projects.js';
-import { createStageView } from './views/stage.js';
+import { createShellView } from './views/shell.js';
 import { createFilePanelView } from './views/file-panel.js';
 import { createSessionHeaderView } from './views/session-header.js';
 import { createWorkspaceControlsView } from './views/workspace-controls.js';
@@ -352,18 +352,15 @@ export function createInitialView(doc, client) {
     // the stream, so the compose row can stay pinned in thumb reach at every
     // detent. The Stage places them (SLOT_OF_SURFACE.confirm === 'scroll').
     const composeWrap = doc.createElement('div');
-    composeWrap.className = 'sheet__compose-inner';
+    composeWrap.className = 'shell__compose';
     composeWrap.append(prompt.el);
 
-    // ---- THE STAGE ------------------------------------------------------
-    // The shell. Gives the whole screen to the app being built and puts the
-    // agent in a bottom sheet with three detents (peek / half / full), which
-    // becomes a docked rail on a wide viewport. Surfaces are placed by IDENTITY
-    // into fixed slots (preview -> canvas, header -> hud, everything
-    // conversational -> sheet), so the backend descriptor no longer decides
-    // geometry. It still decides visibility, and the experience id still tunes
-    // the opening detent and the density. No backend contract changes.
-    const stage = createStageView({
+    // ---- THE INTERIM SHELL ----------------------------------------------
+    // Deliberately minimal and deliberately temporary. The real interface is
+    // three surfaces (Vibe / IDE / Preview) behind a mode router — see
+    // .kiro/specs/ui-redesign/PLAN.md and task 1.1. This keeps the client
+    // mountable while those are built; it is not a layout system to grow.
+    const shell = createShellView({
       doc,
       store: client.store,
       surfaces: {
@@ -374,14 +371,8 @@ export function createInitialView(doc, client) {
         preview,
         filePanel,
       },
-      onChip: (text) => {
-        // A chip is just a prompt the user did not have to type.
-        if (client.builder && typeof client.builder.submit === 'function') {
-          client.builder.submit(text);
-        }
-      },
     });
-    views.push(stage);
+    views.push(shell);
 
     // The settings toggle — a slim, touch-sized control in the header that flips
     // the router between the builder shell and the settings panel (Task 15.1).
@@ -423,7 +414,7 @@ export function createInitialView(doc, client) {
           ? client.router.getRoute()
           : 'builder';
       const showSettings = route === 'settings';
-      stage.el.hidden = showSettings;
+      shell.el.hidden = showSettings;
       settingsPanel.el.hidden = !showSettings;
       settingsToggle.setAttribute('aria-pressed', showSettings ? 'true' : 'false');
       settingsToggle.textContent = showSettings ? 'Close settings' : 'Settings';
@@ -443,7 +434,7 @@ export function createInitialView(doc, client) {
         : () => {};
     applyRoute();
 
-    main.append(stage.el, settingsPanel.el);
+    main.append(shell.el, settingsPanel.el);
     views.push({
       el: settingsToggle,
       destroy() {
