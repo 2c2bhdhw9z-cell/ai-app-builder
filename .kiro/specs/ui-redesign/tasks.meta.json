@@ -1,0 +1,185 @@
+{
+  "pbtResults": {},
+  "executionHistory": {
+    "1.1 Implement `deriveDecisions(palette)` as a pure, DOM-free function": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436041
+      },
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260444865
+      }
+    ],
+    "1.2 Emit the derived layer from `applyPalette`": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436133
+      }
+    ],
+    "2.1 Author the Token_Block": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436166
+      }
+    ],
+    "2.2 Define the Derived_Gradation layer": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436215
+      }
+    ],
+    "2.3 Replace accent-as-text globally": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436248
+      }
+    ],
+    "3.1 Author the type scale and apply it": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436290
+      }
+    ],
+    "3.2 Add the self-hosted variable font and its designed fallback": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436328
+      }
+    ],
+    "3.3 Register the font asset in all three coordinated places": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436371
+      }
+    ],
+    "4.1 Apply the space scale and radius hierarchy": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436406
+      }
+    ],
+    "4.2 Add the three elevation levels": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436448
+      }
+    ],
+    "4.3 Add motion and the focus treatment": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436491
+      }
+    ],
+    "5.1 Implement the two profiles keyed off `data-experience`": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436529
+      }
+    ],
+    "6.1 Activity stream": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436565
+      }
+    ],
+    "6.2 Prompt / compose surface": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436601
+      }
+    ],
+    "6.3 Preview pane and its status attribute": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436648
+      }
+    ],
+    "6.4 Confirm card": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436699
+      }
+    ],
+    "6.5 Session header": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436729
+      }
+    ],
+    "7.1 File panel and workspace controls": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436760
+      }
+    ],
+    "7.2 Project creation form": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436800
+      }
+    ],
+    "7.3 Settings screens": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436841
+      }
+    ],
+    "8.1 `color-mix()` fallback": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436884
+      }
+    ],
+    "8.2 Forced-colors mode": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436923
+      }
+    ],
+    "8.3 Uncomfortable palette fills": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436961
+      }
+    ],
+    "9.1 Preserve and re-assert the load-bearing geometry declarations": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260436996
+      }
+    ],
+    "9.4 Regenerate the visual reference set": [
+      {
+        "executionId": "c0c6a111-8a05-43a4-b9ae-53cfd09bf039",
+        "chatSessionId": "sess_c4d12d61-9767-4456-bfeb-1faf7edc1e68",
+        "timestamp": 1789260437038
+      }
+    ]
+  }
+}
