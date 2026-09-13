@@ -62,6 +62,18 @@ export const DEFAULT_CONFIRM_TIMEOUT_MS = 60_000;
  */
 export function truncateStream(text, limitBytes = DEFAULT_TRUNCATE_LIMIT_BYTES) {
   if (typeof text !== 'string' || text === '') return text ?? '';
+  // A BAD limit must not silently destroy the output (audit M22). `NaN`, `0`,
+  // a negative, or a non-number previously produced either an empty string or
+  // `[output truncated: NaN bytes omitted]` — the caller lost every byte and the
+  // notice did not even say how many. Truncation is a display concession; it is
+  // never a reason to discard what a command actually printed, so an unusable
+  // limit falls back to the documented default rather than to nothing.
+  const requested = Number(limitBytes);
+  const limit =
+    Number.isFinite(requested) && requested >= 1
+      ? Math.floor(requested)
+      : DEFAULT_TRUNCATE_LIMIT_BYTES;
+  limitBytes = limit;
   const buf = Buffer.from(text, 'utf8');
   const totalBytes = buf.length;
   if (totalBytes <= limitBytes) return text;

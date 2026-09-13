@@ -653,7 +653,22 @@ export function createProjectOrigin({
 function deepCopyTree(tree) {
   const out = {};
   for (const [rel, contents] of Object.entries(tree)) {
-    out[rel] = Buffer.isBuffer(contents) ? Buffer.from(contents) : contents;
+    // Copy EVERY binary view, not only Buffer (audit M23). `Buffer.isBuffer` is
+    // false for a plain `Uint8Array`, so such an entry was passed through by
+    // reference and a forked tree aliased the source's bytes — mutating one
+    // silently mutated the other. Fork exists precisely to give an independent
+    // copy, so aliasing defeats the whole operation.
+    if (Buffer.isBuffer(contents)) {
+      out[rel] = Buffer.from(contents);
+    } else if (ArrayBuffer.isView(contents)) {
+      // Covers Uint8Array and every other typed-array view over the bytes.
+      out[rel] = Buffer.from(contents.buffer.slice(
+        contents.byteOffset,
+        contents.byteOffset + contents.byteLength,
+      ));
+    } else {
+      out[rel] = contents;
+    }
   }
   return out;
 }

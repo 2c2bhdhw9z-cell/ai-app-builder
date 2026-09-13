@@ -39,24 +39,93 @@ usage and exits 0; a nonexistent path, a file-as-root and an invalid regex each 
 instead of reporting a green "0 high"; and a finding whose own text mentions `/dist/`
 is no longer suppressed.
 
-### Medium — partially open, not fully triaged
+### Medium — all 34 verified individually on 2026-09-13
 
-Two were verified as genuinely open and **fixed on 2026-09-13**:
+Every Medium was checked against the running code. Where a behaviour could be
+executed, it was executed rather than inferred — several grep-level guesses in the
+earlier version of this file were **wrong** (M11 in particular looked fixed and was
+not), so nothing below is a heuristic.
 
-- **M21** — `classifyCommand()` failed **open** on a non-string: `classifyCommand(42)`,
-  `({})`, `(null)` and `(undefined)` all returned `allow`, bypassing every REFUSE and
-  CONFIRM rule. Now refuses on a type error; a genuinely empty string still allows.
-- **Redaction self-corruption** (adjacent to M14/H6) — `redactSecrets()` looped once
-  per secret over its own rewritten output, so an emitted marker could itself be
-  redacted when a secret's value was an ordinary identifier. Now a single-pass
-  alternation. This was surfacing as a pre-existing failing test.
+#### Fixed on 2026-09-13 (4)
 
-**The remaining Mediums and Lows have NOT been individually verified.** A grep-level
-pass suggested several may still be open, including M1 (bash timeout orphans
-grandchildren), M3 (`read_file` loads a whole file before capping), M13 (path
-containment TOCTOU), M18 (`sessions` never evicted) and M19 (`close()` does not end
-live SSE responses, so shutdown hangs). Those are heuristics, not confirmations —
-treat the list as a to-do, not a status.
+| # | Repo | Finding | Verified how |
+|---|---|---|---|
+| M10 | plumby | The bare word `migrate` made ordinary commands confirm-class. `grep -rn migrate src/` and `git commit -m "refactor: migrate to new API"` both required confirmation — and since a sub-agent's `bashPolicy` is `read-only`, `guard()` **refused them structurally**. Now requires a runner prefix | Ran the classifier |
+| M11 | plumby | `dd of=/dev/…` matched only `sd\|nvme\|hd\|disk`, so `of=/dev/vda` (KVM/virtio) and `of=/dev/xvda` (Xen/EC2) — the normal root disks in the VMs this runs inside — were **allow**. Also missed `mmcblk`, `md`, `loop`, `dm-` | Ran the classifier |
+| M21 | plumby | `classifyCommand()` failed **open** on a type error: `42`, `{}`, `null`, `undefined` all returned `allow`, bypassing every REFUSE and CONFIRM rule | Ran the classifier |
+| M22 | ai-app-builder | `truncateStream` with a limit of `0`, `NaN`, `null` or a negative **discarded all output**, emitting `[output truncated: NaN bytes omitted]`. Now falls back to the default | Called it directly |
+| M23 | ai-app-builder | `deepCopyTree` copied only `Buffer`; a plain `Uint8Array` was passed by reference, so a forked tree **aliased the source's bytes**. Fork exists to give an independent copy | Read the function; pinned by test |
+
+Plus the redaction self-corruption fix (adjacent to M14/H6) described above.
+All are pinned by regression tests. Suites: ai-app-builder 1043 tests / 0 fail,
+plumby 850 tests / 0 fail.
+
+#### Confirmed already fixed (7)
+
+**M6** `/compact` now refuses while a turn is running. **M14** error responses carry a
+correlation id rather than internal text. **M16** the background turn has a `.catch()`.
+**M24** ISO-date validation exists. **M31** the badge regex prefix is now optional —
+verified `<Badge />`, `<PoweredBy />`, `<Watermark />`, `<Feedback />`, `<Branding />`
+are all caught. **M32** the unused-env search covers py/go/rs/rb/php/java/kt/cs/sh and
+extraction is anchored on `=`. **M34** an invalid vendor regex exits 2.
+
+#### Confirmed still OPEN (22)
+
+Ordered by what I'd fix first. None is a remote-exploitable hole; they are resource,
+correctness and containment issues.
+
+**Worth fixing next**
+
+- **M1** (plumby) — a `bash` timeout kills only the shell, **orphaning every
+  grandchild**. Verified empirically: timeout fired correctly at 1.2s, `timedOut:true`,
+  and the background grandchild still ran to completion and touched its marker file.
+  Needs a detached process group and a group kill.
+- **M3** (plumby) — `read_file` does `await fs.readFile(target, 'utf8')` and only then
+  caps output. `stat` is already in hand two lines earlier, so a multi-GB file inside
+  the workspace OOMs the agent. One comparison away.
+- **M7** (plumby) — SSE ignores `res.write`'s return value, never waits for `drain`,
+  and caps nothing. A stalled reader queues every frame until OOM.
+- **M13** (plumby) — path-containment TOCTOU: the realpath check and the write are
+  separate, with no `O_NOFOLLOW` or post-open `fstat`.
+- **M19** (ai-app-builder) — `close()` never ends live SSE responses, so shutdown hangs.
+- **M18** (ai-app-builder) — the `sessions` map is never evicted; unbounded growth.
+- **M29** (ai-app-builder) — nothing ever stops a Dev_Server (`devServer.stop` is
+  called nowhere).
+
+**Correctness / quality**
+
+- **M2** (plumby) — `verify` classifies `scripts.test` but runs `npm test`, so a
+  malicious `pretest` never passes the guard. The docstring claims otherwise.
+- **M4** (plumby) — `cleanSplitPoint` re-slices and re-reduces the whole retained tail
+  on every step, with three regex tests per character underneath. O(n²) on the
+  synchronous path right before a turn.
+- **M5** (plumby) — `provider.contextWindow` is fixed at the boot model and preferred
+  over the table; benign for Anthropic, wrong for a provider spanning 8k–2M.
+- **M8** (plumby) — `multi_edit` is wired into neither surface's diff nor summary
+  (0 references in `src/web` and `src/cli`), so the highest-risk file operation renders
+  as raw JSON.
+- **M9** (plumby) — the `todos` event is emitted and consumed by nobody, while the tool
+  description tells the model the user can see the list.
+- **M12** (plumby) — workspace steering and skills are folded into the system prompt
+  with **no trust gate**, so a cloned repo's `.plumby/steering/*.md` gets
+  system-prompt authority. Medium only because it needs the user to run against
+  untrusted code, which is the primary use case.
+- **M17** (ai-app-builder) — the one-turn lock is keyed `accountId::projectId`, not per
+  project, so two accounts on a shared project can run concurrent turns.
+- **M20** (ai-app-builder) — `CommandGuard` does not wrap `manager.exec`, so it throws
+  instead of denying.
+- **M33** (agent-skills-lockin) — **partially** fixed. `vendor-lockin-guard/SKILL.md`
+  now references the script, but `devendor-project/SKILL.md` still prescribes
+  bare-vocabulary greps and never mentions `detect-lockin.sh`.
+- **M15, M25, M26, M27, M28, M30** — reviewed and left as reported: raw turn error
+  broadcast, egress host classification edge cases, `supportsEgressFiltering` unused,
+  refinement edit-path containment, refinement rollback lossiness, self-healing
+  over-normalisation.
+
+#### Low (11)
+
+Not individually re-verified. They are cosmetic or documentation-level; the audit
+gives file and line for each.
 
 ## Suggested next step
 
