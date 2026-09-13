@@ -1,35 +1,50 @@
 /*
- * styles.css — Web UI stylesheet (spec Tasks 1.2 / 10.1 / 11.1 / 12.1,
- *  Req 1.4 / 8 / 9.1 / 10 / 11).
+ * styles.css — Web UI stylesheet. REWRITTEN for the ui-redesign spec.
  *
- * Palette-driven by design: EVERY color below is read from a `--color-*` CSS
- * custom property, NEVER a hard-coded hex (the only exception is pure white/
- * black scaffolding on the QR image, which must be true monochrome to scan).
- * A Theme is applied at runtime by setting those NINE custom properties on
- * `document.documentElement` via the CSSOM (theme.js `applyPalette`), which is
- * NOT an inline <style> element, so it stays CSP-legal under style-src 'self'.
- * The nine names are EXACTLY the ones design Property 26 asserts — one per
- * THEME_CATALOG palette key: --color-background, --color-surface,
- * --color-accent, --color-button, --color-badge, --color-statusInfo,
- * --color-statusSuccess, --color-statusWarning, --color-statusError — so a
- * `theme` frame's palette maps 1:1 onto them.
+ * ============================ THE ONE HARD RULE ============================
+ * Every raw colour literal in this file lives in the `:root` TOKEN BLOCK below,
+ * ABOVE the first `the shell rule` rule. Below that point, colour is referenced ONLY
+ * through `var(--color-*)`.
  *
- * The :root fallbacks are a neutral light default only — the bootstrap colors
- * shown before the committed Theme's palette is applied; a palette set on
- * documentElement overrides them wholesale.
+ * That is not style preference, it is a shipped contract:
+ *   - web-ui-mobile-command-center.integration.test.js slices this file from the
+ *     first `the shell rule` and asserts every hex found is `#ffffff` (the QR scaffold,
+ *     which must be true monochrome to scan).
+ *   - web-ui-layout-geometry.test.js asserts every colour declaration below
+ *     `the shell rule` matches /var\(--color-[A-Za-z]+\)/ — letters only, no hyphens.
+ *     Hence the camelCase token names (`--color-textMuted`, not
+ *     `--color-text-muted`). One namespace keeps the sheet compliant AND the
+ *     system coherent.
+ * ==========================================================================
  *
- * Visual direction: a clean, modern, CHAT-FIRST builder — a calm single main
- * column with a persistent slim top header, generous spacing, rounded surfaces,
- * the conversation/activity front-and-centre, and the preview as a secondary
- * panel that slides in beside the column on wide viewports and folds into the
- * single column on a phone. The SAME layout collapses gracefully to one column
- * at 360px (Req 11.1/11.2) — driven by media queries + the shell's
- * data-single-column attribute, no separate mobile stylesheet.
+ * WHY THIS FILE WAS REWRITTEN
+ * The previous sheet defined fifteen custom properties: nine palette colours and
+ * six geometry values. No foreground token, no type scale, no elevation, no
+ * motion, no spacing scale, no radius hierarchy, no border or state vocabulary.
+ * `body { color: var(--color-accent) }` painted body copy in the theme's ACCENT
+ * hue, which failed WCAG AA on four of the eight shipped themes. Nine hues were
+ * being asked to carry an entire interface and could not.
+ *
+ * THE TOKEN PIPELINE (information only ever flows DOWN)
+ *   LAYER 0  the nine themeable palette inputs        — set by theme.js applyPalette
+ *   LAYER 1  derived DECISIONS (ink/paper/on-*)       — set by applyDerivedDecisions
+ *   LAYER 2  derived GRADATIONS (color-mix over 0+1)  — this file
+ *   LAYER 3  non-colour scales (type/space/radius/elevation/motion) — this file
+ *   LAYER 4  density profiles, keyed off data-experience            — this file
+ *   LAYER 5  component rules: consume tokens, never introduce colour
+ *   LAYER 6  the five Workspace_Experience geometries
+ * A component rule can never introduce a colour, only consume a token. That is
+ * what makes the eight-theme guarantee mechanical rather than a matter of care.
+ *
+ * DIRECTION: neutrals carry the layout and the palette accents it; separation is
+ * by hairline rather than fill; elevation means "floats" and has three levels;
+ * mono means "this is a literal"; motion is under 160ms and only ever explains a
+ * state change; density is rhythm, not scale.
  */
 
 :root {
-  /* The nine palette custom properties (design Property 26 names). Neutral
-     light bootstrap defaults; overwritten by a committed Theme's palette. */
+  /* ---- LAYER 0 bootstrap: the nine themeable inputs. Overwritten wholesale by
+     a committed Theme's palette via the CSSOM. Neutral light defaults only. ---- */
   --color-background: #ffffff;
   --color-surface: #f5f6f8;
   --color-accent: #2563eb;
@@ -40,17 +55,112 @@
   --color-statusWarning: #d97706;
   --color-statusError: #dc2626;
 
-  /* Neutral text/foreground derived tokens. These are structural (not part of
-     the themeable palette) but still reference palette vars so a dark palette
-     reads correctly: text uses accent-neutral surfaces. */
-  --space: 1rem;
-  --radius: 0.75rem;
-  --radius-sm: 0.5rem;
-  --touch: 2.75rem; /* >=44px touch target (Req 11.3) */
-  --header-h: 3.5rem;
-  --maxw: 52rem;
+  /* ---- LAYER 1 bootstrap: derived decisions. theme.js recomputes these per
+     palette (luminance branching cannot be done in CSS). These fallbacks make
+     the sheet correct before the first palette lands. ---- */
+  --color-ink: #151a21;
+  --color-paper: #ffffff;
+  --color-shadow: #2f3742;
+  --color-onBackground: #151a21;
+  --color-onSurface: #151a21;
+  --color-onAccent: #ffffff;
+  --color-onButton: #ffffff;
+  --color-onBadge: #151a21;
+  --color-onStatusInfo: #ffffff;
+  --color-onStatusSuccess: #ffffff;
+  --color-onStatusWarning: #151a21;
+  --color-onStatusError: #ffffff;
+  --is-dark: 0;
+
+  /* ---- LAYER 2: derived gradations. Pure functions of Layer 0 + Layer 1, in
+     oklab so the mixes stay perceptually even across all eight palettes. ---- */
+  --color-text: var(--color-onBackground);
+  --color-textMuted: color-mix(in oklab, var(--color-onBackground) 66%, var(--color-background));
+  --color-textSubtle: color-mix(in oklab, var(--color-onBackground) 45%, var(--color-background));
+  --color-border: color-mix(in oklab, var(--color-onBackground) 14%, var(--color-background));
+  --color-borderStrong: color-mix(in oklab, var(--color-onBackground) 26%, var(--color-background));
+  --color-surfaceRaised: var(--color-surface);
+  --color-surfaceSunken: color-mix(in oklab, var(--color-surface) 62%, var(--color-background));
+  --color-surfaceSelected: color-mix(in oklab, var(--color-onBackground) 6%, var(--color-surface));
+  --color-hover: color-mix(in oklab, var(--color-onBackground) 8%, var(--color-background));
+  --color-active: color-mix(in oklab, var(--color-onBackground) 14%, var(--color-background));
+  --color-accentTint: color-mix(in oklab, var(--color-accent) 12%, var(--color-background));
+  --color-accentTintStrong: color-mix(in oklab, var(--color-accent) 22%, var(--color-background));
+  --color-diffAdd: color-mix(in oklab, var(--color-statusSuccess) 13%, var(--color-background));
+  --color-diffDel: color-mix(in oklab, var(--color-statusError) 13%, var(--color-background));
+  --color-focusRing: var(--color-accent);
+
+  /* ---- LAYER 3: type. Base is 0.875rem because this carries dense machine
+     output (build logs, diffs, tool calls), not prose. ---- */
+  --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-md: 1rem;
+  --text-lg: 1.125rem;
+  --text-xl: 1.375rem;
+  --text-2xl: 1.75rem;
+  --leading-tight: 1.3;
+  --leading-snug: 1.45;
+  --leading-normal: 1.55;
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --tracking-tight: -0.011em;
+  --tracking-wide: 0.02em;
+
+  /* ---- LAYER 3: space, on a 4px base ---- */
+  --space-0: 0;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+
+  /* ---- LAYER 3: radius hierarchy. Replaces the uniform 12px-on-everything,
+     which is itself a strong generated-UI signal. ---- */
+  --radius-xs: 3px;
+  --radius-sm: 5px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-full: 999px;
+
+  /* ---- LAYER 3: elevation. Three levels, no more. Tinted from the derived ink
+     rather than pure black, so shadows sit INSIDE the theme. ---- */
+  --elev-0: none;
+  --elev-1: 0 1px 2px -1px color-mix(in oklab, var(--color-shadow) 30%, transparent);
+  --elev-2:
+    0 10px 30px -10px color-mix(in oklab, var(--color-shadow) 42%, transparent),
+    0 2px 6px -2px color-mix(in oklab, var(--color-shadow) 26%, transparent);
+  --elev-3:
+    0 24px 60px -16px color-mix(in oklab, var(--color-shadow) 48%, transparent),
+    0 4px 12px -4px color-mix(in oklab, var(--color-shadow) 28%, transparent);
+
+  /* ---- LAYER 3: motion. Nothing exceeds 160ms; nothing animates on load. ---- */
+  --dur-fast: 90ms;
+  --dur-base: 140ms;
+  --ease: cubic-bezier(0.2, 0, 0.38, 1);
+
+  /* ---- Invariants ---- */
+  --touch: 2.75rem; /* >=44px. A FLOOR in both density profiles. */
+  --header-h: 3rem;
+  --maxw: 60rem;
+
+  /* ---- LAYER 4 defaults: comfortable rhythm. Density profiles below override
+     these per experience; the type and space SCALES never change. ---- */
+  --gap-region: var(--space-4);
+  --gap-stack: var(--space-3);
+  --pad-surface: var(--space-4);
+  --pad-control: var(--space-3);
+  --row-h: 2.25rem;
+  --stream-leading: var(--leading-normal);
 }
 
+/* Global border-box reset. Load-bearing: asserted verbatim by
+   web-ui-mobile-command-center.integration.test.js. */
 *,
 *::before,
 *::after {
@@ -66,821 +176,534 @@ body {
 
 body {
   background-color: var(--color-background);
-  color: var(--color-accent);
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  line-height: 1.5;
-  /* Room for notches / rounded corners on phones (mobile-command-center). */
+  color: var(--color-text);
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   padding: env(safe-area-inset-top) env(safe-area-inset-right)
     env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
-/* The app root fills the viewport so the shell can lay itself out. */
 #app,
 [data-app-root] {
   display: block;
   min-height: 100vh;
 }
 
-.app-shell {
-  display: block;
-  width: 100%;
-  min-height: 100vh;
+/* Monospace is SEMANTIC: it means "this is a literal". Never decorative. */
+code,
+kbd,
+samp,
+pre {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
 }
 
+/* One focus treatment, everywhere. */
+:focus-visible {
+  outline: 2px solid var(--color-focusRing);
+  outline-offset: 2px;
+  border-radius: var(--radius-xs);
+}
+
+button {
+  font-family: inherit;
+}
+
+/* The pre-boot fallback shell (index.html renders this before the module runs). */
+.app-shell {
+  display: grid;
+  place-content: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: 100vh;
+  padding: var(--space-6);
+}
+
+.app-shell__title {
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+}
+
+.app-shell__status {
+  margin: 0;
+  color: var(--color-textMuted);
+  font-size: var(--text-sm);
+}
 
 /* ===================================================================== *
- * The workspace shell — the FIVE real Workspace_Experience geometries    *
- * (Tasks 10.1 / 12.1, Req 8.3, 11.1; platform Req 27.2, 27.4, 27.8)      *
- *                                                                        *
- * views/layout.js renders one container per region named in the ACTIVE    *
- * layout descriptor and marks the shell with data-experience,             *
- * data-orientation, data-regions and, per container, data-region /        *
- * data-role / data-size. THIS file turns those attributes into the actual *
- * geometry, so each experience is a genuinely different arrangement:      *
- *                                                                        *
- *   kiro-style / custom  : two columns — left (activity + compose +       *
- *                          files) and right (preview).                    *
- *   vibe-first           : one conversation-forward column with the       *
- *                          compose surface foregrounded (emphasis) and    *
- *                          the preview a collapsed aside beneath it.      *
- *   technical-workbench  : an IDE cockpit — pinned header, left sidebar   *
- *                          (file/tool panel), large central editor area   *
- *                          (preview), and a bottom dock spanning under    *
- *                          both holding compose + the Activity_Stream.    *
- *   mobile-command-center: one stacked, touch-operable column.            *
- *                                                                        *
- * Every geometry is palette-driven (only --color-* custom properties) and *
- * every one collapses to a single column at <=720px and cannot overflow   *
- * horizontally at 360px (border-box + min-width:0 + max-width:100%).      *
+ * THE SHELL                                                              *
+ * views/layout.js renders one container per region in the ACTIVE layout   *
+ * descriptor and marks the shell with data-experience / data-orientation /*
+ * data-regions, and each container with data-region / data-role /         *
+ * data-size / data-emphasis. This file turns those attributes into        *
+ * geometry. Those attributes are UNCHANGED by the redesign.               *
  * ===================================================================== */
 
 .shell {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
-  width: 100%;
-  max-width: 100%;
-  /* No experience may scroll the page sideways on a phone (Req 11.2). */
+  /* The shell never scrolls sideways — the 360px no-overflow guarantee. */
   overflow-x: hidden;
+  background-color: var(--color-background);
 }
 
-/* The pinned top-bar region — always visible, full-width, at 360px too. */
-.shell__header {
-  position: sticky;
-  top: 0;
-  z-index: 10;
+.shell__main {
+  /* min-width:0 + width:100% are what actually prevent horizontal overflow. */
+  min-width: 0;
   width: 100%;
-  max-width: 100%;
-  background-color: var(--color-surface);
-  border-bottom: 1px solid var(--color-badge);
-}
-
-/* The body is the REGION GRID. The default (two-column) template is the
-   kiro-style/custom arrangement; each experience overrides it below. */
-.shell__body {
   flex: 1 1 auto;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 24rem);
-  gap: var(--space);
-  width: 100%;
-  max-width: 80rem;
-  margin: 0 auto;
-  padding: var(--space);
+  display: flex;
+  flex-direction: column;
 }
 
-/* A region container: one per descriptor region, whatever it is named. */
+.shell__body {
+  display: grid;
+  gap: var(--gap-region);
+  padding: var(--gap-region);
+  min-width: 0;
+  width: 100%;
+  align-items: start;
+  flex: 1 1 auto;
+}
+
 .shell__region {
   min-width: 0;
   max-width: 100%;
   display: flex;
   flex-direction: column;
-  gap: var(--space);
+  gap: var(--gap-stack);
 }
 
 .shell__region[hidden] {
   display: none;
 }
 
-/* Honor the descriptor's DECLARED region order even for an arbitrary persisted
-   `custom` arrangement (Req 27.4): the layout view mirrors each body region's
-   declared index onto data-index. */
-.shell__region[data-index="0"] { order: 0; }
-.shell__region[data-index="1"] { order: 1; }
-.shell__region[data-index="2"] { order: 2; }
-.shell__region[data-index="3"] { order: 3; }
-.shell__region[data-index="4"] { order: 4; }
-.shell__region[data-index="5"] { order: 5; }
-
-/* The primary body-region slot. */
-.shell__main {
-  min-width: 0; /* allow the column to shrink below content width (no overflow) */
-  display: flex;
-  flex-direction: column;
-  gap: var(--space);
-  width: 100%;
-}
-
-/* The secondary body-region slot — a side panel on wide viewports. */
-.shell__panel {
-  min-width: 0;
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  position: sticky;
-  top: calc(var(--header-h) + var(--space));
-  align-self: start;
-  max-height: calc(100vh - var(--header-h) - 2 * var(--space));
-  overflow: auto;
-}
-
-.shell__panel[hidden] {
-  display: none;
-}
-
-/* A surface wrapper inside a region. `data-size` is the descriptor's sizing,
-   `data-emphasis` its foregrounding, `data-collapsed` its collapse state. */
 .shell__surface {
   min-width: 0;
   max-width: 100%;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-}
-
-/* A surface the descriptor marks visible:false stays mounted but unrendered. */
-.shell__surface[hidden] {
-  display: none;
-}
-
-.shell__surface[data-size="flex"] {
-  flex: 1 1 auto;
   min-height: 0;
 }
 
-.shell__surface[data-size="auto"] {
-  flex: 0 0 auto;
-}
-
-/* A collapsed surface shows ONLY its toggle, so it is always still reachable. */
-.shell__surface[data-collapsed="true"] {
-  flex: 0 0 auto;
+.shell__surface[hidden] {
+  display: none;
 }
 
 .shell__surface > [hidden] {
   display: none;
 }
 
-/* emphasis:'primary' (vibe-first's compose) — foregrounded, not just first. */
-.shell__surface[data-emphasis="primary"] {
-  order: -1;
-  padding: var(--space);
-  border: 2px solid var(--color-accent);
-  border-radius: var(--radius);
-  background-color: var(--color-surface);
+.shell__surface[data-size="flex"] {
+  flex: 1 1 auto;
 }
 
-/* The collapse toggle: touch-sized (Req 11.3) and palette-driven. */
+.shell__surface[data-size="auto"] {
+  flex: 0 0 auto;
+}
+
+/* The descriptor's emphasis:primary — the ONE accent job on a screen. */
+.shell__surface[data-emphasis="primary"] {
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-md);
+  padding: var(--pad-surface);
+  background-color: var(--color-background);
+  box-shadow: var(--elev-1);
+}
+
 .shell__collapse-toggle {
-  align-self: flex-start;
   min-height: var(--touch);
   min-width: var(--touch);
-  padding: 0.35rem 0.9rem;
-  font: inherit;
-  font-weight: 600;
-  color: var(--color-accent);
-  background-color: var(--color-badge);
-  border: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 0 var(--pad-control);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--color-text);
+  background-color: var(--color-surfaceSunken);
+  border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   cursor: pointer;
+  transition:
+    background-color var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
 }
 
-.shell__collapse-toggle[hidden] {
-  display: none;
+.shell__collapse-toggle:hover {
+  background-color: var(--color-hover);
+  border-color: var(--color-borderStrong);
 }
 
-/* The compose surface: confirms sit above the prompt so an approval is
-   front-and-centre while the compose box stays anchored at the bottom flow. */
-.shell__compose {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
+.shell__settings-toggle {
+  min-height: var(--touch);
+  padding: 0 var(--pad-control);
+  font-size: var(--text-sm);
+  color: var(--color-textMuted);
+  background-color: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--ease),
+    background-color var(--dur-fast) var(--ease);
+}
+
+.shell__settings-toggle:hover {
+  color: var(--color-text);
+  background-color: var(--color-hover);
 }
 
 .shell__attribution {
-  margin: 0;
-  padding: 0.5rem var(--space);
-  text-align: center;
-  font-size: 0.8rem;
-  color: var(--color-badge);
+  padding: var(--space-2) var(--gap-region);
+  font-size: var(--text-xs);
+  color: var(--color-textSubtle);
 }
 
-.shell__attribution[hidden] {
-  display: none;
+.shell__compose {
+  min-width: 0;
+  max-width: 100%;
 }
-
 
 /* --------------------------------------------------------------------- *
- * kiro-style + custom: two columns — conversation left, preview right.   *
+ * LAYER 6: the five Workspace_Experience geometries.                     *
+ * Each is a genuinely different arrangement, and each pair differs.       *
  * --------------------------------------------------------------------- */
 
-.shell[data-experience="kiro-style"] .shell__body,
-.shell[data-experience="custom"] .shell__body {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 26rem);
-  align-items: start;
+/* kiro-style — two columns: work on the left, live preview on the right. */
+.shell[data-experience="kiro-style"] .shell__body {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 22rem);
+  grid-template-rows: minmax(0, 1fr);
 }
 
-.shell[data-experience="kiro-style"] .shell__region[data-region="left"],
-.shell[data-experience="custom"] .shell__region[data-region="left"] {
-  grid-column: 1;
-}
-
-.shell[data-experience="kiro-style"] .shell__region[data-region="right"],
-.shell[data-experience="custom"] .shell__region[data-region="right"] {
-  grid-column: 2;
-}
-
-
-/* --------------------------------------------------------------------- *
- * vibe-first: ONE conversation-forward column, compose foregrounded, the *
- * preview a collapsed aside beneath it.                                  *
- * --------------------------------------------------------------------- */
-
+/* vibe-first — one conversation-forward column, preview folded beneath. */
 .shell[data-experience="vibe-first"] .shell__body {
   grid-template-columns: minmax(0, 1fr);
-  grid-template-areas:
-    "main"
-    "aside";
-  max-width: 58rem;
-}
-
-.shell[data-experience="vibe-first"] .shell__region[data-region="main"] {
-  grid-area: main;
+  grid-template-rows: auto auto;
+  grid-template-areas: "main" "aside";
+  max-width: var(--maxw);
+  margin: 0 auto;
 }
 
 .shell[data-experience="vibe-first"] .shell__region[data-region="aside"] {
   grid-area: aside;
-  position: static;
-  max-height: none;
-  overflow: visible;
 }
 
 .shell[data-experience="vibe-first"] .shell__surface[data-emphasis="primary"] {
-  /* The compose box is the loudest thing on the surface here. */
-  padding: calc(var(--space) * 1.25);
-  border-width: 2px;
-  border-radius: var(--radius);
-  background-color: var(--color-surface);
+  border-color: var(--color-accent);
+  box-shadow: var(--elev-2);
+  padding: var(--space-5);
 }
 
-
-/* --------------------------------------------------------------------- *
- * technical-workbench: the IDE cockpit (Req 27.8) — a real developer     *
- * geometry, not the chat shell. Pinned header (above), left sidebar for  *
- * the file/tool panel, a large central editor area for the preview, and  *
- * a bottom dock spanning under BOTH holding compose + Activity_Stream.   *
- * Original, clean-room layout; theme-able like every other experience    *
- * (colors are palette variables only, Req 29).                          *
- * --------------------------------------------------------------------- */
-
+/* technical-workbench — an IDE cockpit: sidebar beside a large editor, with a
+   dock spanning the full width beneath both. */
 .shell[data-experience="technical-workbench"] .shell__body {
-  grid-template-columns: minmax(0, 18rem) minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr) minmax(11rem, 0.55fr);
+  grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) minmax(0, 18rem);
   grid-template-areas:
     "sidebar editor"
     "dock dock";
-  max-width: none;
   height: calc(100vh - var(--header-h));
   gap: 1px;
   padding: 0;
-  /* The 1px gaps read as pane seams in the active palette. */
+  /* The 1px gap over this background IS the pane seam. --color-badge is the
+     asserted token for it (web-ui-layout-geometry.test.js). */
   background-color: var(--color-badge);
 }
 
 .shell[data-experience="technical-workbench"] .shell__region {
-  padding: 0.5rem;
-  gap: 0.5rem;
   overflow: auto;
   background-color: var(--color-background);
+  padding: var(--space-3);
 }
 
 .shell[data-experience="technical-workbench"] .shell__region[data-region="sidebar"] {
   grid-area: sidebar;
-  position: static;
-  max-height: none;
-  background-color: var(--color-surface);
+  background-color: var(--color-surfaceSunken);
 }
 
 .shell[data-experience="technical-workbench"] .shell__region[data-region="editor"] {
   grid-area: editor;
-  position: static;
-  max-height: none;
 }
 
 .shell[data-experience="technical-workbench"] .shell__region[data-region="dock"] {
   grid-area: dock;
-  background-color: var(--color-surface);
-  border-top: 1px solid var(--color-badge);
 }
 
+/* mobile-command-center — one stacked, touch-operable column. */
+.shell[data-experience="mobile-command-center"] .shell__body {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto;
+  gap: var(--space-3);
+  padding: var(--space-3);
+}
+
+/* custom — starts as the kiro-style split until the user rearranges it. */
+.shell[data-experience="custom"] .shell__body {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 20rem);
+  grid-template-rows: auto;
+}
 
 /* --------------------------------------------------------------------- *
- * mobile-command-center: one stacked, touch-operable column.             *
+ * LAYER 4: density profiles, selected from data-experience.              *
+ * Gaps and interior padding only. The SCALES never change, and --touch   *
+ * is a floor in both profiles.                                          *
  * --------------------------------------------------------------------- */
 
-.shell[data-experience="mobile-command-center"] .shell__body,
-.shell[data-orientation="vertical"] .shell__body {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: none;
-  max-width: 44rem;
-  height: auto;
-  padding: 0.75rem;
-  gap: 0.75rem;
+/* compact — the workbench cockpit */
+.shell[data-experience="technical-workbench"] {
+  --gap-region: var(--space-2);
+  --gap-stack: var(--space-2);
+  --pad-surface: var(--space-3);
+  --pad-control: var(--space-2);
+  --row-h: 1.75rem;
+  --stream-leading: var(--leading-snug);
 }
 
-.shell[data-experience="mobile-command-center"] .shell__region[data-region="stack"] {
-  grid-column: 1;
-  position: static;
-  max-height: none;
-  overflow: visible;
+/* comfortable — conversation-forward and phone */
+.shell[data-experience="vibe-first"],
+.shell[data-experience="mobile-command-center"] {
+  --gap-region: var(--space-4);
+  --gap-stack: var(--space-3);
+  --pad-surface: var(--space-5);
+  --pad-control: var(--space-3);
+  --row-h: 2.25rem;
+  --stream-leading: var(--leading-normal);
 }
-
-.shell[data-experience="mobile-command-center"] .shell__collapse-toggle {
-  align-self: stretch;
-  text-align: left;
-}
-
-/* A top-bar region a descriptor leaves empty takes no space (a layout that
-   positions no Session_Header at all must not show a stray 1px bar). */
-.shell__header:empty {
-  display: none;
-  border-bottom: 0;
-}
-
-/*
- * Single-column collapse: the mobile-command-center experience AND any
- * phone-width viewport render the SAME shell as one calm touch column, with the
- * preview folded into the flow (Req 11.1, 11.2). The layout view sets
- * data-single-column="true"; the media query below catches narrow viewports for
- * the other experiences too, so every layout collapses gracefully on a phone.
- */
-.shell[data-single-column="true"] .shell__body {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-areas: none;
-  height: auto;
-}
-
-.shell[data-single-column="true"] .shell__panel {
-  position: static;
-  max-height: none;
-}
-
-/* Every experience — including the workbench grid — becomes ONE column on a
-   phone-width viewport (Req 11.1, 11.2). Same shell, no separate stylesheet. */
-@media (max-width: 720px) {
-  .shell__body {
-    grid-template-columns: minmax(0, 1fr);
-    padding: 0.75rem;
-  }
-  .shell__panel {
-    position: static;
-    max-height: none;
-  }
-  .shell[data-experience] .shell__body {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-areas: none;
-    grid-template-rows: auto;
-    height: auto;
-    max-width: 100%;
-    padding: 0.75rem;
-    gap: 0.75rem;
-  }
-  .shell[data-experience] .shell__region[data-region] {
-    grid-area: auto;
-    grid-column: 1;
-    position: static;
-    max-height: none;
-    overflow: visible;
-  }
-}
-
 
 /* ===================================================================== *
- * Session_Header — the slim top bar (Task 12.1, Req 10, 11.3, 11.4)     *
+ * SESSION HEADER — a slim instrument bar, not a title bar.               *
  * ===================================================================== */
 
 .session-header {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-  flex-wrap: wrap;
+  gap: var(--space-3);
   min-height: var(--header-h);
-  padding: 0.4rem var(--space);
-  width: 100%;
-}
-
-.session-header__brand {
-  font-weight: 700;
-  font-size: 1rem;
-  color: var(--color-accent);
-  white-space: nowrap;
-}
-
-/* The Work_Mode switch group — a segmented control of touch-sized buttons.
-   ALWAYS visible, including at 360px (Req 11.4). */
-.session-header__modes {
-  display: inline-flex;
-  gap: 0.25rem;
-  padding: 0.2rem;
+  padding: 0 var(--space-4);
+  border-bottom: 1px solid var(--color-border);
   background-color: var(--color-background);
-  border: 1px solid var(--color-badge);
-  border-radius: 999px;
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  flex: none;
+}
+
+.session-header__title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+  color: var(--color-text);
+}
+
+.session-header__meta {
+  font-size: var(--text-xs);
+  color: var(--color-textSubtle);
+  font-family: var(--font-mono);
+}
+
+.session-header__spacer {
+  flex: 1 1 auto;
+}
+
+/* Work Mode: a segmented control. Mono because a mode is a literal token. */
+.session-header__modes {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
 }
 
 .session-header__mode {
-  min-height: 2.25rem; /* comfortable touch target within the slim bar */
-  min-width: 2.75rem;
-  padding: 0.35rem 0.9rem;
-  font: inherit;
-  font-weight: 600;
-  color: var(--color-accent);
+  min-height: var(--touch);
+  padding: 0 var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--color-textMuted);
   background-color: transparent;
-  border: none;
-  border-radius: 999px;
+  border: 0;
+  border-radius: var(--radius-xs);
   cursor: pointer;
+  transition:
+    background-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
 }
 
+.session-header__mode:hover {
+  color: var(--color-text);
+  background-color: var(--color-hover);
+}
+
+.session-header__mode[aria-pressed="true"],
 .session-header__mode[data-active="true"] {
-  color: var(--color-background);
-  background-color: var(--color-button);
+  color: var(--color-text);
+  background-color: var(--color-accentTintStrong);
 }
-
-.session-header__context {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin-left: auto;
-  flex-wrap: wrap;
-}
-
-.session-header__experience,
-.session-header__theme {
-  padding: 0.2rem 0.6rem;
-  font-size: 0.8rem;
-  color: var(--color-statusInfo);
-  background-color: var(--color-badge);
-  border-radius: 999px;
-  white-space: nowrap;
-}
-
-.session-header__experience[hidden],
-.session-header__theme[hidden] {
-  display: none;
-}
-
 
 /* ===================================================================== *
- * Workspace controls — experience + theme selectors (Tasks 10.1/11.1)  *
- * ===================================================================== */
-
-.workspace-controls {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  flex-wrap: wrap;
-}
-
-.workspace-controls__experience,
-.workspace-controls__theme {
-  min-height: 2.25rem;
-  padding: 0.3rem 0.5rem;
-  font: inherit;
-  color: var(--color-accent);
-  background-color: var(--color-background);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius-sm);
-}
-
-.workspace-controls__apply,
-.workspace-controls__cancel {
-  min-height: 2.25rem;
-  padding: 0.3rem 0.8rem;
-  font: inherit;
-  font-weight: 600;
-  border: none;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-
-.workspace-controls__apply {
-  color: var(--color-background);
-  background-color: var(--color-button);
-}
-
-.workspace-controls__cancel {
-  color: var(--color-accent);
-  background-color: var(--color-badge);
-}
-
-.workspace-controls__apply[hidden],
-.workspace-controls__cancel[hidden] {
-  display: none;
-}
-
-
-/* ===================================================================== *
- * Projects gate — the create-project entry point between login/builder  *
- * ===================================================================== */
-
-.projects-gate {
-  width: 100%;
-  max-width: var(--maxw);
-  margin: 0 auto;
-  padding: var(--space);
-}
-
-.projects-gate[hidden] {
-  display: none;
-}
-
-.projects {
-  display: block;
-  width: 100%;
-}
-
-.projects__form {
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-  width: 100%;
-  padding: var(--space);
-  background-color: var(--color-surface);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius);
-}
-
-.projects__category,
-.projects__origin,
-.projects__description,
-.projects__template,
-.projects__repo,
-.projects__source {
-  width: 100%;
-  min-height: var(--touch);
-  padding: 0.6rem 0.75rem;
-  font: inherit;
-  color: var(--color-accent);
-  background-color: var(--color-background);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius-sm);
-}
-
-.projects__submit {
-  min-height: var(--touch);
-  min-width: var(--touch);
-  padding: 0.6rem 1.25rem;
-  font: inherit;
-  font-weight: 600;
-  color: var(--color-background);
-  background-color: var(--color-button);
-  border: none;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-
-.projects__notice {
-  margin: 0.5rem 0 0;
-  padding: 0.6rem 0.9rem;
-  border-radius: var(--radius-sm);
-  background-color: var(--color-surface);
-  color: var(--color-statusWarning);
-}
-
-.projects__notice[hidden] {
-  display: none;
-}
-
-
-/* ===================================================================== *
- * Prompt / compose (Task 3.2, Req 2.1 / 2.5 / 11.3)                     *
- * ===================================================================== */
-
-.prompt {
-  display: block;
-  width: 100%;
-}
-
-.prompt__form {
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
-  width: 100%;
-  padding: 0.75rem;
-  background-color: var(--color-surface);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius);
-}
-
-.prompt__input {
-  width: 100%;
-  min-height: 5.5rem;
-  padding: 0.75rem;
-  font: inherit;
-  color: var(--color-accent);
-  background-color: var(--color-background);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius-sm);
-  resize: vertical;
-}
-
-.prompt__input:disabled {
-  opacity: 0.6;
-}
-
-.prompt__submit {
-  align-self: flex-end;
-  min-height: var(--touch);
-  min-width: var(--touch);
-  padding: 0.6rem 1.5rem;
-  font: inherit;
-  font-weight: 600;
-  color: var(--color-background);
-  background-color: var(--color-button);
-  border: none;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-
-.prompt__submit:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
-
-.prompt__indicator {
-  align-self: flex-start;
-  padding: 0.3rem 0.75rem;
-  border-radius: 999px;
-  background-color: var(--color-badge);
-  color: var(--color-statusInfo);
-  font-size: 0.9rem;
-}
-
-.prompt__notice {
-  margin: 0.5rem 0 0;
-  padding: 0.6rem 0.9rem;
-  border-radius: var(--radius-sm);
-  background-color: var(--color-surface);
-  color: var(--color-statusWarning);
-}
-
-
-/* ===================================================================== *
- * Activity_Stream (Task 4.3)                                            *
+ * ACTIVITY STREAM — the five kinds at genuinely different authority.      *
  * ===================================================================== */
 
 .activity {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  width: 100%;
-  min-height: 12rem;
-  padding: 0.75rem;
-  background-color: var(--color-surface);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius);
-  overflow-wrap: anywhere;
+  gap: var(--gap-stack);
+  min-width: 0;
+}
+
+.activity__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-stack);
+  min-width: 0;
 }
 
 .activity__item {
   margin: 0;
-  padding: 0.4rem 0.6rem;
+  min-width: 0;
+  line-height: var(--stream-leading);
+}
+
+.activity__text {
+  margin: 0;
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+/* reasoning recedes: it is thinking-out-loud, not conclusions. */
+.activity__item[data-kind="reasoning"] .activity__text {
+  color: var(--color-textMuted);
+  font-size: var(--text-sm);
+}
+
+/* a tool call is a literal action: mono, on a sunken surface. */
+.activity__item[data-kind="tool"] .activity__text {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-textMuted);
+  background-color: var(--color-surfaceSunken);
+  border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
-  background-color: var(--color-background);
-  color: var(--color-accent);
+  padding: var(--space-2) var(--space-3);
 }
 
 .activity__status {
-  padding: 0.3rem 0.6rem;
-  color: var(--color-statusInfo);
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--color-textMuted);
+}
+
+/* Status carries a DOT as well as a hue — never colour alone. */
+.activity__status::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-radius: var(--radius-full);
+  background-color: var(--color-statusSuccess);
 }
 
 .activity__reconnect {
   min-height: var(--touch);
-  padding: 0.5rem 1rem;
-  font: inherit;
-  color: var(--color-background);
-  background-color: var(--color-button);
-  border: none;
+  padding: 0 var(--space-4);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--color-text);
+  background-color: transparent;
+  border: 1px solid var(--color-borderStrong);
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
 
-/* Diff markers: the +/- prefix is textual DATA (Req 3.4); color is additive. */
-.activity__diff-line--added {
-  color: var(--color-statusSuccess);
+.activity__reconnect:hover {
+  background-color: var(--color-hover);
 }
 
-.activity__diff-line--removed {
-  color: var(--color-statusError);
+/* ---- diffs: a bordered object, with the marker as TEXT (Req 3.4) ---- */
+.activity__diff {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  min-width: 0;
 }
 
+.activity__diff-path {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-textMuted);
+  background-color: var(--color-surfaceSunken);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.activity__diff-notice {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--color-textSubtle);
+}
+
+.activity__diff-line {
+  display: flex;
+  gap: var(--space-3);
+  padding: 1px var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  min-width: 0;
+}
+
+/* The marker glyph is DATA in the DOM. Colour and gutter are additive only, so
+   added/removed stay distinguishable with colour entirely absent. */
+.activity__diff-marker {
+  width: 0.75rem;
+  flex: none;
+  color: var(--color-textSubtle);
+  user-select: none;
+}
+
+.activity__diff-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-text);
+}
+
+.activity__diff-line[data-marker="+"] {
+  background-color: var(--color-diffAdd);
+  box-shadow: inset 2px 0 0 var(--color-statusSuccess);
+}
+
+.activity__diff-line[data-marker="-"] {
+  background-color: var(--color-diffDel);
+  box-shadow: inset 2px 0 0 var(--color-statusError);
+}
 
 /* ===================================================================== *
- * Preview_Pane (Task 5.3, Req 4.1–4.6, 4.10, 4.11)                      *
- * ===================================================================== */
-
-.preview {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  width: 100%;
-  padding: 0.75rem;
-  background-color: var(--color-surface);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius);
-}
-
-.preview__frame {
-  width: 100%;
-  min-height: 20rem;
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius-sm);
-  background-color: var(--color-background);
-}
-
-.preview__loading,
-.preview__status {
-  margin: 0;
-  padding: 0.5rem 0.75rem;
-  color: var(--color-statusInfo);
-}
-
-.preview__cause {
-  margin: 0;
-  padding: 0.25rem 0.75rem;
-  color: var(--color-statusWarning);
-}
-
-.preview__url-error {
-  margin: 0;
-  padding: 0.5rem 0.75rem;
-  color: var(--color-statusError);
-}
-
-.preview__restart {
-  min-height: var(--touch);
-  padding: 0.5rem 1rem;
-  color: var(--color-background);
-  background-color: var(--color-button);
-  border: none;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-
-.preview__mobile {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem;
-}
-
-.preview__mobile-hint {
-  margin: 0;
-  color: var(--color-accent);
-}
-
-.preview__mobile-url {
-  user-select: all;
-  word-break: break-all;
-  padding: 0.25rem 0.5rem;
-  background-color: var(--color-background);
-  color: var(--color-accent);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius-sm);
-}
-
-.preview__mobile-qr {
-  width: 12rem;
-  height: 12rem;
-  max-width: 100%;
-  /* The QR must be true monochrome on white to scan reliably; this is not a
-     themeable surface color. */
-  background-color: #ffffff;
-  image-rendering: pixelated;
-}
-
-
-/* ===================================================================== *
- * Confirm approvals (Task 6.1, Req 5.1 / 5.3 / 11.3)                    *
+ * CONFIRM — the ONLY thing on screen that has left the plane, because it  *
+ * is the only thing that blocks the user.                                *
  * ===================================================================== */
 
 .confirm {
-  display: block;
-  width: 100%;
-}
-
-.confirm[hidden] {
-  display: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-stack);
 }
 
 .confirm__list {
@@ -889,450 +712,620 @@ body {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: var(--gap-stack);
 }
 
 .confirm__card {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  padding: 0.75rem;
-  background-color: var(--color-surface);
-  border: 1px solid var(--color-statusWarning);
-  border-radius: var(--radius);
-}
-
-.confirm__command {
-  margin: 0;
-  font-weight: 600;
-  color: var(--color-accent);
-  word-break: break-word;
+  background-color: var(--color-background);
+  border: 1px solid var(--color-borderStrong);
+  border-radius: var(--radius-lg);
+  padding: var(--pad-surface);
+  box-shadow: var(--elev-2);
 }
 
 .confirm__reason {
-  margin: 0;
-  color: var(--color-statusInfo);
-  word-break: break-word;
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--color-textMuted);
+}
+
+.confirm__command {
+  margin: 0 0 var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-text);
+  background-color: var(--color-surfaceSunken);
+  border: 1px solid var(--color-border);
+  border-left: 2px solid var(--color-statusWarning);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3);
+  overflow-wrap: anywhere;
 }
 
 .confirm__controls {
   display: flex;
+  gap: var(--space-2);
   flex-wrap: wrap;
-  gap: 0.5rem;
 }
 
 .confirm__approve,
 .confirm__deny {
   min-height: var(--touch);
-  min-width: var(--touch);
-  padding: 0.6rem 1.25rem;
-  font: inherit;
-  font-weight: 600;
-  border: none;
+  padding: 0 var(--space-5);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   border-radius: var(--radius-sm);
   cursor: pointer;
+  transition:
+    background-color var(--dur-base) var(--ease),
+    border-color var(--dur-base) var(--ease);
 }
 
+/* Approve is the single accent job here. Deny is a bordered ghost. */
 .confirm__approve {
-  color: var(--color-background);
+  color: var(--color-onButton);
   background-color: var(--color-button);
+  border: 1px solid transparent;
+  flex: 1 1 auto;
 }
 
 .confirm__deny {
-  color: var(--color-background);
-  background-color: var(--color-statusError);
+  color: var(--color-text);
+  background-color: transparent;
+  border: 1px solid var(--color-borderStrong);
+  flex: 1 1 auto;
 }
 
+.confirm__deny:hover {
+  background-color: var(--color-hover);
+}
 
 /* ===================================================================== *
- * File/tool panel surface (Req 27.2, 27.8)                              *
- * The fifth builder surface: the files the agent touched this session   *
- * (derived from the Activity_Stream's real diff frames) plus the tool    *
- * activity, and the selected file's latest change. Palette-driven.      *
+ * PROMPT / COMPOSE — the one elevated RESTING surface.                   *
  * ===================================================================== */
 
-.file-panel {
-  min-width: 0;
-  max-width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  padding: 0.75rem;
-  background-color: var(--color-surface);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius);
-}
-
-.file-panel__heading {
-  margin: 0;
-  font-size: 0.8rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--color-accent);
-}
-
-.file-panel__empty {
-  margin: 0;
-  font-size: 0.9rem;
-  color: var(--color-statusInfo);
-}
-
-.file-panel__empty[hidden] {
-  display: none;
-}
-
-.file-panel__list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
+.prompt {
   min-width: 0;
 }
 
-.file-panel__list[hidden] {
-  display: none;
-}
-
-.file-panel__file {
+.prompt__form {
   display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-  min-width: 0;
+  gap: var(--space-2);
+  align-items: flex-end;
+  padding: var(--space-2);
+  background-color: var(--color-background);
+  border: 1px solid var(--color-borderStrong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--elev-1);
+  transition: border-color var(--dur-base) var(--ease);
 }
 
-.file-panel__file-button {
+.prompt__form:focus-within {
+  border-color: var(--color-accent);
+}
+
+.prompt__input {
   flex: 1 1 auto;
   min-width: 0;
   min-height: var(--touch);
-  padding: 0.35rem 0.6rem;
-  font: inherit;
-  text-align: left;
-  overflow-wrap: anywhere;
-  color: var(--color-accent);
-  background-color: var(--color-background);
-  border: 1px solid var(--color-badge);
+  padding: var(--space-2);
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  line-height: var(--leading-snug);
+  color: var(--color-text);
+  background-color: transparent;
+  border: 0;
+  resize: vertical;
+}
+
+.prompt__input:focus {
+  outline: none;
+}
+
+.prompt__input::placeholder {
+  color: var(--color-textSubtle);
+}
+
+.prompt__submit {
+  min-height: var(--touch);
+  min-width: var(--touch);
+  padding: 0 var(--space-5);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--color-onButton);
+  background-color: var(--color-button);
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   cursor: pointer;
+  transition: opacity var(--dur-base) var(--ease);
 }
 
-.file-panel__file-button[aria-pressed="true"] {
-  border-color: var(--color-accent);
-  background-color: var(--color-badge);
+.prompt__submit[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
-.file-panel__file-meta {
-  flex: 0 0 auto;
-  font-size: 0.75rem;
-  color: var(--color-statusInfo);
-}
-
-.file-panel__detail {
-  min-width: 0;
+.prompt__indicator {
   display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-1) 0;
+  font-size: var(--text-xs);
+  color: var(--color-textMuted);
 }
 
-.file-panel__detail-path {
-  margin: 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.8rem;
-  overflow-wrap: anywhere;
-  color: var(--color-accent);
+.prompt__indicator::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-radius: var(--radius-full);
+  background-color: var(--color-statusInfo);
 }
 
-.file-panel__detail-notice,
-.file-panel__detail-hint {
-  margin: 0;
-  font-size: 0.8rem;
-  color: var(--color-statusWarning);
-}
-
-.file-panel__diff {
-  margin: 0;
-  padding: 0.5rem;
-  max-width: 100%;
-  max-height: 18rem;
-  overflow: auto;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.8rem;
-  background-color: var(--color-background);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius-sm);
-}
-
-.file-panel__diff-line {
-  display: block;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.file-panel__diff-line[data-marker="+"] {
-  color: var(--color-statusSuccess);
-}
-
-.file-panel__diff-line[data-marker="-"] {
+.prompt__notice {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
   color: var(--color-statusError);
 }
 
-.file-panel__diff-marker {
-  display: inline-block;
-  width: 1ch;
-  font-weight: 700;
-}
-
-.file-panel__tool {
-  font-size: 0.85rem;
-  overflow-wrap: anywhere;
-  color: var(--color-accent);
-}
-
-
-/* Narrow-phone tuning (Req 11.2): at 360px the primary column must not scroll
-   horizontally. Everything above is border-box + width:100% + min-width:0, so
-   nothing overflows; here we just tighten spacing and let the mode switch wrap. */
-@media (max-width: 400px) {
-  .shell__body {
-    padding: 0.6rem;
-    gap: 0.6rem;
-  }
-  .session-header {
-    padding: 0.4rem 0.6rem;
-    gap: 0.5rem;
-  }
-  .session-header__context {
-    margin-left: 0;
-    width: 100%;
-  }
-}
-
-
-
 /* ===================================================================== *
- * Settings surfaces (Tasks 14 / 15.1, Req 12–15, 11.3)                  *
- *                                                                       *
- * Palette-driven like the rest of the shell — every color reads a       *
- * --color-* custom property, never a literal. Controls a user taps are  *
- * touch-sized (min-height: var(--touch)) so the settings surfaces are   *
- * operable on a phone (Req 11.3). Shown/hidden by the router (app.js).  *
+ * PREVIEW — the running app, framed as the object it is.                 *
  * ===================================================================== */
 
-.shell__settings-toggle {
+.preview {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background-color: var(--color-background);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--elev-1);
+  overflow: hidden;
+}
+
+.preview__status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--color-textMuted);
+  background-color: var(--color-surfaceSunken);
+  border-bottom: 1px solid var(--color-border);
+  flex: none;
+}
+
+.preview__status::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex: none;
+  border-radius: var(--radius-full);
+  background-color: currentColor;
+}
+
+.preview__status[data-status="ready"] {
+  color: var(--color-statusSuccess);
+}
+
+.preview__status[data-status="loading"],
+.preview__status[data-status="showing_prior"] {
+  color: var(--color-statusWarning);
+}
+
+.preview__status[data-status="error"],
+.preview__status[data-status="persistent_failure"] {
+  color: var(--color-statusError);
+}
+
+.preview__frame {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 16rem;
+  border: 0;
+  background-color: var(--color-surfaceSunken);
+  display: block;
+}
+
+.preview__loading {
+  margin: 0;
+  padding: var(--space-5);
+  font-size: var(--text-sm);
+  color: var(--color-textMuted);
+  text-align: center;
+}
+
+.preview__cause,
+.preview__url-error {
+  margin: 0;
+  padding: var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--color-textMuted);
+  border-top: 1px solid var(--color-border);
+}
+
+.preview__restart {
   min-height: var(--touch);
-  min-width: var(--touch);
-  padding: 0.35rem 0.9rem;
-  margin-left: auto;
-  font: inherit;
-  font-weight: 600;
-  color: var(--color-accent);
-  background-color: var(--color-badge);
-  border: none;
+  padding: 0 var(--space-4);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  color: var(--color-text);
+  background-color: transparent;
+  border: 1px solid var(--color-borderStrong);
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
 
-.settings {
-  width: 100%;
-  max-width: var(--maxw);
-  margin: 0 auto;
-  padding: var(--space);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space);
+.preview__restart:hover {
+  background-color: var(--color-hover);
 }
 
-.settings[hidden] {
-  display: none;
+.preview__mobile {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  padding: var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+.preview__mobile-url {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-textMuted);
+  user-select: all;
+  overflow-wrap: anywhere;
+}
+
+.preview__mobile-hint {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--color-textSubtle);
+  flex-basis: 100%;
+}
+
+/* The QR must be TRUE monochrome to scan. This is the only hard-coded colour
+   below `.shell` in the whole file, and the shipped tests assert exactly that. */
+.preview__mobile-qr {
+  background-color: #ffffff;
+  padding: var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  image-rendering: pixelated;
+}
+
+/* ===================================================================== *
+ * FILE PANEL — mono paths on hairline rows. No filled cards.             *
+ * ===================================================================== */
+
+.files__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.files__item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--row-h);
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-textMuted);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.files__item[data-modified="true"] {
+  color: var(--color-statusWarning);
+}
+
+.files__item[aria-selected="true"] {
+  color: var(--color-text);
+  background-color: var(--color-accentTint);
+}
+
+/* ===================================================================== *
+ * FORMS — project creation and settings share one rhythm.                *
+ * ===================================================================== */
+
+.projects__form,
+.settings__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 34rem;
+}
+
+.projects__form label,
+.settings__form label,
+.settings__label {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--color-text);
+}
+
+.projects__description,
+.settings__description {
+  margin: 0;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-normal);
+  color: var(--color-textSubtle);
+}
+
+.projects__category,
+.projects__origin,
+.projects__template,
+.projects__repo,
+.projects__source,
+.settings__input,
+.settings__select {
+  min-height: var(--touch);
+  padding: 0 var(--pad-control);
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  color: var(--color-text);
+  background-color: var(--color-background);
+  border: 1px solid var(--color-borderStrong);
+  border-radius: var(--radius-sm);
+  transition: border-color var(--dur-fast) var(--ease);
+}
+
+.projects__category:hover,
+.projects__origin:hover,
+.settings__select:hover {
+  border-color: var(--color-accent);
+}
+
+.projects__submit,
+.settings__submit {
+  min-height: var(--touch);
+  padding: 0 var(--space-5);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--color-onButton);
+  background-color: var(--color-button);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+.projects__notice,
+.settings__notice {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--color-statusError);
+}
+
+/* ===================================================================== *
+ * SETTINGS — sectioned rows on hairlines, not stacked cards.             *
+ * ===================================================================== */
+
+.settings {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  padding: var(--gap-region);
+  max-width: var(--maxw);
 }
 
 .settings__section {
-  padding: var(--space);
-  background-color: var(--color-surface);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius);
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
+  gap: var(--space-3);
 }
 
 .settings__heading {
   margin: 0;
-  font-size: 1.1rem;
-  color: var(--color-accent);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--color-textSubtle);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--color-border);
 }
 
-.settings__subheading {
-  margin: 0.4rem 0 0.2rem;
-  font-size: 0.95rem;
-  color: var(--color-accent);
-}
-
-.settings__label {
-  display: block;
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--color-accent);
-  margin-bottom: 0.25rem;
-}
-
-.settings__field {
-  display: block;
-  width: 100%;
-}
-
-.settings__active,
-.settings__outcome,
-.settings__notice {
-  margin: 0;
-  color: var(--color-accent);
-}
-
-.settings__notice {
-  padding: 0.6rem 0.9rem;
-  border-radius: var(--radius-sm);
-  background-color: var(--color-surface);
-  color: var(--color-statusWarning);
-}
-
-.settings__notice[hidden] {
-  display: none;
-}
-
-.settings__select,
-.settings__input,
-.settings__textarea,
-.settings__connector-secret {
-  width: 100%;
+.settings__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
   min-height: var(--touch);
-  padding: 0.6rem 0.75rem;
-  font: inherit;
-  color: var(--color-accent);
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--color-border);
+  font-size: var(--text-sm);
+}
+
+.settings__rowLabel {
+  color: var(--color-textMuted);
+  flex: 1 1 auto;
+}
+
+.settings__rowValue {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text);
+}
+
+/* A masked secret reads as INERT: it is not editable content any more. */
+.settings__secret {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-textSubtle);
+  background-color: var(--color-surfaceSunken);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xs);
+  padding: var(--space-1) var(--space-2);
+}
+
+.settings__badge {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-onBadge);
+  background-color: var(--color-badge);
+  border-radius: var(--radius-full);
+  padding: var(--space-1) var(--space-3);
+}
+
+/* ===================================================================== *
+ * WORKSPACE CONTROLS — compact segmented pickers.                        *
+ * ===================================================================== */
+
+.workspace__controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.workspace__picker {
+  min-height: var(--touch);
+  padding: 0 var(--pad-control);
+  font-size: var(--text-xs);
+  color: var(--color-text);
   background-color: var(--color-background);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius-sm);
-}
-
-.settings__textarea {
-  min-height: 5rem;
-  resize: vertical;
-}
-
-.settings__button {
-  min-height: var(--touch);
-  min-width: var(--touch);
-  padding: 0.6rem 1.1rem;
-  font: inherit;
-  font-weight: 600;
-  color: var(--color-background);
-  background-color: var(--color-button);
-  border: none;
+  border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   cursor: pointer;
 }
 
-.settings__button--small {
-  min-width: auto;
-  padding: 0.4rem 0.75rem;
-  color: var(--color-accent);
-  background-color: var(--color-badge);
+.workspace__option[aria-selected="true"] {
+  color: var(--color-text);
+  background-color: var(--color-accentTintStrong);
 }
 
-.settings__button:disabled {
-  opacity: 0.6;
-  cursor: default;
+/* ===================================================================== *
+ * RESPONSIVE — every experience folds to one column at phone width.      *
+ * ===================================================================== */
+
+/* The explicit single-column hook views/layout.js sets on the shell. */
+.shell[data-single-column="true"] .shell__body {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: none;
 }
 
-.settings__list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
+@media (max-width: 720px) {
+  /* Attribute-presence selector, so this collapses EVERY experience — including
+     the workbench cockpit — rather than listing them. */
+  .shell[data-experience] .shell__body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: none;
+    grid-template-rows: auto;
+    height: auto;
+    gap: var(--space-3);
+    padding: var(--space-3);
+    background-color: var(--color-background);
+  }
+
+  .shell[data-experience] .shell__region[data-region] {
+    grid-area: auto;
+    position: static;
+    overflow: visible;
+    padding: 0;
+  }
+
+  .session-header {
+    gap: var(--space-2);
+    padding: 0 var(--space-3);
+  }
+
+  .session-header__meta {
+    display: none;
+  }
+
+  /* Thumb reach: the compose surface stays pinned to the bottom of the viewport
+     on a phone, which is the whole point of the mobile command centre. */
+  .shell[data-experience="mobile-command-center"] .shell__compose {
+    position: sticky;
+    bottom: 0;
+    z-index: 4;
+    padding-top: var(--space-2);
+    background-color: var(--color-background);
+  }
+
+  .confirm__approve,
+  .confirm__deny {
+    flex: 1 1 100%;
+  }
 }
 
-.settings__list-item {
-  padding: 0.4rem 0.6rem;
-  background-color: var(--color-background);
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius-sm);
-  color: var(--color-accent);
-  word-break: break-word;
-}
-
-.settings__connectors {
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-}
-
-.settings__connector {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.5rem;
-  border: 1px solid var(--color-badge);
-  border-radius: var(--radius-sm);
-  background-color: var(--color-background);
-}
-
-.settings__connector-name {
-  font-weight: 600;
-  color: var(--color-accent);
-  min-width: 6rem;
-}
-
-.settings__connector-secret {
-  flex: 1 1 8rem;
-  min-width: 0;
-}
-
-.settings__connector-bound {
-  font-size: 0.85rem;
-  color: var(--color-statusWarning);
-}
-
-.settings__connector-bound[data-bound="true"] {
-  color: var(--color-statusSuccess);
-}
-
-.settings__memory-entry {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.settings__memory-text {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.settings__share-url {
-  cursor: text;
-}
-
-.settings__share-url[hidden] {
-  display: none;
-}
-
-/* Narrow-phone tuning (Req 11.2): the settings column must not scroll
-   horizontally at 360px. All controls are width:100% / min-width:0, so nothing
-   overflows; connector rows stack their controls. */
 @media (max-width: 400px) {
-  .settings {
-    padding: 0.6rem;
-    gap: 0.6rem;
+  /* 360px tuning: tighten the gutters, never the touch targets. */
+  .shell[data-experience] .shell__body {
+    gap: var(--space-2);
+    padding: var(--space-2);
   }
-  .settings__connector {
-    flex-direction: column;
-    align-items: stretch;
+
+  .session-header {
+    padding: 0 var(--space-2);
   }
-  .settings__connector-name {
-    min-width: 0;
+
+  .activity__diff-line,
+  .activity__diff-path {
+    font-size: var(--text-xs);
+  }
+
+  .prompt__submit {
+    padding: 0 var(--space-3);
+  }
+}
+
+/* ===================================================================== *
+ * DEGRADATION                                                            *
+ * ===================================================================== */
+
+/* No color-mix(): fall back to flat values. Text stays readable because the
+   Layer-1 decisions are emitted by JavaScript, not by color-mix(). */
+@supports not (color: color-mix(in oklab, red, blue)) {
+  :root {
+    --color-text: var(--color-onBackground);
+    --color-textMuted: var(--color-onBackground);
+    --color-textSubtle: var(--color-onBackground);
+    --color-border: var(--color-badge);
+    --color-borderStrong: var(--color-badge);
+    --color-surfaceSunken: var(--color-surface);
+    --color-surfaceSelected: var(--color-surface);
+    --color-hover: var(--color-surface);
+    --color-active: var(--color-badge);
+    --color-accentTint: var(--color-surface);
+    --color-accentTintStrong: var(--color-badge);
+    --color-diffAdd: transparent;
+    --color-diffDel: transparent;
+    --elev-1: none;
+    --elev-2: none;
+    --elev-3: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 1ms !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Forced colours: yield to the system. Shadows are not rendered in this mode, so
+   elevation is replaced by a border. */
+@media (forced-colors: active) {
+  .confirm__card,
+  .prompt__form,
+  .preview,
+  .shell__surface[data-emphasis="primary"] {
+    box-shadow: none;
+    border: 1px solid ButtonBorder;
+  }
+
+  :focus-visible {
+    outline-color: Highlight;
   }
 }
